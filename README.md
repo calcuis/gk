@@ -3,9 +3,8 @@
 An independent tensor library for the gguf engine: the layer the server, the
 diffuser and the multimodal projectors run their graphs on.
 
-It replaced the vendored `ggml` outright - the `kernels/` tree is gone, and
-every graph the engine builds now evaluates here. It is written to the same
-rules as `../quantizer`: the byte layouts it reads are fixed by what already
+`gk` works similar to `ggml` but everything is building from scratch. It is written to the same
+rules as `quantizer` (see [here](https://github.com/gguf-org/quantizer)): the byte layouts it reads are fixed by what already
 exists in published GGUF files, and everything above those bytes is our own.
 
 The runtime above still speaks the historical ggml API. `compat/` implements
