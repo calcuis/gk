@@ -490,11 +490,19 @@ bool gk_are_same_stride(const struct gk_tensor * a, const struct gk_tensor * b) 
 }
 
 bool gk_can_repeat(const struct gk_tensor * a, const struct gk_tensor * b) {
-    if (gk_is_empty(a) != gk_is_empty(b)) {
-        return false;
+    // An empty operand repeats onto an empty result and onto nothing else. It
+    // has to be answered before the loop, which would divide by a zero extent.
+    // Graphs really do carry empty tensors - a vision encoder run with no
+    // images, a batch whose sequence contributes no tokens - and the ops that
+    // consume them are expected to become no-ops rather than to fail.
+    if (gk_is_empty(a)) {
+        return gk_is_empty(b);
     }
+    // `b` may itself be empty here: a zero extent divides by anything, so a
+    // normal weight broadcasts onto an empty result and the op drops out at
+    // compute time. Only an empty *source* is special, hence the test above.
     for (int i = 0; i < GK_MAX_DIMS; ++i) {
-        if (a->ne[i] == 0 || b->ne[i] % a->ne[i] != 0) {
+        if (b->ne[i] % a->ne[i] != 0) {
             return false;
         }
     }

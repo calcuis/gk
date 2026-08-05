@@ -595,6 +595,17 @@ static struct gk_tensor * gk_sched_stage_for(struct gk_sched * s,
         return NULL;
     }
 
+    // The staging tensor takes the source's strides, not fresh contiguous ones.
+    // That is what lets a strided source - a transposed input, a view with a
+    // row pitch - be staged at all: with the layouts identical, the same byte
+    // offset means the same element on both sides, so the transfer is one flat
+    // span of gk_nbytes and the reader sees the shape it expected. A
+    // contiguous destination would need a gather instead, and the padding
+    // bytes carried along here cost far less than that.
+    for (int i = 0; i < GK_MAX_DIMS; ++i) {
+        dst->nb[i] = src->nb[i];
+    }
+
     gk_format_name(dst, "%s#%s", src->name, gk_backend_name(s->backends[backend_id]));
 
     s->copies[s->n_copies].src        = src;
@@ -687,14 +698,6 @@ static bool gk_sched_split(struct gk_sched * s, struct gk_cgraph * graph) {
             const gk_backend_buffer_type_t buft = gk_sched_buft_of(s, src, graph);
             if (buft == NULL || gk_backend_supports_buft(s->backends[bid], buft)) {
                 continue; // this backend can read it where it is
-            }
-
-            // A strided view cannot be staged as a flat copy - the bytes
-            // between its rows belong to something else. Materialise it on the
-            // producing side first (gk_cont) if this ever fires.
-            if (!gk_is_contiguous(src)) {
-                gk_logf("gk: cannot stage non-contiguous %s across a split\n", src->name);
-                return false;
             }
 
             struct gk_tensor * stage = gk_sched_stage_for(s, src, bid, s->n_splits);

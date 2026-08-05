@@ -852,6 +852,211 @@ static __global__ void gk_cu_k_im2col(gk_tview img, gk_tview_mut d,
     }
 }
 
+// roll: every axis shifts cyclically by its own amount. One thread per output
+// element, each reading the one input element that lands on it - the wrap is a
+// cheap index computation, so nothing is gained by the CPU pass's two-piece
+// row copy here.
+static __global__ void gk_cu_k_roll(gk_tview a, gk_tview_mut d,
+                                    int s0, int s1, int s2, int s3, int64_t n) {
+    GK_CU_FLAT_LOOP(n) {
+        const gk_cu_idx x = gk_cu_decompose(k, d.ne);
+
+        const float v = gk_cu_get(a,
+                                  gk_cu_wrap(x.i0 - s0, a.ne[0]),
+                                  gk_cu_wrap(x.i1 - s1, a.ne[1]),
+                                  gk_cu_wrap(x.i2 - s2, a.ne[2]),
+                                  gk_cu_wrap(x.i3 - s3, a.ne[3]));
+
+        gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, v);
+    }
+}
+
+// The state-space convolution: a short depthwise filter slid along the time
+// axis of a padded input. `sx` is [d_conv-1+n_t, d_inner, n_seq] and the
+// destination is [d_inner, n_t, n_seq] - the inner dimension moves to the
+// front, which is why this cannot be an im2col plus a matmul.
+static __global__ void gk_cu_k_ssm_conv(gk_tview sx, gk_tview c, gk_tview_mut d,
+                                        int64_t nc, int64_t n) {
+    GK_CU_FLAT_LOOP(n) {
+        const gk_cu_idx x = gk_cu_decompose(k, d.ne);
+
+        float sum = 0.0f;
+        for (int64_t i0 = 0; i0 < nc; ++i0) {
+            sum += gk_cu_get(sx, x.i1 + i0, x.i0, x.i2, 0) * gk_cu_get(c, i0, x.i0, 0, 0);
+        }
+
+        gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, sum);
+    }
+}
+
+// max / average pooling over a 2D window. One thread per output cell; the
+// window is small enough that a thread walking it serially is the right shape.
+static __global__ void gk_cu_k_pool_2d(gk_tview a, gk_tview_mut d, int pool_op,
+                                       int k0, int k1, int s0, int s1, int p0, int p1,
+                                       int64_t IW, int64_t IH, int64_t n) {
+    const float ka = (float) (k0 * k1);
+
+    GK_CU_FLAT_LOOP(n) {
+        const gk_cu_idx x = gk_cu_decompose(k, d.ne);
+
+        const int64_t ix = x.i0 * s0 - p0;
+        const int64_t iy = x.i1 * s1 - p1;
+
+        float res = pool_op == GK_OP_POOL_MAX ? -FLT_MAX : 0.0f;
+
+        for (int ky = 0; ky < k1; ++ky) {
+            const int64_t j1 = iy + ky;
+            if (j1 < 0 || j1 >= IH) {
+                continue;
+            }
+            for (int kx = 0; kx < k0; ++kx) {
+                const int64_t j0 = ix + kx;
+                if (j0 < 0 || j0 >= IW) {
+                    continue;
+                }
+                const float v = gk_cu_get(a, j0, j1, x.i2, x.i3);
+                res = pool_op == GK_OP_POOL_MAX ? fmaxf(res, v) : res + v;
+            }
+        }
+
+        // avg divides by the whole kernel area, padding included: the same
+        // asymmetry with pool_1d the CPU pass carries, because it is what the
+        // models were trained against
+        if (pool_op == GK_OP_POOL_AVG) {
+            res /= ka;
+        }
+
+        gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, res);
+    }
+}
+
+// The direct 2D convolution: no im2col buffer, one thread per output cell
+// walking the input channels and the kernel window. The composite gk_conv_2d
+// lowers to im2col plus a matmul and already runs here through those two
+// kernels; this is the path taken when the intermediate would be too large to
+// materialise.
+static __global__ void gk_cu_k_conv_2d(gk_tview a, gk_tview b, gk_tview_mut d,
+                                       int s0, int s1, int p0, int p1, int d0, int d1,
+                                       int64_t IC, int64_t IW, int64_t IH,
+                                       int64_t KW, int64_t KH, bool round_src, int64_t n) {
+    GK_CU_FLAT_LOOP(n) {
+        const gk_cu_idx o = gk_cu_decompose(k, d.ne);
+
+        float acc = 0.0f;
+
+        for (int64_t ic = 0; ic < IC; ++ic) {
+            for (int64_t ky = 0; ky < KH; ++ky) {
+                const int64_t sy = o.i1 * s1 + ky * d1 - p1;
+                if (sy < 0 || sy >= IH) {
+                    continue;
+                }
+                for (int64_t kx = 0; kx < KW; ++kx) {
+                    const int64_t sx = o.i0 * s0 + kx * d0 - p0;
+                    if (sx < 0 || sx >= IW) {
+                        continue;
+                    }
+
+                    float sv = gk_cu_get(b, sx, sy, ic, o.i3);
+
+                    // A half-precision kernel rounds the input to its own
+                    // precision before multiplying. That is not an accident of
+                    // the CPU pass - it is what the im2col path does, whose
+                    // buffer is f16 - and dropping it here would make the two
+                    // spellings of the same convolution disagree.
+                    if (round_src) {
+                        sv = __half2float(__float2half(sv));
+                    }
+
+                    acc += gk_cu_get(a, kx, ky, ic, o.i2) * sv;
+                }
+            }
+        }
+
+        gk_cu_set(d, o.i0, o.i1, o.i2, o.i3, acc);
+    }
+}
+
+// The Mamba selective scan.
+//
+// The recurrence runs along time and cannot be parallelised across it, so the
+// threads are spread over everything else: one per (sequence, head, channel).
+// Each such thread owns d_state consecutive state values that no other thread
+// touches, which is what makes the whole scan race-free without a barrier -
+// the state chains through a thread's own registers and its own slice of the
+// result, never through a neighbour's.
+//
+// Strides arrive as byte offsets because that is how the tensors describe
+// themselves; within a row the CPU pass indexes flat floats and this matches
+// it element for element, softplus included, so a graph split across the two
+// devices does not drift at the seam.
+static __global__ void gk_cu_k_ssm_scan(const char * s_in, const char * x, const char * dt,
+                                        const float * A, const char * B, const char * C,
+                                        const int32_t * ids, char * dst,
+                                        int64_t nc, int64_t nr, int64_t nh, int64_t ng,
+                                        int64_t nt, int64_t nheads_per_group,
+                                        int64_t s_nb3, int64_t x_nb2, int64_t x_nb3,
+                                        int64_t dt_nb1, int64_t dt_nb2,
+                                        int64_t bc_nb2, int64_t bc_nb3,
+                                        int64_t s_off, bool one_decay_per_head, int64_t n) {
+    GK_UNUSED(ng);
+
+    GK_CU_FLAT_LOOP(n) {
+        const int64_t i1 = k % nr;              // channel within the head
+        const int64_t h  = (k / nr) % nh;       // head
+        const int64_t i3 = k / (nr * nh);       // sequence
+
+        const int64_t ii = i1 + h * nr;
+        const int64_t g  = h / nheads_per_group;
+
+        // The state this thread carries: d_state values, read from the cache
+        // on the first token and from its own output afterwards.
+        const float * s0 = (const float *) (s_in + (int64_t) ids[i3] * s_nb3) + ii * nc;
+        float * s = (float *) (dst + s_off + i3 * s_nb3) + ii * nc;
+
+        for (int64_t i2 = 0; i2 < nt; ++i2) {
+            const float * xt  = (const float *) (x  + i2 * x_nb2  + i3 * x_nb3);
+            const float * dtt = (const float *) (dt + i2 * dt_nb1 + i3 * dt_nb2);
+            const float * Bt  = (const float *) (B  + i2 * bc_nb2 + i3 * bc_nb3);
+            const float * Ct  = (const float *) (C  + i2 * bc_nb2 + i3 * bc_nb3);
+            float * y = (float *) dst + i2 * nh * nr + i3 * nt * nh * nr;
+
+            // softplus, with the large-input shortcut the CPU pass takes so
+            // the two agree bit for bit above the threshold
+            const float dtv = dtt[h];
+            const float dts = dtv > 20.0f ? dtv : logf(1.0f + expf(dtv));
+
+            const float x_dt = xt[ii] * dts;
+
+            float sum = 0.0f;
+
+            if (one_decay_per_head) {
+                // Mamba-2: A is [1, n_head], so the decay is a single scalar
+                // for the whole state vector and is computed once.
+                const float dA = expf(dts * A[h]);
+
+                for (int64_t i0 = 0; i0 < nc; ++i0) {
+                    const int64_t ig = i0 + g * nc;
+                    const float state = s0[i0] * dA + Bt[ig] * x_dt;
+                    sum += state * Ct[ig];
+                    s[i0] = state;
+                }
+            } else {
+                // Mamba-1: A is [d_state, n_head], one decay per state element
+                for (int64_t i0 = 0; i0 < nc; ++i0) {
+                    const int64_t ig = i0 + g * nc;
+                    const float state = s0[i0] * expf(dts * A[i0 + h * nc]) + Bt[ig] * x_dt;
+                    sum += state * Ct[ig];
+                    s[i0] = state;
+                }
+            }
+
+            y[ii] = sum;
+
+            s0 = s; // from here on the state chains through the result
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 // dispatch
 // --------------------------------------------------------------------------
@@ -933,6 +1138,8 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         case GK_OP_PAD: case GK_OP_TIMESTEP_EMBEDDING: case GK_OP_ARANGE:
         case GK_OP_FLASH_ATTN_EXT: case GK_OP_IM2COL: case GK_OP_UPSCALE:
         case GK_OP_SET_ROWS:
+        case GK_OP_ROLL: case GK_OP_SSM_CONV: case GK_OP_POOL_2D:
+        case GK_OP_CONV_2D: case GK_OP_SSM_SCAN:
             break;
 
         default:
@@ -959,6 +1166,33 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
                gk_cu_type_supported((int) op->src[2]->type) &&
                op->src[1]->ne[0] <= GK_CUDA_FA_MAX_DK &&
                op->src[2]->ne[0] <= GK_CUDA_FA_MAX_DV;
+    }
+    if ((int) op->op == GK_OP_CONV_2D) {
+        // The image and the result are f32; the kernel may be half, which also
+        // decides whether the input is rounded on the way in.
+        return op->type == GKT_F32 && s1 != NULL && s1->type == GKT_F32 &&
+               (s0->type == GKT_F32 || s0->type == GKT_F16);
+    }
+    if ((int) op->op == GK_OP_SSM_SCAN) {
+        // The scan indexes x, B and C as flat rows across their first two
+        // dimensions, exactly as the CPU pass does, so a tensor whose second
+        // dimension is not packed against its first would be read wrongly.
+        // That shape never reaches here from the graph builders, and declining
+        // it costs a CPU fallback rather than a wrong answer.
+        const struct gk_tensor * packed[] = { op->src[1], op->src[4], op->src[5] };
+        for (int i = 0; i < 3; ++i) {
+            const struct gk_tensor * t = packed[i];
+            if (t->type != GKT_F32 || t->nb[0] != sizeof(float) ||
+                t->nb[1] != (size_t) t->ne[0] * t->nb[0]) {
+                return false;
+            }
+        }
+
+        return op->type == GKT_F32 && s0->type == GKT_F32 &&
+               gk_is_contiguous(s0) && gk_is_contiguous(op->src[2]) &&
+               gk_is_contiguous(op->src[3]) &&
+               op->src[2]->type == GKT_F32 && op->src[3]->type == GKT_F32 &&
+               op->src[6]->type == GKT_I32;
     }
     if ((int) op->op == GK_OP_UPSCALE) {
         // only nearest and plain bilinear; the antialiased and bicubic filters
@@ -994,6 +1228,21 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_tensor * node) {
 
     const int64_t ne = gk_cu_nelements(node);
     const int     nb = gk_cu_blocks(ne, GK_CUDA_BLOCK);
+
+    // A node with no elements is a legal part of a graph - the output matmul of
+    // a batch that produces no logits has zero columns, and a view of an empty
+    // range has zero rows - but there is no launch geometry that means "no
+    // work": a grid dimension of zero is rejected by the driver, not ignored.
+    // So the emptiness is answered here, where it is one comparison, rather
+    // than at each of the launches below.
+    //
+    // The op is still complete after this: everything below writes only into
+    // the destination, so an empty destination has nothing owed to it. The one
+    // op that writes elsewhere - set_rows, whose destination is the cache - is
+    // driven by its source's element count and is handled at its own launch.
+    if (ne == 0) {
+        return true;
+    }
 
     switch (op) {
         case GK_OP_NONE: case GK_OP_RESHAPE: case GK_OP_VIEW:
@@ -1256,6 +1505,71 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_tensor * node) {
                 gk_cu_view(src1), gk_cu_view_mut(node),
                 IC, IH, IW, KH, KW, OH, OW, ofs_n, ofs_c, ofs_h,
                 s0, s1, p0, p1, d0, d1, ne);
+            return true;
+        }
+
+        case GK_OP_ROLL:
+            gk_cu_k_roll<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0), gk_get_op_params_i32(node, 1),
+                gk_get_op_params_i32(node, 2), gk_get_op_params_i32(node, 3), ne);
+            return true;
+
+        case GK_OP_SSM_CONV:
+            gk_cu_k_ssm_conv<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(node),
+                src1->ne[0], ne);
+            return true;
+
+        case GK_OP_POOL_2D:
+            gk_cu_k_pool_2d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0),
+                gk_get_op_params_i32(node, 1), gk_get_op_params_i32(node, 2),
+                gk_get_op_params_i32(node, 3), gk_get_op_params_i32(node, 4),
+                gk_get_op_params_i32(node, 5), gk_get_op_params_i32(node, 6),
+                src0->ne[0], src0->ne[1], ne);
+            return true;
+
+        case GK_OP_CONV_2D:
+            gk_cu_k_conv_2d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0), gk_get_op_params_i32(node, 1),
+                gk_get_op_params_i32(node, 2), gk_get_op_params_i32(node, 3),
+                gk_get_op_params_i32(node, 4), gk_get_op_params_i32(node, 5),
+                src1->ne[2], src1->ne[0], src1->ne[1], src0->ne[0], src0->ne[1],
+                src0->type == GKT_F16, ne);
+            return true;
+
+        case GK_OP_SSM_SCAN: {
+            const struct gk_tensor * s_in = node->src[0];
+            const struct gk_tensor * dt   = node->src[2];
+            const struct gk_tensor * A    = node->src[3];
+            const struct gk_tensor * B    = node->src[4];
+
+            const int64_t nc = s_in->ne[0];  // d_state
+            const int64_t nr = s_in->ne[1];  // channels per head
+            const int64_t nh = src1->ne[1];  // heads
+            const int64_t ng = B->ne[1];     // groups sharing a B/C pair
+            const int64_t nt = src1->ne[2];  // tokens
+            const int64_t ns = src1->ne[3];  // sequences
+
+            // One thread per (sequence, head, channel); the token loop is
+            // inside the thread because the recurrence is sequential in it.
+            const int64_t threads = ns * nh * nr;
+
+            gk_cu_k_ssm_scan<<<gk_cu_blocks(threads, GK_CUDA_BLOCK),
+                               GK_CUDA_BLOCK, 0, stream>>>(
+                (const char *) s_in->data, (const char *) src1->data,
+                (const char *) dt->data, (const float *) A->data,
+                (const char *) B->data, (const char *) node->src[5]->data,
+                (const int32_t *) node->src[6]->data, (char *) node->data,
+                nc, nr, nh, ng, nt, nh / ng,
+                (int64_t) s_in->nb[3], (int64_t) src1->nb[2], (int64_t) src1->nb[3],
+                (int64_t) dt->nb[1], (int64_t) dt->nb[2],
+                (int64_t) B->nb[2], (int64_t) B->nb[3],
+                gk_cu_nelements(src1) * (int64_t) sizeof(float),
+                A->ne[0] == 1, threads);
             return true;
         }
 

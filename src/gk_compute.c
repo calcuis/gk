@@ -3887,6 +3887,13 @@ static void gk_compute_custom(struct gk_compute_state * st, struct gk_tensor * d
 // --------------------------------------------------------------------------
 
 static void gk_compute_node(struct gk_compute_state * st, struct gk_tensor * node) {
+    // A node with a zero extent has no elements to write. The per-op kernels
+    // below assume at least one row and would divide by, or index past, a zero
+    // dimension, so an empty result is a no-op here.
+    if (gk_is_empty(node)) {
+        return;
+    }
+
     switch (node->op) {
         // Pure reinterpretations: the result already aliases the operand's
         // memory, so there is nothing to do.
@@ -4171,6 +4178,17 @@ enum gk_status gk_graph_compute_with_pool(struct gk_cgraph * graph, struct gk_po
         // A node in the graph but not flagged for computing is a placeholder
         // branch from gk_build_forward_select. It holds its slot and no more.
         if (node->op != GK_OP_NONE && !(node->flags & GK_TENSOR_FLAG_COMPUTE)) {
+            continue;
+        }
+
+        // An empty node is dropped by gk_compute_node anyway, but it has to be
+        // dropped here too, ahead of the storage check: zero bytes of result is
+        // exactly the case an allocator is entitled to answer with a null
+        // pointer, so the check below would call a legal node unallocated. The
+        // GPU backends skip empty nodes at the same point and the two have to
+        // agree - a graph that runs on one and refuses on the other is the
+        // hardest kind of split-placement bug to find.
+        if (gk_is_empty(node)) {
             continue;
         }
 

@@ -379,15 +379,21 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
                     GK_CUDA_BACKEND_NAME, gk_op_name(node->op), node->name);
             return GK_STATUS_NO_STORAGE;
         }
-    }
 
-    // Launch errors surface here rather than at the failing kernel, because
-    // launches are asynchronous; the node they name is the last one queued,
-    // which is close enough to find it.
-    const gkError_t err = gkGetLastError();
-    if (err != gkSuccess) {
-        gk_logf("gk %s: graph failed: %s\n", GK_CUDA_BACKEND_NAME, gkGetErrorString(err));
-        return GK_STATUS_NO_STORAGE;
+        // A launch is rejected synchronously when its geometry is wrong, so the
+        // check belongs next to the launch that caused it: checking once at the
+        // end of the graph would name whichever node happened to be queued last
+        // and leave the real one unnamed. It is a host-side flag read, not a
+        // synchronization - the queue keeps running behind it.
+        const gkError_t err = gkGetLastError();
+        if (err != gkSuccess) {
+            gk_logf("gk %s: %s (node %s, op %s, ne = [%lld %lld %lld %lld])\n",
+                    GK_CUDA_BACKEND_NAME, gkGetErrorString(err),
+                    node->name, gk_op_name(node->op),
+                    (long long) node->ne[0], (long long) node->ne[1],
+                    (long long) node->ne[2], (long long) node->ne[3]);
+            return GK_STATUS_NO_STORAGE;
+        }
     }
 
     return GK_STATUS_SUCCESS;

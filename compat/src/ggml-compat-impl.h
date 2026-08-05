@@ -35,31 +35,31 @@ void ggml_compat_log(enum ggml_log_level level, const char * fmt, ...);
 #define GGML_LOG_INFO(...)  ggml_compat_log(GGML_LOG_LEVEL_INFO,  __VA_ARGS__)
 #define GGML_LOG_DEBUG(...) ggml_compat_log(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 
-#ifndef NDEBUG
-#define GGML_ASSERT(x) \
-    do { \
-        if (!(x)) { \
-            ggml_compat_abort(__FILE__, __LINE__, "GGML_ASSERT(%s) failed", #x); \
-        } \
-    } while (0)
-#else
-#define GGML_ASSERT(x) \
-    do { \
-        if (!(x)) { \
-            ggml_compat_abort(__FILE__, __LINE__, "GGML_ASSERT(%s) failed", #x); \
-        } \
-    } while (0)
-#endif
+// ggml.h defines the public spellings of these in terms of ggml_abort(); inside
+// the layer they route to ggml_compat_abort() instead, which carries the
+// printf format attribute and the noreturn hint. Undefine first so including
+// ggml.h before this header is not a redefinition warning.
 
 #ifdef __GNUC__
 __attribute__((format(printf, 3, 4), noreturn))
 #endif
 void ggml_compat_abort(const char * file, int line, const char * fmt, ...);
 
+#undef GGML_ABORT
 #define GGML_ABORT(...) ggml_compat_abort(__FILE__, __LINE__, __VA_ARGS__)
 
+#undef GGML_ASSERT
+#define GGML_ASSERT(x) \
+    do { \
+        if (!(x)) { \
+            ggml_compat_abort(__FILE__, __LINE__, "GGML_ASSERT(%s) failed", #x); \
+        } \
+    } while (0)
+
+#undef GGML_UNUSED
 #define GGML_UNUSED(x) (void) (x)
 
+#undef GGML_PAD
 #define GGML_PAD(x, n) (((x) + (n) - 1) & ~((n) - 1))
 
 // ---------------------------------------------------------------------------

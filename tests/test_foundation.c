@@ -203,6 +203,50 @@ static void test_out_of_space(void) {
     gk_free(ctx);
 }
 
+// Graphs really do carry tensors with a zero extent - a vision encoder run on
+// a batch that turned out to hold no image, a sequence that contributes no
+// tokens to a ubatch. The ops that consume them have to become no-ops instead
+// of failing, which means the broadcast test has to answer before it divides
+// by a zero extent. Getting the two directions backwards aborts a multimodal
+// server on its first request, so both are pinned here.
+static void test_empty_tensors(void) {
+    printf("zero-extent tensors\n");
+
+    struct gk_ctx * ctx = gk_init((struct gk_init_params) {
+        .mem_size = 4 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = true,
+    });
+    CHECK(ctx != NULL);
+
+    struct gk_tensor * empty  = gk_new_tensor_2d(ctx, GK_TYPE_F32, 576, 0);
+    struct gk_tensor * empty2 = gk_new_tensor_2d(ctx, GK_TYPE_F32, 576, 0);
+    struct gk_tensor * weight = gk_new_tensor_2d(ctx, GK_TYPE_F32, 576, 1);
+    struct gk_tensor * rows   = gk_new_tensor_2d(ctx, GK_TYPE_F32, 576, 4);
+
+    CHECK(gk_is_empty(empty));
+    CHECK(!gk_is_empty(weight));
+    CHECK(gk_nelements(empty) == 0);
+    CHECK(gk_nbytes(empty) == 0);
+
+    // a normal operand broadcasts onto an empty result: 0 % n == 0
+    CHECK_MSG(gk_can_repeat(weight, empty),
+              "a weight must broadcast onto an empty result");
+    // empty onto empty is the identity case
+    CHECK_MSG(gk_can_repeat(empty, empty2), "empty repeats onto empty");
+    // an empty source cannot fill a non-empty result - there is nothing to read
+    CHECK_MSG(!gk_can_repeat(empty, rows),
+              "an empty source must not fill a non-empty result");
+    CHECK_MSG(!gk_can_repeat(empty, weight),
+              "an empty source must not fill a non-empty result");
+
+    // the ops built on top of it must therefore accept the empty operand
+    struct gk_tensor * mul = gk_mul(ctx, empty, weight);
+    CHECK(mul != NULL && gk_is_empty(mul));
+    struct gk_tensor * add = gk_add(ctx, empty, weight);
+    CHECK(add != NULL && gk_is_empty(add));
+
+    gk_free(ctx);
+}
+
 // Builds a small diamond so the walk has a shared subexpression to dedup:
 //
 //     x -> b -> d
@@ -558,6 +602,7 @@ int main(void) {
     test_fp_roundtrip();
     test_context_and_strides();
     test_out_of_space();
+    test_empty_tensors();
     test_graph_order();
     test_graph_deep();
     test_op_names();
