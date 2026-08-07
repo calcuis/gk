@@ -54,6 +54,10 @@ bool gk_cuda_supports_op(const struct gk_tensor * op);
 #define GK_CUDA_FA_MAX_DK 640
 #define GK_CUDA_FA_MAX_DV 512
 
+// The widest head the linear-attention recurrences take. They give each slot
+// of a head's state its own thread, so this is a block's thread limit.
+#define GK_CUDA_RECURRENT_MAX_S 1024
+
 // The matmuls live in their own translation unit: they are the only kernels
 // here with a performance story worth separating out.
 void gk_cuda_mul_mat   (gkStream_t stream, struct gk_tensor * dst);

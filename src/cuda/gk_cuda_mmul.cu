@@ -30,6 +30,28 @@
 // where the reuse stops paying for the occupancy it costs.
 #define GK_CU_MM_NC 4
 
+// Consecutive weight elements a lane takes at a time. Every quantized block
+// size in the format set - 32, 64, 128, 256 - is a multiple of the largest
+// value here, so an aligned run always sits inside one block and that block's
+// header is decoded once for the whole run rather than once per element.
+//
+// The trade is against coalescing: a longer run spreads a warp's reads further
+// apart, and where the header is cheap that costs more than it saves. Four is
+// where the two balance for every format measured on an Ada part except q6_K,
+// whose 210-byte block comes out ahead with no run at all - 0.18 ms against
+// 0.21. The type is already a template parameter, so saying so per format
+// costs nothing.
+//
+// These are measured, not derived. bench-cuda's decoder-cost group is the
+// measurement to retune them against: one matmul shape in every format, where
+// the only thing that varies between rows is the decode.
+#define GK_CU_MM_RUN_MAX 4
+
+template <int TYPE>
+static __device__ __host__ __forceinline__ int gk_cu_mm_run() {
+    return TYPE == GKT_Q6_K ? 1 : GK_CU_MM_RUN_MAX;
+}
+
 // The tiled path below. A block computes a TILE_M x TILE_N patch of the
 // result, marching over k in TILE_K slices staged in shared memory, with each
 // of its 16x16 threads holding a 4x4 patch in registers.
@@ -90,14 +112,38 @@ static __device__ __forceinline__ void gk_cu_reduce_n(float (&acc)[NC], float * 
 // query heads and each key head serves a group.
 // --------------------------------------------------------------------------
 
+// A *warp* owns an output row, not a block.
+//
+// The block-per-row shape this replaced spent most of a short row's time in
+// its own reduction: a 1536-wide q4_0 row is 864 packed bytes, which 128
+// threads read in a few instructions each and then pay two barriers and a
+// shared-memory round trip to add up. At 42 GB/s against a card that does 183
+// the bottleneck was never the decode.
+//
+// A warp needs no barriers and no shared memory at all - the reduction is
+// shuffles - and a block of several warps retires several rows for one launch.
+// The activations are read by every warp in the block at the same k, so they
+// stay resident in L1 rather than being staged by hand; staging them through
+// shared memory was tried and was slower than not.
+//
+// Within a warp, a lane takes gk_cu_mm_run<ATYPE>() consecutive elements at a
+// time, aligned so the run never crosses a quantized block's boundary. That is
+// what lets the block be found once and its header decoded once for the whole
+// run instead of once per element.
 template <int NC, int ATYPE>
 static __global__ void gk_cu_k_mul_mat(gk_tview a, gk_tview b, gk_tview_mut d,
                                        int64_t k_len, int64_t r2, int64_t r3) {
-    extern __shared__ float shared[];
+    const int lane    = threadIdx.x % GK_WARP_SIZE;
+    const int warp    = threadIdx.x / GK_WARP_SIZE;
+    const int n_warps = blockDim.x / GK_WARP_SIZE;
 
-    const int64_t i0  = blockIdx.x;                     // weight row
-    const int64_t c0  = (int64_t) blockIdx.y * NC;      // first activation column
+    const int64_t i0  = (int64_t) blockIdx.x * n_warps + warp; // weight row
+    const int64_t c0  = (int64_t) blockIdx.y * NC;             // first column
     const int64_t i23 = blockIdx.z;
+
+    if (i0 >= d.ne[0]) {
+        return; // whole-warp uniform, so the shuffles below stay well formed
+    }
 
     const int64_t i2 = i23 % d.ne[2];
     const int64_t i3 = i23 / d.ne[2];
@@ -111,23 +157,68 @@ static __global__ void gk_cu_k_mul_mat(gk_tview a, gk_tview b, gk_tview_mut d,
         acc[j] = 0.0f;
     }
 
-    for (int64_t kk = threadIdx.x; kk < k_len; kk += blockDim.x) {
-        // the reuse this kernel exists for: one decode of the weight element,
-        // NC multiplies against it
-        const float av = gk_cu_get_t<ATYPE>(a, kk, i0, a2, a3);
+    const char * a_row = gk_cu_row(a, i0, a2, a3);
+
+    const int run = gk_cu_mm_run<ATYPE>();
+
+    for (int64_t k0 = (int64_t) lane * run; k0 < k_len;
+         k0 += GK_WARP_SIZE * run) {
+
+        const uint8_t * blk = NULL;
+        int j0 = 0;
+        if (gk_cu_is_blocked<ATYPE>()) {
+            // k0 is a multiple of the run and every block size is a multiple
+            // of it too, so the whole run lives in this one block.
+            const int blck = gk_cu_blck_size(ATYPE);
+            const int tsz  = gk_cu_type_size(ATYPE);
+            blk = (const uint8_t *) a_row + (k0 / blck) * tsz;
+            j0  = (int) (k0 % blck);
+        }
+
+        // The run's weights, decoded together, so the block's header is paid
+        // for once instead of once per element. Only for the formats where
+        // that is worth an array to hold them; the rest decode in place below.
+        const bool use_run = gk_cu_is_blocked<ATYPE>() && gk_cu_has_run_path<ATYPE>();
+
+        float wv[GK_CU_MM_RUN_MAX];
+        if (use_run) {
+            const int64_t left = k_len - k0;
+            gk_cu_blk_run_t<ATYPE, GK_CU_MM_RUN_MAX>(
+                blk, j0, (int) (left < run ? left : run), wv);
+        }
 
 #pragma unroll
-        for (int j = 0; j < NC; ++j) {
-            const int64_t col = c0 + j;
-            if (col < d.ne[1]) {
-                acc[j] += av * gk_cu_get(b, kk, col, i2, i3);
+        for (int e = 0; e < GK_CU_MM_RUN_MAX; ++e) {
+            if (e >= run) {
+                break;
+            }
+            const int64_t kk = k0 + e;
+            if (kk >= k_len) {
+                break;
+            }
+
+            // the reuse this kernel exists for: one decode of the weight
+            // element, NC multiplies against it
+            const float av = use_run ? wv[e]
+                : gk_cu_is_blocked<ATYPE>() ? gk_cu_blk_elem_t<ATYPE>(blk, j0 + e)
+                : gk_cu_get_t<ATYPE>(a, kk, i0, a2, a3);
+
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                const int64_t col = c0 + j;
+                if (col < d.ne[1]) {
+                    acc[j] += av * gk_cu_get(b, kk, col, i2, i3);
+                }
             }
         }
     }
 
-    gk_cu_reduce_n<NC>(acc, shared);
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        acc[j] = gk_cu_warp_sum(acc[j]);
+    }
 
-    if (threadIdx.x == 0) {
+    if (lane == 0) {
 #pragma unroll
         for (int j = 0; j < NC; ++j) {
             const int64_t col = c0 + j;
@@ -270,8 +361,10 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
         return;
     }
 
+    // A warp per output row, so a block of GK_CU_MM_BLOCK threads retires
+    // n_warps of them and the grid is that much shorter.
     dim3 grid;
-    grid.x = (unsigned) dst->ne[0];
+    grid.x = (unsigned) ((dst->ne[0] + n_warps - 1) / n_warps);
     grid.z = (unsigned) (dst->ne[2] * dst->ne[3]);
 
     // One column at a time when there is only one - the decode case, every
@@ -281,8 +374,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
         grid.y = (unsigned) dst->ne[1];
 
 #define GK_CU_LAUNCH_MV1(T)                                                \
-        gk_cu_k_mul_mat<1, T><<<grid, GK_CU_MM_BLOCK,                      \
-                                n_warps * sizeof(float), stream>>>(        \
+        gk_cu_k_mul_mat<1, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>(            \
             gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
 
         GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MV1);
@@ -291,8 +383,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
         grid.y = (unsigned) ((dst->ne[1] + GK_CU_MM_NC - 1) / GK_CU_MM_NC);
 
 #define GK_CU_LAUNCH_MVN(T)                                                \
-        gk_cu_k_mul_mat<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK,            \
-                GK_CU_MM_NC * n_warps * sizeof(float), stream>>>(          \
+        gk_cu_k_mul_mat<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>(  \
             gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
 
         GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MVN);

@@ -529,6 +529,117 @@ static __device__ __forceinline__ float gk_cu_dq_tq2_0(const uint8_t * b, int j)
 // rather than by every caller.
 // --------------------------------------------------------------------------
 
+// One element of an already-located block.
+//
+// Split out of gk_cu_row_elem_t below so that a caller walking several
+// elements of the same block can find the block once. That is the whole point:
+// the block's header - a scale, sometimes a minimum, sometimes a packed set of
+// sub-scales - costs the same whether one element is wanted from the block or
+// thirty-two, and the per-element entry point pays it every time.
+template <int TYPE>
+static __device__ __forceinline__ float gk_cu_blk_elem_t(const uint8_t * b, int j) {
+    switch (TYPE) {
+        case GKT_Q4_0:   return gk_cu_dq_q4_0  (b, j);
+        case GKT_Q4_1:   return gk_cu_dq_q4_1  (b, j);
+        case GKT_Q5_0:   return gk_cu_dq_q5_0  (b, j);
+        case GKT_Q5_1:   return gk_cu_dq_q5_1  (b, j);
+        case GKT_Q8_0:   return gk_cu_dq_q8_0  (b, j);
+        case GKT_Q1_0:   return gk_cu_dq_q1_0  (b, j);
+        case GKT_Q2_0:   return gk_cu_dq_q2_0  (b, j);
+        case GKT_MXFP4:  return gk_cu_dq_mxfp4 (b, j);
+        case GKT_NVFP4:  return gk_cu_dq_nvfp4 (b, j);
+        case GKT_Q2_K:   return gk_cu_dq_q2_k  (b, j);
+        case GKT_Q3_K:   return gk_cu_dq_q3_k  (b, j);
+        case GKT_Q4_K:   return gk_cu_dq_q4_k  (b, j);
+        case GKT_Q5_K:   return gk_cu_dq_q5_k  (b, j);
+        case GKT_Q6_K:   return gk_cu_dq_q6_k  (b, j);
+        case GKT_IQ4_NL: return gk_cu_dq_iq4_nl(b, j);
+        case GKT_IQ4_XS: return gk_cu_dq_iq4_xs(b, j);
+        case GKT_TQ1_0:  return gk_cu_dq_tq1_0 (b, j);
+        case GKT_TQ2_0:  return gk_cu_dq_tq2_0 (b, j);
+        default:         return 0.0f; // unreachable: supports_op filtered it
+    }
+}
+
+// Whether gk_cu_blk_run_t below has anything better to offer this format than
+// calling the per-element decoder in a loop. Where it does not, the caller is
+// better off not gathering a run at all: the array costs registers, and both
+// q6_K and mxfp4 measured slower going through one for no gain.
+template <int TYPE>
+static __device__ __host__ __forceinline__ bool gk_cu_has_run_path() {
+    return TYPE == GKT_Q4_K || TYPE == GKT_Q5_K;
+}
+
+// A run of `n` consecutive elements of one block, into `out`.
+//
+// The generic body just calls the per-element decoder, which is already a big
+// improvement over finding the block each time. The K formats get an explicit
+// path because their header is the expensive one: two half-precision scales
+// and a 6-bit sub-scale unpacked out of a packed twelve-byte field. A run of
+// four stays inside one 32-element sub-group, so the sub-scale is the same for
+// all of them and the whole header reduces to two multiplies hoisted out of
+// the loop - which the compiler does not manage on its own through the
+// per-element entry point.
+//
+// `j0` is a multiple of the maximum run, which is what guarantees a run never
+// straddles a sub-group boundary.
+template <int TYPE, int RUN>
+static __device__ __forceinline__ void gk_cu_blk_run_t(const uint8_t * b, int j0, int n,
+                                                       float (&out)[RUN]) {
+    if (TYPE == GKT_Q4_K || TYPE == GKT_Q5_K) {
+        const float d    = gk_cu_h2f(b);
+        const float dmin = gk_cu_h2f(b + 2);
+        const uint8_t * scales = b + 4;
+
+        const int g = j0 / 32;
+
+        int sc, mn;
+        gk_cu_scale_min_6(scales, g, &sc, &mn);
+
+        // the whole header, collapsed to the two constants it contributes
+        const float dsc = d * (float) sc;
+        const float dm  = dmin * (float) mn;
+
+        const int shift = (g % 2) * 4;
+
+        if (TYPE == GKT_Q4_K) {
+            const uint8_t * qs = b + 4 + 12 + (g / 2) * 32;
+#pragma unroll
+            for (int e = 0; e < RUN; ++e) {
+                if (e >= n) { break; }
+                const int q = (qs[(j0 % 32) + e] >> shift) & 0xf;
+                out[e] = dsc * (float) q - dm;
+            }
+        } else {
+            const uint8_t * qh = b + 4 + 12;
+            const uint8_t * qs = b + 4 + 12 + GK_QK / 8 + (g / 2) * 32;
+#pragma unroll
+            for (int e = 0; e < RUN; ++e) {
+                if (e >= n) { break; }
+                const int l  = (j0 % 32) + e;
+                const int lo = (qs[l] >> shift) & 0xf;
+                const int q  = lo | ((qh[l] & (1u << g)) ? 16 : 0);
+                out[e] = dsc * (float) q - dm;
+            }
+        }
+        return;
+    }
+
+#pragma unroll
+    for (int e = 0; e < RUN; ++e) {
+        if (e >= n) { break; }
+        out[e] = gk_cu_blk_elem_t<TYPE>(b, j0 + e);
+    }
+}
+
+// Whether a type is packed into blocks at all, which decides whether the
+// caller above has a block to find.
+template <int TYPE>
+static __device__ __forceinline__ constexpr bool gk_cu_is_blocked() {
+    return TYPE != GKT_F32 && TYPE != GKT_F16 && TYPE != GKT_BF16 &&
+           TYPE != GKT_I8  && TYPE != GKT_I16 && TYPE != GKT_I32 && TYPE != GKT_I64;
+}
+
 // The same decode, with the type known at compile time.
 //
 // This exists because the runtime version below is expensive in a way that is
