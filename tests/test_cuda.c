@@ -948,6 +948,131 @@ static int run_flash_attn(gk_backend_t gpu, const char * name,
     return bad == 0 ? 0 : 1;
 }
 
+// --------------------------------------------------------------------------
+// top_k
+//
+// Also its own harness, and for a sharper reason than attention's: top_k's
+// result is a set of indices with a fully specified order - descending by
+// value, index breaking ties, and then the first two deliberately swapped - so
+// the device and the CPU must agree exactly, not approximately. An int
+// comparison catches what a tolerance would hide.
+//
+// The data patterns matter more than the shapes. A row of distinct values
+// never exercises the tie-break; a row that is entirely -inf is what a fully
+// masked router produces, and is where padding slots would displace real
+// indices if their sentinel index were not chosen to lose the tie.
+// --------------------------------------------------------------------------
+
+enum tk_data {
+    TK_DISTINCT = 0,
+    TK_TIES,        // few distinct levels, so most comparisons are ties
+    TK_ALL_NEG_INF, // a fully masked row
+    TK_SOME_NEG_INF,
+};
+
+static void tk_fill(float * p, int64_t n, int64_t rows, enum tk_data mode) {
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t at = r * n + i;
+            switch (mode) {
+                case TK_DISTINCT:
+                    p[at] = input_value((int) (at * 7 + 1));
+                    break;
+                case TK_TIES:
+                    // eight levels over the row: every top-k slot is contested
+                    p[at] = (float) (((at * 2654435761u) >> 8) % 8u);
+                    break;
+                case TK_ALL_NEG_INF:
+                    p[at] = -INFINITY;
+                    break;
+                default:
+                    p[at] = (i % 3 == 0) ? -INFINITY : input_value((int) (at * 5 + 3));
+                    break;
+            }
+        }
+    }
+}
+
+static int run_top_k(gk_backend_t gpu, const char * name,
+                     int64_t n, int64_t k, int64_t rows, enum tk_data mode) {
+    const size_t in_bytes = (size_t) n * rows * sizeof(float);
+
+    struct gk_ctx * gpu_ctx = gk_init((struct gk_init_params) {
+        .mem_size = 64u << 20, .mem_buffer = NULL, .no_alloc = true,
+    });
+    struct gk_tensor * ga  = gk_new_tensor_2d(gpu_ctx, GK_TYPE_F32, n, rows);
+    struct gk_tensor * gout = gk_top_k(gpu_ctx, ga, (int) k);
+    gk_set_output(gout);
+    struct gk_cgraph * gpu_graph = gk_new_graph(gpu_ctx);
+    gk_build_forward_expand(gpu_graph, gout);
+
+    if (!gk_backend_supports_op(gpu, gout)) {
+        printf("  %-20s FAIL: the backend declines the op\n", name);
+        gk_free(gpu_ctx);
+        return 1;
+    }
+
+    struct gk_gallocr * alloc = gk_gallocr_new(gk_backend_get_default_buffer_type(gpu));
+    if (alloc == NULL || !gk_gallocr_alloc_graph(alloc, gpu_graph)) {
+        printf("  %-20s FAIL: could not allocate the device graph\n", name);
+        gk_free(gpu_ctx);
+        return 1;
+    }
+
+    struct gk_ctx * cpu_ctx = gk_init((struct gk_init_params) {
+        .mem_size = 256u << 20, .mem_buffer = NULL, .no_alloc = false,
+    });
+    struct gk_tensor * ca   = gk_new_tensor_2d(cpu_ctx, GK_TYPE_F32, n, rows);
+    struct gk_tensor * cout = gk_top_k(cpu_ctx, ca, (int) k);
+    struct gk_cgraph * cpu_graph = gk_new_graph(cpu_ctx);
+    gk_build_forward_expand(cpu_graph, cout);
+
+    float * values = (float *) malloc(in_bytes);
+    tk_fill(values, n, rows, mode);
+    memcpy(ca->data, values, in_bytes);
+    gk_backend_tensor_set(ga, values, 0, in_bytes);
+    free(values);
+
+    if (gk_graph_compute(cpu_graph, 4) != GK_STATUS_SUCCESS) {
+        printf("  %-20s FAIL: the CPU reference failed\n", name);
+        return 1;
+    }
+    if (gk_backend_graph_compute(gpu, gpu_graph) != GK_STATUS_SUCCESS) {
+        printf("  %-20s FAIL: the device graph failed\n", name);
+        return 1;
+    }
+    gk_backend_synchronize(gpu);
+
+    const int64_t no = k * rows;
+    int32_t * got = (int32_t *) malloc((size_t) no * sizeof(int32_t));
+    gk_backend_tensor_get(gout, got, 0, (size_t) no * sizeof(int32_t));
+    const int32_t * want = (const int32_t *) cout->data;
+
+    int bad = 0;
+    int first_at = -1;
+    for (int64_t i = 0; i < no; ++i) {
+        if (got[i] != want[i]) {
+            if (first_at < 0) {
+                first_at = (int) i;
+            }
+            bad++;
+        }
+    }
+
+    if (bad == 0) {
+        printf("  %-20s %5lld indices, exact\n", name, (long long) no);
+    } else {
+        printf("  %-20s %5lld indices, %d differ (first at %d: got %d, want %d)  FAIL\n",
+               name, (long long) no, bad, first_at, got[first_at], want[first_at]);
+    }
+
+    free(got);
+    gk_free(cpu_ctx);
+    gk_gallocr_free(alloc);
+    gk_free(gpu_ctx);
+    return bad == 0 ? 0 : 1;
+}
+
 int main(void) {
     gk_device_t device = gk_device_by_type(GK_DEVICE_TYPE_GPU);
     if (device == NULL) {
@@ -1053,6 +1178,43 @@ int main(void) {
         // still split, but with more than one query row per head
         failures += run_flash_attn(gpu, "small batch",
             (struct fa_shape) { 8, 4, 4, 1024, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+    }
+
+    // top_k on both sides of the width where one network stops fitting: 4096
+    // slots. Below it the row is sorted whole; above it the selection is done
+    // in rounds, and the two must give identical indices.
+    printf("top_k:\n");
+    {
+        // the in-network path, which the rounds have to agree with
+        failures += run_top_k(gpu, "moe 128 k=8",        128,    8,  17, TK_DISTINCT);
+        failures += run_top_k(gpu, "narrow 4096 k=40",   4096,   40,  1, TK_DISTINCT);
+
+        // one past the network's width: the rounds start here
+        failures += run_top_k(gpu, "wide 4097 k=40",     4097,   40,  1, TK_DISTINCT);
+        failures += run_top_k(gpu, "wide 8192 k=40",     8192,   40,  1, TK_DISTINCT);
+
+        // a real vocabulary row, which is what the old path could not do
+        failures += run_top_k(gpu, "vocab 262144 k=40",  262144, 40,  1, TK_DISTINCT);
+        failures += run_top_k(gpu, "vocab k=1",          262144,  1,  1, TK_DISTINCT);
+
+        // not a multiple of the chunk, so the last chunk is short and pads
+        failures += run_top_k(gpu, "ragged 100000 k=64", 100000, 64,  1, TK_DISTINCT);
+
+        // several rows at once, so the per-row candidate spans have to be
+        // indexed apart
+        failures += run_top_k(gpu, "wide rows",          20000,  16,  5, TK_DISTINCT);
+
+        // where the tie-break earns its keep
+        failures += run_top_k(gpu, "ties narrow",        2048,   32,  3, TK_TIES);
+        failures += run_top_k(gpu, "ties wide",          50000,  32,  2, TK_TIES);
+
+        // a fully masked row: every value -inf, so the padding sentinel is the
+        // only thing keeping real indices in the answer
+        failures += run_top_k(gpu, "all -inf wide",      50000,  24,  2, TK_ALL_NEG_INF);
+        failures += run_top_k(gpu, "some -inf wide",     50000,  24,  2, TK_SOME_NEG_INF);
+
+        // a k large enough to need more than one round
+        failures += run_top_k(gpu, "big k rounds",       262144, 1024, 1, TK_DISTINCT);
     }
 
     printf("composite graphs:\n");

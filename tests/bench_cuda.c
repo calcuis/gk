@@ -400,6 +400,15 @@ static struct gk_tensor * b_top_k_8k(struct gk_ctx * ctx) {
     return gk_top_k(ctx, a, 40);
 }
 
+// A vocabulary row, which is what the backend sampler's top_k sees. Before the
+// rounds this shape was not measurable - the fallback's cost grows with the
+// square of the row, and 262144 would have taken tens of seconds per call.
+static struct gk_tensor * b_top_k_vocab(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_2d(ctx, GK_TYPE_F32, 262144, 1);
+    gk_set_name(a, "logits");
+    return gk_top_k(ctx, a, 40);
+}
+
 static struct gk_tensor * b_argsort_moe(struct gk_ctx * ctx) {
     struct gk_tensor * a = gk_new_tensor_2d(ctx, GK_TYPE_F32, 128, N_PREFILL);
     gk_set_name(a, "logits");
@@ -573,6 +582,7 @@ static const struct bench_case g_cases[] = {
     { "sort and select", "top_k   moe",   "128x512 k=8",  b_top_k_moe,   ARENA_SMALL },
     { NULL,              "top_k   4096",  "4096 k=40",    b_top_k_4k,    ARENA_SMALL },
     { NULL,              "top_k   8192",  "8192 k=40",    b_top_k_8k,    ARENA_SMALL },
+    { NULL,              "top_k   vocab", "262144 k=40",  b_top_k_vocab, ARENA_MID   },
     { NULL,              "argsort moe",   "128x512",      b_argsort_moe, ARENA_SMALL },
 
     { "no device kernel today", "argmax        vocab", "262144",         b_argmax_vocab,       ARENA_SMALL },

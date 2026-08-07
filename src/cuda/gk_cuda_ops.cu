@@ -753,6 +753,39 @@ static __device__ __forceinline__ bool gk_cu_sort_before(const gk_cu_sort_smem &
     return s.idx[p] < s.idx[q];
 }
 
+// The network itself, over slots already staged in shared memory. Factored out
+// because three callers want it: the whole-row sort below, and the two halves
+// of the chunked selection further down.
+//
+// Every compare-exchange within a stage is independent, which is the shape a
+// block wants; the stages are log2(n_pad)*(log2(n_pad)+1)/2 of them, each
+// ending in a barrier.
+static __device__ __forceinline__ void gk_cu_sort_network(const gk_cu_sort_smem & s,
+                                                          int n_pad, bool desc) {
+    for (int stage = 2; stage <= n_pad; stage <<= 1) {
+        for (int step = stage >> 1; step > 0; step >>= 1) {
+            for (int i = threadIdx.x; i < n_pad; i += blockDim.x) {
+                const int j = i ^ step;
+                if (j <= i) {
+                    continue; // the other half of the pair does this one
+                }
+
+                // Halves of a stage are built in opposite directions so the
+                // next stage sees a bitonic sequence; only the last stage's
+                // direction is the answer's.
+                const bool up   = (i & stage) == 0;
+                const bool swap = up ? gk_cu_sort_before(s, j, i, desc)
+                                     : gk_cu_sort_before(s, i, j, desc);
+                if (swap) {
+                    const float   tv = s.val[i]; s.val[i] = s.val[j]; s.val[j] = tv;
+                    const int32_t ti = s.idx[i]; s.idx[i] = s.idx[j]; s.idx[j] = ti;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // A bitonic network in shared memory: log2(n_pad)*(log2(n_pad)+1)/2 stages,
 // every compare-exchange within a stage independent, which is the shape a
 // block wants. One block owns a row for the whole network, so the rows are
@@ -782,28 +815,7 @@ static __global__ void gk_cu_k_argsort(gk_tview a, gk_tview_mut d,
         }
         __syncthreads();
 
-        for (int stage = 2; stage <= n_pad; stage <<= 1) {
-            for (int step = stage >> 1; step > 0; step >>= 1) {
-                for (int i = threadIdx.x; i < n_pad; i += blockDim.x) {
-                    const int j = i ^ step;
-                    if (j <= i) {
-                        continue; // the other half of the pair does this one
-                    }
-
-                    // Halves of a stage are built in opposite directions so
-                    // the next stage sees a bitonic sequence; only the last
-                    // stage's direction is the answer's.
-                    const bool up   = (i & stage) == 0;
-                    const bool swap = up ? gk_cu_sort_before(s, j, i, desc)
-                                         : gk_cu_sort_before(s, i, j, desc);
-                    if (swap) {
-                        const float   tv = s.val[i]; s.val[i] = s.val[j]; s.val[j] = tv;
-                        const int32_t ti = s.idx[i]; s.idx[i] = s.idx[j]; s.idx[j] = ti;
-                    }
-                }
-                __syncthreads();
-            }
-        }
+        gk_cu_sort_network(s, n_pad, desc);
 
         // top_k promises no order, and says so by breaking the one it happens
         // to have - the same swap the CPU pass makes, so the two agree.
@@ -853,6 +865,200 @@ static __global__ void gk_cu_k_argsort_rank(gk_tview a, gk_tview_mut d,
             }
         }
     }
+}
+
+// --------------------------------------------------------------------------
+// top_k on a row too wide for one network
+//
+// The network above holds 4096 slots. A router row is 128 wide and fits with
+// room to spare; a vocabulary row is 262144 and does not, and what it used to
+// fall to was the ranking kernel - every element compared against every other,
+// in one block. Measured, that is 31 ms at a row of 8192 and grows with the
+// square: a real vocabulary row would have taken something like thirty
+// seconds, per token.
+//
+// But top_k is a selection, not a sort, and a selection composes. The k
+// largest of a row are the k largest of {the k largest of each chunk of it},
+// whatever the chunks are - anything not in the top k of its own chunk cannot
+// be in the top k overall, because the k elements that beat it in its chunk
+// beat it everywhere. So the row is cut into chunks the network does fit, each
+// block reduces its chunk to k candidates, and the round repeats on those
+// until what is left fits in one network.
+//
+// One round takes 262144 down to 2560 at k of 40, so in practice this is two
+// launches and never a third.
+//
+// The candidates travel as (value, index) pairs: the value because the next
+// round has to compare them, the index because it is what the op returns and
+// the position in the candidate array is not it.
+// --------------------------------------------------------------------------
+
+// Chunks are the widest the network takes, so that a round sheds as much as it
+// can. The reduction per round is k/chunk, so a small k converges at once.
+#define GK_CU_TOPK_CHUNK GK_CU_SORT_MAX_PAD
+
+// A round has to shrink the candidate list or the loop does not terminate.
+// Emitting k per chunk out of GK_CU_TOPK_CHUNK shrinks by k/chunk, so a k at
+// least half the chunk makes no useful progress and the caller keeps the old
+// path. No sampler or router comes near this - it is a guard, not a case.
+#define GK_CU_TOPK_MAX_K (GK_CU_TOPK_CHUNK / 2)
+
+// The sentinel a short chunk pads with. Every chunk emits the same count so
+// the next round can index its input without a per-chunk length: -inf loses
+// every comparison on value, and an index above any real one loses the tie
+// against a real element that is also -inf - which a fully masked row is made
+// of.
+#define GK_CU_TOPK_PAD_IDX INT32_MAX
+
+// One round. Reads either the source row (round 0, `in_val` NULL) or the
+// candidates a previous round left, and writes `m` candidates per chunk.
+static __global__ void gk_cu_k_top_k_chunk(gk_tview a,
+                                           const float * in_val, const int32_t * in_idx,
+                                           int64_t cur_n,
+                                           float * out_val, int32_t * out_idx,
+                                           int n_pad, int m, int n_chunks) {
+    extern __shared__ char gk_cu_topk_buf[];
+
+    gk_cu_sort_smem s;
+    s.val = (float *)   gk_cu_topk_buf;
+    s.idx = (int32_t *) (s.val + n_pad);
+
+    const int64_t ir = blockIdx.x;  // which row
+    const int64_t ic = blockIdx.y;  // which chunk of it
+
+    int64_t i1, i2, i3;
+    gk_cu_unrow(ir, a.ne, &i1, &i2, &i3);
+
+    const int64_t base = ic * GK_CU_TOPK_CHUNK;
+    const int64_t len  = cur_n - base < GK_CU_TOPK_CHUNK ? cur_n - base : GK_CU_TOPK_CHUNK;
+
+    for (int i = threadIdx.x; i < n_pad; i += blockDim.x) {
+        if (i < len) {
+            if (in_val == NULL) {
+                s.val[i] = gk_cu_get(a, base + i, i1, i2, i3);
+                s.idx[i] = (int32_t) (base + i);
+            } else {
+                s.val[i] = in_val[ir * cur_n + base + i];
+                s.idx[i] = in_idx[ir * cur_n + base + i];
+            }
+        } else {
+            s.val[i] = -INFINITY;
+            s.idx[i] = GK_CU_TOPK_PAD_IDX;
+        }
+    }
+    __syncthreads();
+
+    gk_cu_sort_network(s, n_pad, true);
+
+    // The top m of this chunk, at this chunk's slot in the next round's input.
+    const int64_t out_base = ir * ((int64_t) n_chunks * m) + ic * m;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        out_val[out_base + i] = s.val[i];
+        out_idx[out_base + i] = s.idx[i];
+    }
+}
+
+// The last round: what is left fits one network, so this sorts it and writes
+// the answer. Same tie-break and same deliberate scrambling of the first two
+// slots as the whole-row kernel, because this is the same op.
+static __global__ void gk_cu_k_top_k_final(const float * in_val, const int32_t * in_idx,
+                                           int64_t cur_n, gk_tview_mut d,
+                                           int n_pad, int64_t k_out) {
+    extern __shared__ char gk_cu_topk_buf[];
+
+    gk_cu_sort_smem s;
+    s.val = (float *)   gk_cu_topk_buf;
+    s.idx = (int32_t *) (s.val + n_pad);
+
+    const int64_t ir = blockIdx.x;
+
+    int64_t i1, i2, i3;
+    gk_cu_unrow(ir, d.ne, &i1, &i2, &i3);
+
+    for (int i = threadIdx.x; i < n_pad; i += blockDim.x) {
+        const bool real = i < cur_n;
+        s.val[i] = real ? in_val[ir * cur_n + i] : -INFINITY;
+        s.idx[i] = real ? in_idx[ir * cur_n + i] : GK_CU_TOPK_PAD_IDX;
+    }
+    __syncthreads();
+
+    gk_cu_sort_network(s, n_pad, true);
+
+    if (k_out > 1 && threadIdx.x == 0) {
+        const int32_t t = s.idx[0]; s.idx[0] = s.idx[1]; s.idx[1] = t;
+    }
+    __syncthreads();
+
+    for (int64_t i = threadIdx.x; i < k_out; i += blockDim.x) {
+        *(int32_t *) (gk_cu_row(d, i1, i2, i3) + i * d.nb[0]) = s.idx[i];
+    }
+}
+
+// Rounds until what is left fits one network. Returns false if the scratch it
+// needs cannot be had, which leaves the caller to fall back rather than fail.
+static bool gk_cu_top_k_wide(gkStream_t stream, struct gk_cuda_scratch * scratch,
+                             const struct gk_tensor * src0, struct gk_tensor * node,
+                             int64_t rows, int64_t n, int64_t k_out) {
+    if (scratch == NULL) {
+        return false;
+    }
+
+    const int m = (int) k_out;
+
+    // Two buffers, alternating: a round reads one and writes the other. The
+    // first round's output is the largest, so both are sized to it.
+    const int64_t n_chunks0 = (n + GK_CU_TOPK_CHUNK - 1) / GK_CU_TOPK_CHUNK;
+    const int64_t cap       = rows * n_chunks0 * m;
+
+    const size_t pair   = sizeof(float) + sizeof(int32_t);
+    const size_t needed = 2 * (size_t) cap * pair;
+
+    char * buf = (char *) gk_cu_scratch_get(scratch, needed, stream);
+    if (buf == NULL) {
+        return false;
+    }
+
+    float   * val[2] = { (float *) buf, (float *) (buf + (size_t) cap * pair) };
+    int32_t * idx[2] = { (int32_t *) (val[0] + cap), (int32_t *) (val[1] + cap) };
+
+    // Threads enough for half the network's slots, since each pair is handled
+    // once, and no more than a chunk can use.
+    const int block = GK_CU_SORT_MAX_BLOCK;
+    const size_t smem_chunk = (size_t) GK_CU_TOPK_CHUNK * pair;
+
+    int64_t cur_n = n;
+    int     cur   = 0;   // which buffer the next round writes
+    bool    first = true;
+
+    while (cur_n > GK_CU_SORT_MAX_PAD) {
+        const int64_t n_chunks = (cur_n + GK_CU_TOPK_CHUNK - 1) / GK_CU_TOPK_CHUNK;
+
+        dim3 grid;
+        grid.x = (unsigned) rows;
+        grid.y = (unsigned) n_chunks;
+        grid.z = 1;
+
+        gk_cu_k_top_k_chunk<<<grid, block, smem_chunk, stream>>>(
+            gk_cu_view(src0),
+            first ? NULL : val[1 - cur], first ? NULL : idx[1 - cur],
+            cur_n, val[cur], idx[cur],
+            GK_CU_TOPK_CHUNK, m, (int) n_chunks);
+
+        cur_n = n_chunks * m;
+        cur   = 1 - cur;
+        first = false;
+    }
+
+    int n_pad = 1;
+    while (n_pad < cur_n) {
+        n_pad <<= 1;
+    }
+
+    gk_cu_k_top_k_final<<<(unsigned) rows, block,
+                          (size_t) n_pad * pair, stream>>>(
+        val[1 - cur], idx[1 - cur], cur_n, gk_cu_view_mut(node), n_pad, k_out);
+
+    return true;
 }
 
 // --------------------------------------------------------------------------
@@ -1612,11 +1818,23 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_cu_k_argsort<<<grid, block, smem, stream>>>(
                     gk_cu_view(src0), gk_cu_view_mut(node),
                     n, (int) n_pad, k_out, desc, op == GK_OP_TOP_K, rows);
-            } else {
-                gk_cu_k_argsort_rank<<<grid, GK_CU_SORT_MAX_BLOCK, 0, stream>>>(
-                    gk_cu_view(src0), gk_cu_view_mut(node),
-                    n, k_out, desc, op == GK_OP_TOP_K, rows);
+                return true;
             }
+
+            // Too wide for one network. A selection can be done in rounds; a
+            // sort cannot, so only top_k takes this path.
+            if (op == GK_OP_TOP_K && k_out <= GK_CU_TOPK_MAX_K &&
+                gk_cu_top_k_wide(stream, scratch, src0, node, rows, n, k_out)) {
+                return true;
+            }
+
+            // What is left: a wide argsort, or a top_k with a k so large that
+            // rounds would not converge. Every element against every other,
+            // which is slow but finite - and the single-backend caller has no
+            // CPU to fall back to.
+            gk_cu_k_argsort_rank<<<grid, GK_CU_SORT_MAX_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view_mut(node),
+                n, k_out, desc, op == GK_OP_TOP_K, rows);
             return true;
         }
 
