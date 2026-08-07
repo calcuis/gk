@@ -81,6 +81,26 @@ static __device__ __forceinline__ float gk_cu_get(const gk_tview & t,
     }
 }
 
+// The same read with the type known at compile time. `t.type` is ignored and
+// TYPE is trusted, so a caller has to have dispatched on the runtime type to
+// reach the matching instantiation - which is what GK_CU_MM_DISPATCH does.
+template <int TYPE>
+static __device__ __forceinline__ float gk_cu_get_t(const gk_tview & t,
+                                                    int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    const char * row = gk_cu_row(t, i1, i2, i3);
+
+    // The float types keep their stride, which is what makes a permuted
+    // operand work; a quantized row is packed by definition and is indexed by
+    // block arithmetic instead. Same rule as the runtime version.
+    if (TYPE == GKT_F32)  { return *(const float *)    (row + i0 * t.nb[0]); }
+    if (TYPE == GKT_F16)  { return __half2float(*(const __half *) (row + i0 * t.nb[0])); }
+    if (TYPE == GKT_BF16) { return gk_cu_bf2f(*(const uint16_t *) (row + i0 * t.nb[0])); }
+    if (TYPE == GKT_I32)  { return (float) *(const int32_t *) (row + i0 * t.nb[0]); }
+    if (TYPE == GKT_I64)  { return (float) *(const int64_t *) (row + i0 * t.nb[0]); }
+
+    return gk_cu_row_elem_t<TYPE>(row, i0);
+}
+
 // Reading back what a kernel has just written. Only the float types can be a
 // destination, so this needs none of the quantized paths above.
 static __device__ __forceinline__ float gk_cu_get_mut(const gk_tview_mut & t,

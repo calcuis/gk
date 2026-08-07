@@ -190,6 +190,12 @@ static __device__ __host__ __forceinline__ int gk_cu_type_size(int type) {
 }
 
 // Whether a matmul weight of this type can be read by the kernels below.
+//
+// This list and GK_CU_MM_DISPATCH's must agree: supports_op promises the
+// scheduler that a weight of this type will be handled, and the dispatch is
+// what handles it. They are kept adjacent for that reason, and the dispatch
+// says loudly rather than quietly if it is ever asked for a type it has no
+// instantiation of.
 static __host__ __forceinline__ bool gk_cu_type_supported(int type) {
     switch (type) {
         case GKT_F32: case GKT_F16: case GKT_BF16:
@@ -202,6 +208,46 @@ static __host__ __forceinline__ bool gk_cu_type_supported(int type) {
             return false;
     }
 }
+
+// Turns a runtime weight type into a compile-time one, once per launch, so
+// that everything inside the kernel can be specialized. `LAUNCH` is a macro
+// taking the type constant; it is invoked exactly once, on the matching arm.
+//
+// The cost is instantiation count - one kernel per type per launcher - which
+// is the trade this whole file is making: a larger binary and a longer build
+// against a division and two branches per weight element at run time.
+#define GK_CU_MM_DISPATCH(type, LAUNCH)                                       \
+    switch (type) {                                                           \
+        case GKT_F32:    LAUNCH(GKT_F32);    break;                           \
+        case GKT_F16:    LAUNCH(GKT_F16);    break;                           \
+        case GKT_BF16:   LAUNCH(GKT_BF16);   break;                           \
+        case GKT_Q4_0:   LAUNCH(GKT_Q4_0);   break;                           \
+        case GKT_Q4_1:   LAUNCH(GKT_Q4_1);   break;                           \
+        case GKT_Q5_0:   LAUNCH(GKT_Q5_0);   break;                           \
+        case GKT_Q5_1:   LAUNCH(GKT_Q5_1);   break;                           \
+        case GKT_Q8_0:   LAUNCH(GKT_Q8_0);   break;                           \
+        case GKT_Q1_0:   LAUNCH(GKT_Q1_0);   break;                           \
+        case GKT_Q2_0:   LAUNCH(GKT_Q2_0);   break;                           \
+        case GKT_MXFP4:  LAUNCH(GKT_MXFP4);  break;                           \
+        case GKT_NVFP4:  LAUNCH(GKT_NVFP4);  break;                           \
+        case GKT_Q2_K:   LAUNCH(GKT_Q2_K);   break;                           \
+        case GKT_Q3_K:   LAUNCH(GKT_Q3_K);   break;                           \
+        case GKT_Q4_K:   LAUNCH(GKT_Q4_K);   break;                           \
+        case GKT_Q5_K:   LAUNCH(GKT_Q5_K);   break;                           \
+        case GKT_Q6_K:   LAUNCH(GKT_Q6_K);   break;                           \
+        case GKT_IQ4_NL: LAUNCH(GKT_IQ4_NL); break;                           \
+        case GKT_IQ4_XS: LAUNCH(GKT_IQ4_XS); break;                           \
+        case GKT_TQ1_0:  LAUNCH(GKT_TQ1_0);  break;                           \
+        case GKT_TQ2_0:  LAUNCH(GKT_TQ2_0);  break;                           \
+        default:                                                              \
+            /* supports_op said yes to a type with no instantiation: the two  \
+               lists above have drifted. Nothing is launched, so this would   \
+               otherwise be an untouched output buffer rather than an error. */ \
+            gk_logf("gk cuda: matmul has no kernel for weight type %d "       \
+                    "(gk_cu_type_supported and GK_CU_MM_DISPATCH disagree)\n", \
+                    (int) (type));                                            \
+            break;                                                            \
+    }
 
 // --------------------------------------------------------------------------
 // the decoders
@@ -482,6 +528,67 @@ static __device__ __forceinline__ float gk_cu_dq_tq2_0(const uint8_t * b, int j)
 // counts elements, so the block and the offset within it are worked out here
 // rather than by every caller.
 // --------------------------------------------------------------------------
+
+// The same decode, with the type known at compile time.
+//
+// This exists because the runtime version below is expensive in a way that is
+// invisible when you read it. `gk_cu_blck_size(type)` and `gk_cu_type_size(type)`
+// return runtime values, so `i / blck` is a 64-bit integer division by a
+// quantity the compiler cannot see - and no NVIDIA part has an integer divide
+// instruction, so that is tens of instructions, per element, before any
+// decoding happens. The two switches are branches for the same reason.
+//
+// With TYPE a template parameter all of it folds: every block size here is a
+// power of two, so the division becomes a shift and the modulo a mask, and
+// both switches become the one arm that survives dead-code elimination.
+//
+// The measurement that prompted this: a q4_0 matvec reads 3.6x less memory
+// than the same matmul in f32 and took longer, and every quantized format
+// landed within 25% of every other regardless of how many bytes it moved.
+// That is the signature of being bound by decode instructions rather than by
+// the memory system.
+template <int TYPE>
+static __device__ __forceinline__ float gk_cu_row_elem_t(const void * row, int64_t i) {
+    const uint8_t * p = (const uint8_t *) row;
+
+    // Not a switch: TYPE is a constant here, so each of these is either the
+    // whole function or nothing at all.
+    if (TYPE == GKT_F32)  { return ((const float *)    p)[i]; }
+    if (TYPE == GKT_F16)  { return __half2float(((const __half *) p)[i]); }
+    if (TYPE == GKT_BF16) { return gk_cu_bf2f(((const uint16_t *) p)[i]); }
+    if (TYPE == GKT_I32)  { return (float) ((const int32_t *) p)[i]; }
+    if (TYPE == GKT_I64)  { return (float) ((const int64_t *) p)[i]; }
+    if (TYPE == GKT_I16)  { return (float) ((const int16_t *) p)[i]; }
+    if (TYPE == GKT_I8)   { return (float) ((const int8_t  *) p)[i]; }
+
+    const int blck = gk_cu_blck_size(TYPE);
+    const int tsz  = gk_cu_type_size(TYPE);
+
+    const uint8_t * b = p + (i / blck) * tsz;
+    const int       j = (int) (i % blck);
+
+    switch (TYPE) {
+        case GKT_Q4_0:   return gk_cu_dq_q4_0  (b, j);
+        case GKT_Q4_1:   return gk_cu_dq_q4_1  (b, j);
+        case GKT_Q5_0:   return gk_cu_dq_q5_0  (b, j);
+        case GKT_Q5_1:   return gk_cu_dq_q5_1  (b, j);
+        case GKT_Q8_0:   return gk_cu_dq_q8_0  (b, j);
+        case GKT_Q1_0:   return gk_cu_dq_q1_0  (b, j);
+        case GKT_Q2_0:   return gk_cu_dq_q2_0  (b, j);
+        case GKT_MXFP4:  return gk_cu_dq_mxfp4 (b, j);
+        case GKT_NVFP4:  return gk_cu_dq_nvfp4 (b, j);
+        case GKT_Q2_K:   return gk_cu_dq_q2_k  (b, j);
+        case GKT_Q3_K:   return gk_cu_dq_q3_k  (b, j);
+        case GKT_Q4_K:   return gk_cu_dq_q4_k  (b, j);
+        case GKT_Q5_K:   return gk_cu_dq_q5_k  (b, j);
+        case GKT_Q6_K:   return gk_cu_dq_q6_k  (b, j);
+        case GKT_IQ4_NL: return gk_cu_dq_iq4_nl(b, j);
+        case GKT_IQ4_XS: return gk_cu_dq_iq4_xs(b, j);
+        case GKT_TQ1_0:  return gk_cu_dq_tq1_0 (b, j);
+        case GKT_TQ2_0:  return gk_cu_dq_tq2_0 (b, j);
+        default:         return 0.0f; // unreachable: supports_op filtered it
+    }
+}
 
 static __device__ __forceinline__ float gk_cu_row_elem(const void * row, int type, int64_t i) {
     const uint8_t * p = (const uint8_t *) row;

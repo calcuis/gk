@@ -90,7 +90,7 @@ static __device__ __forceinline__ void gk_cu_reduce_n(float (&acc)[NC], float * 
 // query heads and each key head serves a group.
 // --------------------------------------------------------------------------
 
-template <int NC>
+template <int NC, int ATYPE>
 static __global__ void gk_cu_k_mul_mat(gk_tview a, gk_tview b, gk_tview_mut d,
                                        int64_t k_len, int64_t r2, int64_t r3) {
     extern __shared__ float shared[];
@@ -114,7 +114,7 @@ static __global__ void gk_cu_k_mul_mat(gk_tview a, gk_tview b, gk_tview_mut d,
     for (int64_t kk = threadIdx.x; kk < k_len; kk += blockDim.x) {
         // the reuse this kernel exists for: one decode of the weight element,
         // NC multiplies against it
-        const float av = gk_cu_get(a, kk, i0, a2, a3);
+        const float av = gk_cu_get_t<ATYPE>(a, kk, i0, a2, a3);
 
 #pragma unroll
         for (int j = 0; j < NC; ++j) {
@@ -147,6 +147,7 @@ static __global__ void gk_cu_k_mul_mat(gk_tview a, gk_tview b, gk_tview_mut d,
 // in the patch and no cross-block reduction is needed.
 // --------------------------------------------------------------------------
 
+template <int ATYPE>
 static __global__ void gk_cu_k_mul_mat_tiled(gk_tview a, gk_tview b, gk_tview_mut d,
                                              int64_t k_len, int64_t r2, int64_t r3) {
     __shared__ float As[GK_CU_MM_TILE_K][GK_CU_MM_TILE_M];
@@ -189,7 +190,7 @@ static __global__ void gk_cu_k_mul_mat_tiled(gk_tview a, gk_tview b, gk_tview_mu
             const int     kk = e % GK_CU_MM_TILE_K;
             const int64_t k  = k0 + kk;
             const int64_t m  = m0 + mm;
-            As[kk][mm] = (k < k_len && m < n_rows) ? gk_cu_get(a, k, m, a2, a3) : 0.0f;
+            As[kk][mm] = (k < k_len && m < n_rows) ? gk_cu_get_t<ATYPE>(a, k, m, a2, a3) : 0.0f;
         }
 #pragma unroll
         for (int e = tid; e < GK_CU_MM_TILE_N * GK_CU_MM_TILE_K; e += 256) {
@@ -260,8 +261,12 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
         tgrid.y = (unsigned) ((dst->ne[1] + GK_CU_MM_TILE_N - 1) / GK_CU_MM_TILE_N);
         tgrid.z = (unsigned) (dst->ne[2] * dst->ne[3]);
 
-        gk_cu_k_mul_mat_tiled<<<tgrid, dim3(16, 16), 0, stream>>>(
-            gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3);
+#define GK_CU_LAUNCH_TILED(T)                                              \
+        gk_cu_k_mul_mat_tiled<T><<<tgrid, dim3(16, 16), 0, stream>>>(      \
+            gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
+
+        GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_TILED);
+#undef GK_CU_LAUNCH_TILED
         return;
     }
 
@@ -274,13 +279,24 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
     // real. Below NC columns the extra accumulators would sit idle.
     if (dst->ne[1] < GK_CU_MM_NC) {
         grid.y = (unsigned) dst->ne[1];
-        gk_cu_k_mul_mat<1><<<grid, GK_CU_MM_BLOCK, n_warps * sizeof(float), stream>>>(
-            gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3);
+
+#define GK_CU_LAUNCH_MV1(T)                                                \
+        gk_cu_k_mul_mat<1, T><<<grid, GK_CU_MM_BLOCK,                      \
+                                n_warps * sizeof(float), stream>>>(        \
+            gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
+
+        GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MV1);
+#undef GK_CU_LAUNCH_MV1
     } else {
         grid.y = (unsigned) ((dst->ne[1] + GK_CU_MM_NC - 1) / GK_CU_MM_NC);
-        gk_cu_k_mul_mat<GK_CU_MM_NC><<<grid, GK_CU_MM_BLOCK,
-                                       GK_CU_MM_NC * n_warps * sizeof(float), stream>>>(
-            gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3);
+
+#define GK_CU_LAUNCH_MVN(T)                                                \
+        gk_cu_k_mul_mat<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK,            \
+                GK_CU_MM_NC * n_warps * sizeof(float), stream>>>(          \
+            gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
+
+        GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MVN);
+#undef GK_CU_LAUNCH_MVN
     }
 }
 
@@ -292,6 +308,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
 // the expert index is read per block rather than per element.
 // --------------------------------------------------------------------------
 
+template <int ATYPE>
 static __global__ void gk_cu_k_mul_mat_id(gk_tview as, gk_tview b, gk_tview ids,
                                           gk_tview_mut d, int64_t k_len) {
     extern __shared__ float shared[];
@@ -305,7 +322,7 @@ static __global__ void gk_cu_k_mul_mat_id(gk_tview as, gk_tview b, gk_tview ids,
     float acc[1] = { 0.0f };
 
     for (int64_t kk = threadIdx.x; kk < k_len; kk += blockDim.x) {
-        acc[0] += gk_cu_get(as, kk, i0, expert, 0) * gk_cu_get(b, kk, 0, it, 0);
+        acc[0] += gk_cu_get_t<ATYPE>(as, kk, i0, expert, 0) * gk_cu_get(b, kk, 0, it, 0);
     }
 
     gk_cu_reduce_n<1>(acc, shared);
@@ -327,8 +344,13 @@ void gk_cuda_mul_mat_id(gkStream_t stream, struct gk_tensor * dst) {
 
     const int n_warps = GK_CU_MM_BLOCK / GK_WARP_SIZE;
 
-    gk_cu_k_mul_mat_id<<<grid, GK_CU_MM_BLOCK, n_warps * sizeof(float), stream>>>(
-        gk_cu_view(as), gk_cu_view(src1), gk_cu_view(ids), gk_cu_view_mut(dst), as->ne[0]);
+#define GK_CU_LAUNCH_ID(T)                                                 \
+    gk_cu_k_mul_mat_id<T><<<grid, GK_CU_MM_BLOCK,                          \
+                            n_warps * sizeof(float), stream>>>(            \
+        gk_cu_view(as), gk_cu_view(src1), gk_cu_view(ids), gk_cu_view_mut(dst), as->ne[0])
+
+    GK_CU_MM_DISPATCH((int) as->type, GK_CU_LAUNCH_ID);
+#undef GK_CU_LAUNCH_ID
 }
 
 // --------------------------------------------------------------------------
