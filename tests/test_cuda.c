@@ -359,6 +359,200 @@ static struct gk_tensor * build_ssm_scan_m1(struct gk_ctx * ctx, struct gk_tenso
 
 
 // --------------------------------------------------------------------------
+// The depthwise convolution and the linear-attention recurrences.
+//
+// The convolution is here in both layouts the builders emit: the ordinary
+// WHCN one, and the channels-fastest CWHN a permuted input produces, which the
+// kernel only gets right by reading through strides rather than assuming a
+// packing. The recurrences are shaped like the models that use them - RWKV's
+// heads are 64 wide, the delta rule's 128 - and are run over several tokens,
+// because a single token would never exercise the state chaining forward.
+// --------------------------------------------------------------------------
+
+static struct gk_tensor * build_conv_2d_dw(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 3, 3, 1, 5);  // kernel, one plane per channel
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 13, 11, 5, 2); // image
+    *n_in = 2;
+    return gk_conv_2d_dw_direct(ctx, in[0], in[1], 1, 1, 1, 1, 1, 1);
+}
+
+static struct gk_tensor * build_conv_2d_dw_f16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 3, 1, 5);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 13, 11, 5, 2);
+    *n_in = 2;
+    return gk_conv_2d_dw_direct(ctx, in[0], in[1], 1, 1, 1, 1, 1, 1);
+}
+
+// Stride 2 and no padding, which is what MobileNetV5's downsampling stages
+// ask for and what makes the window arithmetic worth checking separately.
+static struct gk_tensor * build_conv_2d_dw_s2(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 3, 1, 4);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 16, 16, 4, 1);
+    *n_in = 2;
+    return gk_conv_2d_dw_direct(ctx, in[0], in[1], 2, 2, 0, 0, 1, 1);
+}
+
+// The channels-fastest layout: the image is built transposed and permuted back,
+// so its channel stride is the innermost one.
+static struct gk_tensor * build_conv_2d_dw_cwhn(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 3, 3, 1, 5);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 5, 13, 11, 2); // [C, W, H, N]
+    *n_in = 2;
+
+    // src axis 0 (C) becomes axis 2, W becomes 0, H becomes 1
+    struct gk_tensor * img = gk_permute(ctx, in[1], 2, 0, 1, 3); // -> [W, H, C, N]
+    return gk_conv_2d_dw_direct(ctx, in[0], img, 1, 1, 1, 1, 1, 1);
+}
+
+static struct gk_tensor * build_rwkv_wkv6(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t S = 64, H = 3, T = 7, n_seqs = 1;
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // k
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // v
+    in[2] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // r
+    in[3] = gk_new_tensor_2d(ctx, GK_TYPE_F32, S, H);          // time-mix first
+    in[4] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // decay
+    in[5] = gk_new_tensor_2d(ctx, GK_TYPE_F32, S * S * H, n_seqs);
+    *n_in = 6;
+    return gk_rwkv_wkv6(ctx, in[0], in[1], in[2], in[3], in[4], in[5]);
+}
+
+// Two sequences, so the state has to be re-read from the input at each
+// sequence boundary rather than carried across it.
+static struct gk_tensor * build_rwkv_wkv6_seqs(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t S = 64, H = 2, T = 8, n_seqs = 2;
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);
+    in[2] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);
+    in[3] = gk_new_tensor_2d(ctx, GK_TYPE_F32, S, H);
+    in[4] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);
+    in[5] = gk_new_tensor_2d(ctx, GK_TYPE_F32, S * S * H, n_seqs);
+    *n_in = 6;
+    return gk_rwkv_wkv6(ctx, in[0], in[1], in[2], in[3], in[4], in[5]);
+}
+
+// The decay and the two feedback vectors are scaled down before they reach the
+// recurrence. Left at the harness's own fill they are order 1, the state grows
+// token over token, and the outputs come out in the tens of thousands - where
+// the relative tolerance is tens of thousands of times looser than it looks and
+// would wave through a kernel that was merely close. Scaled, the recurrence
+// settles and the comparison is worth something: this case lands at 1e-6
+// rather than at 2.5.
+static struct gk_tensor * build_rwkv_wkv7(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t S = 64, H = 3, T = 7, n_seqs = 1;
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // r
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // w, the decay
+    in[2] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // k
+    in[3] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // v
+    in[4] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // a
+    in[5] = gk_new_tensor_3d(ctx, GK_TYPE_F32, S, H, T);       // b
+    in[6] = gk_new_tensor_2d(ctx, GK_TYPE_F32, S * S * H, n_seqs);
+    *n_in = 7;
+
+    return gk_rwkv_wkv7(ctx, in[0],
+                        gk_scale(ctx, in[1], 0.1f),
+                        in[2], in[3],
+                        gk_scale(ctx, in[4], 0.1f),
+                        gk_scale(ctx, in[5], 0.1f),
+                        in[6]);
+}
+
+static struct gk_tensor * gdn_common(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in,
+                                     int64_t S, int64_t H, int64_t T, int64_t n_seqs,
+                                     bool kda, int64_t K) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, S, H, T, n_seqs);        // q
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, S, H, T, n_seqs);        // k
+    in[2] = gk_new_tensor_4d(ctx, GK_TYPE_F32, S, H, T, n_seqs);        // v
+    in[3] = gk_new_tensor_4d(ctx, GK_TYPE_F32, kda ? S : 1, H, T, n_seqs); // gate
+    in[4] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 1, H, T, n_seqs);        // beta
+    in[5] = gk_new_tensor_4d(ctx, GK_TYPE_F32, S, S, H, n_seqs);        // state
+    *n_in = 6;
+    return gk_gated_delta_net(ctx, in[0], in[1], in[2], in[3], in[4], in[5], K);
+}
+
+// The scalar gate: one decay for the whole head, which is Qwen3-Next's form.
+static struct gk_tensor * build_gdn_scalar(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return gdn_common(ctx, in, n_in, 32, 3, 6, 1, false, 1);
+}
+
+// The per-channel gate, which is KDA's, and the only path with a barrier.
+static struct gk_tensor * build_gdn_kda(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return gdn_common(ctx, in, n_in, 32, 3, 6, 1, true, 1);
+}
+
+// K above one, so older states are snapshotted as the token loop passes them.
+static struct gk_tensor * build_gdn_snapshots(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return gdn_common(ctx, in, n_in, 32, 2, 6, 1, false, 3);
+}
+
+static struct gk_tensor * build_gdn_seqs(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return gdn_common(ctx, in, n_in, 32, 2, 5, 2, true, 1);
+}
+
+// The padding, reduction and scan kernels. The shapes here are chosen to land
+// off every boundary the implementations care about: a row that is not a
+// multiple of the scan's chunk, a pad wider than a warp, a reduction row that
+// is not a multiple of the block.
+static struct gk_tensor * build_pad_reflect_1d(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 97, 5);
+    *n_in = 1;
+    return gk_pad_reflect_1d(ctx, in[0], 13, 7);
+}
+
+// The largest reflection the op allows: a pad one short of the row, which is
+// where an off-by-one in the mirror shows up.
+static struct gk_tensor * build_pad_reflect_edge(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 40, 3);
+    *n_in = 1;
+    return gk_pad_reflect_1d(ctx, in[0], 39, 39);
+}
+
+static struct gk_tensor * build_argmax(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 1000, 7);
+    *n_in = 1;
+    return gk_argmax(ctx, in[0]);
+}
+
+// A row wider than one block can cover in a pass, so the reduction has to
+// combine partial winners rather than just scan.
+static struct gk_tensor * build_argmax_wide(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 262144, 2);
+    *n_in = 1;
+    return gk_argmax(ctx, in[0]);
+}
+
+static struct gk_tensor * build_cumsum(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 333, 4, 2);
+    *n_in = 1;
+    return gk_cumsum(ctx, in[0]);
+}
+
+// Several chunks, the last one short: the three-pass scan has to carry a
+// prefix across chunk boundaries and stop at the row's real end.
+static struct gk_tensor * build_cumsum_wide(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 20011, 3);
+    *n_in = 1;
+    return gk_cumsum(ctx, in[0]);
+}
+
+static struct gk_tensor * build_im2col_3d(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t IC = 2, N = 2;
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 3, 2, IC * 4); // kernel, shape only
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 9, 7, 5, IC * N); // volume
+    *n_in = 2;
+    return gk_im2col_3d(ctx, in[0], in[1], IC, 1, 1, 1, 0, 0, 0, 1, 1, 1, GK_TYPE_F32);
+}
+
+// f16 output, strided and padded, which is the form a video patch embedding
+// actually asks for.
+static struct gk_tensor * build_im2col_3d_f16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t IC = 3, N = 1;
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 2, 2, 2, IC * 5);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 11, 9, 6, IC * N);
+    *n_in = 2;
+    return gk_im2col_3d(ctx, in[0], in[1], IC, 2, 2, 2, 1, 1, 1, 1, 1, 1, GK_TYPE_F16);
+}
+
+// --------------------------------------------------------------------------
 // The diffusion op set.
 //
 // A transformer decoder exercises a narrow slice of this backend; an image
@@ -1073,6 +1267,91 @@ static int run_top_k(gk_backend_t gpu, const char * name,
     return bad == 0 ? 0 : 1;
 }
 
+// argsort, which shares top_k's data patterns but returns a whole permutation
+// rather than a selection - so a wrong tie-break shows up as a transposed pair
+// somewhere in the middle rather than as a missing index, and the comparison
+// has to cover every slot.
+static int run_argsort(gk_backend_t gpu, const char * name,
+                       int64_t n, int64_t rows, enum gk_sort_order order,
+                       enum tk_data mode) {
+    const size_t in_bytes = (size_t) n * rows * sizeof(float);
+
+    struct gk_ctx * gpu_ctx = gk_init((struct gk_init_params) {
+        .mem_size = 64u << 20, .mem_buffer = NULL, .no_alloc = true,
+    });
+    struct gk_tensor * ga   = gk_new_tensor_2d(gpu_ctx, GK_TYPE_F32, n, rows);
+    struct gk_tensor * gout = gk_argsort(gpu_ctx, ga, order);
+    gk_set_output(gout);
+    struct gk_cgraph * gpu_graph = gk_new_graph(gpu_ctx);
+    gk_build_forward_expand(gpu_graph, gout);
+
+    if (!gk_backend_supports_op(gpu, gout)) {
+        printf("  %-20s FAIL: the backend declines the op\n", name);
+        gk_free(gpu_ctx);
+        return 1;
+    }
+
+    struct gk_gallocr * alloc = gk_gallocr_new(gk_backend_get_default_buffer_type(gpu));
+    if (alloc == NULL || !gk_gallocr_alloc_graph(alloc, gpu_graph)) {
+        printf("  %-20s FAIL: could not allocate the device graph\n", name);
+        gk_free(gpu_ctx);
+        return 1;
+    }
+
+    struct gk_ctx * cpu_ctx = gk_init((struct gk_init_params) {
+        .mem_size = 256u << 20, .mem_buffer = NULL, .no_alloc = false,
+    });
+    struct gk_tensor * ca   = gk_new_tensor_2d(cpu_ctx, GK_TYPE_F32, n, rows);
+    struct gk_tensor * cout = gk_argsort(cpu_ctx, ca, order);
+    struct gk_cgraph * cpu_graph = gk_new_graph(cpu_ctx);
+    gk_build_forward_expand(cpu_graph, cout);
+
+    float * values = (float *) malloc(in_bytes);
+    tk_fill(values, n, rows, mode);
+    memcpy(ca->data, values, in_bytes);
+    gk_backend_tensor_set(ga, values, 0, in_bytes);
+    free(values);
+
+    if (gk_graph_compute(cpu_graph, 4) != GK_STATUS_SUCCESS) {
+        printf("  %-20s FAIL: the CPU reference failed\n", name);
+        return 1;
+    }
+    if (gk_backend_graph_compute(gpu, gpu_graph) != GK_STATUS_SUCCESS) {
+        printf("  %-20s FAIL: the device graph failed\n", name);
+        return 1;
+    }
+    gk_backend_synchronize(gpu);
+
+    const int64_t no = n * rows;
+    int32_t * got = (int32_t *) malloc((size_t) no * sizeof(int32_t));
+    gk_backend_tensor_get(gout, got, 0, (size_t) no * sizeof(int32_t));
+    const int32_t * want = (const int32_t *) cout->data;
+
+    int bad = 0;
+    int first_at = -1;
+    for (int64_t i = 0; i < no; ++i) {
+        if (got[i] != want[i]) {
+            if (first_at < 0) {
+                first_at = (int) i;
+            }
+            bad++;
+        }
+    }
+
+    if (bad == 0) {
+        printf("  %-20s %7lld indices, exact\n", name, (long long) no);
+    } else {
+        printf("  %-20s %7lld indices, %d differ (first at %d: got %d, want %d)  FAIL\n",
+               name, (long long) no, bad, first_at, got[first_at], want[first_at]);
+    }
+
+    free(got);
+    gk_free(cpu_ctx);
+    gk_gallocr_free(alloc);
+    gk_free(gpu_ctx);
+    return bad == 0 ? 0 : 1;
+}
+
 int main(void) {
     gk_device_t device = gk_device_by_type(GK_DEVICE_TYPE_GPU);
     if (device == NULL) {
@@ -1105,6 +1384,37 @@ int main(void) {
     failures += run_op(gpu, "ssm_scan m2",   build_ssm_scan_m2);
     failures += run_op(gpu, "ssm_scan m1",   build_ssm_scan_m1);
     failures += run_op(gpu, "mul_mat empty", build_empty_mul_mat);
+
+    // The recurrences chain a state forward and each token's error feeds the
+    // next, so they are held to a looser bound than a stateless op: 1e-4 is
+    // above the drift a few tokens of f32 accumulation produce and well below
+    // anything a wrong recurrence gives.
+    printf("depthwise convolution and recurrences:\n");
+    failures += run_op(gpu, "conv_2d_dw",     build_conv_2d_dw);
+    failures += run_op(gpu, "conv_2d_dw f16", build_conv_2d_dw_f16);
+    failures += run_op(gpu, "conv_2d_dw s2",  build_conv_2d_dw_s2);
+    failures += run_op(gpu, "conv_dw cwhn",   build_conv_2d_dw_cwhn);
+    failures += run_op(gpu, "rwkv_wkv6",      build_rwkv_wkv6);
+    failures += run_op(gpu, "rwkv_wkv6 seqs", build_rwkv_wkv6_seqs);
+    failures += run_op(gpu, "rwkv_wkv7",      build_rwkv_wkv7);
+    failures += run_op(gpu, "gdn scalar",     build_gdn_scalar);
+    failures += run_op(gpu, "gdn kda",        build_gdn_kda);
+    failures += run_op(gpu, "gdn snapshots",  build_gdn_snapshots);
+    failures += run_op(gpu, "gdn seqs",       build_gdn_seqs);
+
+    printf("padding, reductions and the scan:\n");
+    failures += run_op(gpu, "pad_reflect_1d", build_pad_reflect_1d);
+    failures += run_op(gpu, "pad_reflect max", build_pad_reflect_edge);
+    failures += run_op(gpu, "argmax",         build_argmax);
+    failures += run_op(gpu, "argmax wide",    build_argmax_wide);
+    failures += run_op(gpu, "im2col_3d",      build_im2col_3d);
+    failures += run_op(gpu, "im2col_3d f16",  build_im2col_3d_f16);
+    // The scan sums in a different order from the CPU's straight walk - that
+    // is what makes it parallel - so it is held to a relative bound rather
+    // than to equality. 1e-4 is far above the reassociation and far below a
+    // dropped or double-counted chunk.
+    failures += run_op(gpu, "cumsum",         build_cumsum);
+    failures += run_op(gpu, "cumsum wide",    build_cumsum_wide);
 
     printf("diffusion op set:\n");
     failures += run_op(gpu, "norm",           build_norm);
@@ -1215,6 +1525,36 @@ int main(void) {
 
         // a k large enough to need more than one round
         failures += run_top_k(gpu, "big k rounds",       262144, 1024, 1, TK_DISTINCT);
+    }
+
+    // argsort across the same boundary. Unlike top_k this returns the whole
+    // permutation, so every slot is compared - a tie-break that disagrees with
+    // the CPU shows up as a transposed pair in the middle, not as a missing
+    // index at the front.
+    printf("argsort:\n");
+    {
+        // the in-network path both directions, as the reference for the rest
+        failures += run_argsort(gpu, "narrow desc",   1024,  3, GK_SORT_ORDER_DESC, TK_DISTINCT);
+        failures += run_argsort(gpu, "narrow asc",    1024,  3, GK_SORT_ORDER_ASC,  TK_DISTINCT);
+
+        // one past the network's width: out of global memory from here
+        failures += run_argsort(gpu, "wide 4097",     4097,  1, GK_SORT_ORDER_DESC, TK_DISTINCT);
+        failures += run_argsort(gpu, "wide 8192 asc", 8192,  1, GK_SORT_ORDER_ASC,  TK_DISTINCT);
+
+        // not a power of two, so the padding has to sort past every real slot
+        failures += run_argsort(gpu, "ragged 20000",  20000, 2, GK_SORT_ORDER_DESC, TK_DISTINCT);
+        failures += run_argsort(gpu, "ragged asc",    20000, 2, GK_SORT_ORDER_ASC,  TK_DISTINCT);
+
+        // where the tie-break decides most of the answer
+        failures += run_argsort(gpu, "wide ties",     50000, 2, GK_SORT_ORDER_DESC, TK_TIES);
+        failures += run_argsort(gpu, "wide ties asc", 50000, 2, GK_SORT_ORDER_ASC,  TK_TIES);
+
+        // every value the same, so the whole permutation is the tie-break
+        failures += run_argsort(gpu, "all -inf",      50000, 2, GK_SORT_ORDER_DESC, TK_ALL_NEG_INF);
+        failures += run_argsort(gpu, "some -inf",     50000, 2, GK_SORT_ORDER_ASC,  TK_SOME_NEG_INF);
+
+        // a real vocabulary row, which is the shape the sampler argsorts
+        failures += run_argsort(gpu, "vocab 262144",  262144, 1, GK_SORT_ORDER_DESC, TK_DISTINCT);
     }
 
     printf("composite graphs:\n");

@@ -415,6 +415,21 @@ static struct gk_tensor * b_argsort_moe(struct gk_ctx * ctx) {
     return gk_argsort(ctx, a, GK_SORT_ORDER_DESC);
 }
 
+// A whole permutation of a row too wide for one network, which is what the
+// backend sampler's top-p needs: it sorts the logits, sorts the candidates by
+// the same order, and walks the cumulative distribution.
+static struct gk_tensor * b_argsort_8k(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_2d(ctx, GK_TYPE_F32, 8192, 1);
+    gk_set_name(a, "logits");
+    return gk_argsort(ctx, a, GK_SORT_ORDER_DESC);
+}
+
+static struct gk_tensor * b_argsort_vocab(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_2d(ctx, GK_TYPE_F32, 262144, 1);
+    gk_set_name(a, "logits");
+    return gk_argsort(ctx, a, GK_SORT_ORDER_DESC);
+}
+
 // --------------------------------------------------------------------------
 // ops with no device kernel
 //
@@ -583,9 +598,12 @@ static const struct bench_case g_cases[] = {
     { NULL,              "top_k   4096",  "4096 k=40",    b_top_k_4k,    ARENA_SMALL },
     { NULL,              "top_k   8192",  "8192 k=40",    b_top_k_8k,    ARENA_SMALL },
     { NULL,              "top_k   vocab", "262144 k=40",  b_top_k_vocab, ARENA_MID   },
-    { NULL,              "argsort moe",   "128x512",      b_argsort_moe, ARENA_SMALL },
+    { NULL,              "argsort moe",   "128x512",      b_argsort_moe,   ARENA_SMALL },
+    { NULL,              "argsort 8192",  "8192",         b_argsort_8k,    ARENA_SMALL },
+    { NULL,              "argsort vocab", "262144",       b_argsort_vocab, ARENA_MID   },
 
-    { "no device kernel today", "argmax        vocab", "262144",         b_argmax_vocab,       ARENA_SMALL },
+    { "convolution, recurrences and the sampler's helpers",
+                                "argmax        vocab", "262144",         b_argmax_vocab,       ARENA_SMALL },
     { NULL,                     "cumsum        vocab", "262144",         b_cumsum_vocab,       ARENA_SMALL },
     { NULL,                     "conv_2d_dw",          "128x128x512 3x3", b_conv_2d_dw,        ARENA_MID   },
     { NULL,                     "conv_2d_dw_direct",   "128x128x512 3x3", b_conv_2d_dw_direct, ARENA_MID   },
@@ -893,9 +911,13 @@ int main(int argc, char ** argv) {
     printf("\nops with no device kernel, by what the CPU spends on them.\n");
     printf("the real cost is higher: each one splits the graph and moves its\n");
     printf("operands across the bus in both directions.\n\n");
-    printf("  %-22s %-18s %10s\n", "op", "shape", "CPU ms");
-    for (int i = 0; i < n_gone; ++i) {
-        printf("  %-22s %-18s %10.4f\n", gone[i].name, gone[i].shape, gone[i].cpu_ms);
+    if (n_gone == 0) {
+        printf("  none - every op measured here has one.\n");
+    } else {
+        printf("  %-22s %-18s %10s\n", "op", "shape", "CPU ms");
+        for (int i = 0; i < n_gone; ++i) {
+            printf("  %-22s %-18s %10.4f\n", gone[i].name, gone[i].shape, gone[i].cpu_ms);
+        }
     }
     printf("\n");
 

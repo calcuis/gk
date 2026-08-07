@@ -128,6 +128,18 @@ static __device__ __forceinline__ gk_cu_idx gk_cu_decompose(int64_t k, const int
     return x;
 }
 
+// RWKV-6 gives every slot of a head its own thread, so its block has to be at
+// least as wide as the head, rounded up to a whole warp.
+
+static __host__ __forceinline__ int gk_cu_round_warp(int64_t n) {
+    return (int) ((n + GK_WARP_SIZE - 1) / GK_WARP_SIZE) * GK_WARP_SIZE;
+}
+
+// The other two recurrences give a whole warp to each row and stride their
+// rows over the warps, so any warp-shaped block is correct and this is only a
+// tuning choice.
+#define GK_CU_RECURRENT_BLOCK 256
+
 #define GK_CU_FLAT_LOOP(n) \
     for (int64_t k = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; \
          k < (n); k += (int64_t) gridDim.x * blockDim.x)
@@ -868,6 +880,335 @@ static __global__ void gk_cu_k_argsort_rank(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// reflected padding, argmax, and the prefix sum
+// --------------------------------------------------------------------------
+
+// The reflection: the pad on each side mirrors the row about its end element,
+// which is not repeated. Written as a map from the output position back to the
+// input one, so it stays one thread per output element.
+static __global__ void gk_cu_k_pad_reflect_1d(gk_tview a, gk_tview_mut d,
+                                              int p0, int p1, int64_t n, int64_t total) {
+    GK_CU_FLAT_LOOP(total) {
+        const gk_cu_idx o = gk_cu_decompose(k, d.ne);
+
+        int64_t src;
+        if (o.i0 < p0) {
+            src = p0 - o.i0;              // left pad mirrors forwards
+        } else if (o.i0 < p0 + n) {
+            src = o.i0 - p0;              // the row itself
+        } else {
+            src = 2 * n - 2 - (o.i0 - p0); // right pad mirrors backwards
+        }
+
+        gk_cu_set(d, o.i0, o.i1, o.i2, o.i3, gk_cu_get(a, src, o.i1, o.i2, o.i3));
+    }
+}
+
+// One block per row. Ties keep the lowest index, which is what the CPU pass's
+// strictly-greater comparison gives, so the reduction has to break them the
+// same way rather than take whichever half it saw first.
+static __global__ void gk_cu_k_argmax(gk_tview a, int32_t * d, int64_t n) {
+    extern __shared__ char gk_cu_argmax_buf[];
+
+    float   * s_val = (float *)   gk_cu_argmax_buf;
+    int32_t * s_idx = (int32_t *) (s_val + blockDim.x);
+
+    const int64_t i1 = blockIdx.x;
+
+    float   best  = -INFINITY;
+    int32_t bestx = 0;
+
+    // A thread walks its own indices in increasing order, so a strict
+    // comparison already keeps the lowest of any it sees.
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = gk_cu_get(a, i, i1, 0, 0);
+        if (v > best) {
+            best  = v;
+            bestx = (int32_t) i;
+        }
+    }
+
+    s_val[threadIdx.x] = best;
+    s_idx[threadIdx.x] = bestx;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            const float   ov = s_val[threadIdx.x + stride];
+            const int32_t ox = s_idx[threadIdx.x + stride];
+            const float   cv = s_val[threadIdx.x];
+            const int32_t cx = s_idx[threadIdx.x];
+
+            if (ov > cv || (ov == cv && ox < cx)) {
+                s_val[threadIdx.x] = ov;
+                s_idx[threadIdx.x] = ox;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        d[i1] = s_idx[0];
+    }
+}
+
+// The prefix sum, in three passes.
+//
+// A prefix sum is sequential by definition, and doing it that way - one block
+// walking a row - would leave a vocabulary row to a single multiprocessor. So
+// the row is cut into chunks: pass one totals each chunk, pass two scans those
+// totals, pass three scans each chunk starting from its total's prefix. Only
+// pass two is serial, and it is over the chunk count rather than the row.
+#define GK_CU_SCAN_BLOCK 256
+#define GK_CU_SCAN_CHUNK (GK_CU_SCAN_BLOCK * 16)
+
+// An inclusive scan of one value per thread, across the block. Returns the
+// running total of the whole block in `total` for the caller to carry.
+static __device__ __forceinline__ float gk_cu_block_scan(float v, float * sh, float * total) {
+    sh[threadIdx.x] = v;
+    __syncthreads();
+
+    for (int off = 1; off < blockDim.x; off <<= 1) {
+        const float add = threadIdx.x >= (unsigned) off ? sh[threadIdx.x - off] : 0.0f;
+        __syncthreads();
+        sh[threadIdx.x] += add;
+        __syncthreads();
+    }
+
+    *total = sh[blockDim.x - 1];
+    return sh[threadIdx.x];
+}
+
+static __global__ void gk_cu_k_cumsum_totals(gk_tview a, float * sums,
+                                             int64_t n, int n_chunks) {
+    extern __shared__ float gk_cu_scan_sh[];
+
+    const int64_t ir = blockIdx.y;
+    const int64_t ic = blockIdx.x;
+
+    int64_t i1, i2, i3;
+    gk_cu_unrow(ir, a.ne, &i1, &i2, &i3);
+
+    const int64_t base = ic * (int64_t) GK_CU_SCAN_CHUNK;
+
+    float acc = 0.0f;
+    for (int64_t o = threadIdx.x; o < GK_CU_SCAN_CHUNK; o += blockDim.x) {
+        const int64_t i = base + o;
+        if (i < n) {
+            acc += gk_cu_get(a, i, i1, i2, i3);
+        }
+    }
+
+    const float t = gk_cu_block_sum(acc, gk_cu_scan_sh);
+
+    if (threadIdx.x == 0) {
+        sums[ir * n_chunks + ic] = t;
+    }
+}
+
+// The serial pass, over chunk totals rather than elements. One thread: the
+// count is small and a fixed order is what keeps two runs identical.
+static __global__ void gk_cu_k_cumsum_offsets(float * sums, int n_chunks) {
+    const int64_t ir = blockIdx.x;
+
+    float run = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const float v = sums[ir * n_chunks + c];
+        sums[ir * n_chunks + c] = run;  // exclusive: what precedes this chunk
+        run += v;
+    }
+}
+
+static __global__ void gk_cu_k_cumsum_apply(gk_tview a, gk_tview_mut d,
+                                            const float * sums, int64_t n, int n_chunks) {
+    extern __shared__ float gk_cu_scan_sh[];
+
+    const int64_t ir = blockIdx.y;
+    const int64_t ic = blockIdx.x;
+
+    int64_t i1, i2, i3;
+    gk_cu_unrow(ir, d.ne, &i1, &i2, &i3);
+
+    const int64_t base = ic * (int64_t) GK_CU_SCAN_CHUNK;
+
+    float carry = sums[ir * n_chunks + ic];
+
+    for (int64_t o = 0; o < GK_CU_SCAN_CHUNK; o += blockDim.x) {
+        const int64_t i = base + o + threadIdx.x;
+        const float v = i < n ? gk_cu_get(a, i, i1, i2, i3) : 0.0f;
+
+        float total = 0.0f;
+        const float scanned = gk_cu_block_scan(v, gk_cu_scan_sh, &total);
+
+        if (i < n) {
+            gk_cu_set(d, i, i1, i2, i3, carry + scanned);
+        }
+
+        carry += total;
+        __syncthreads(); // the next sub-chunk reuses the scan buffer
+    }
+}
+
+// --------------------------------------------------------------------------
+// argsort on a row too wide for one network
+//
+// top_k below gets to work in rounds because a selection composes: what is not
+// in the top k of its chunk is in nobody's. A sort does not - every element's
+// final position depends on every other - so the whole row has to go through
+// one network, and above 4096 slots that network does not fit in shared
+// memory.
+//
+// So it runs out of global memory instead. The same bitonic network, the same
+// compare-exchanges in the same order, but each step is a kernel launch over a
+// scratch copy of the row rather than a loop over shared memory.
+//
+// The saving grace is the tail. A step exchanges slot i with slot i^step, so
+// once `step` is smaller than half a block's span every exchange that remains
+// in the stage is inside one block - and all of them can be done in shared
+// memory in a single launch. That collapses a quadratic-looking count of
+// launches into a manageable one: a 262144-wide row is 18 stages and 171
+// steps, of which 28 need a global pass and the rest ride along in 18 local
+// ones.
+// --------------------------------------------------------------------------
+
+// Elements one block owns during the local tail. 2048 slots is 16 KB of
+// shared memory, which leaves room for several blocks per multiprocessor.
+#define GK_CU_SORT_SPAN 2048
+
+// One compare-exchange step over the whole row, in global memory. Used only
+// while `step` is too wide for a block to own both sides of the pair.
+static __global__ void gk_cu_k_sort_step(float * val, int32_t * idx,
+                                         int n_pad, int stage, int step,
+                                         bool desc, int64_t n_rows) {
+    const int64_t pairs = (int64_t) n_pad / 2;
+    const int64_t t     = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (t >= pairs * n_rows) {
+        return;
+    }
+
+    const int64_t ir = t / pairs;
+    const int64_t p  = t % pairs;
+
+    // Dense pair index to the low slot of the pair: `step` consecutive slots
+    // belong to one side, then `step` to the other.
+    const int64_t i = (p / step) * 2 * step + (p % step);
+    const int64_t j = i + step;
+
+    float   * v = val + ir * n_pad;
+    int32_t * x = idx + ir * n_pad;
+
+    const float vi = v[i], vj = v[j];
+    const int32_t xi = x[i], xj = x[j];
+
+    // Halves of a stage are built in opposite directions so the next stage
+    // sees a bitonic sequence. Same rule and same tie-break as the in-block
+    // network, because this is the same sort.
+    const bool up = (i & stage) == 0;
+
+    bool before; // does the value at j sort before the one at i?
+    if (vi != vj) {
+        before = desc ? vj > vi : vj < vi;
+    } else {
+        before = xj < xi;
+    }
+
+    if (before == up) {
+        v[i] = vj; v[j] = vi;
+        x[i] = xj; x[j] = xi;
+    }
+}
+
+// The rest of a stage, once every remaining exchange is inside one block's
+// span. Runs all steps from `step` down to 1 without leaving shared memory.
+static __global__ void gk_cu_k_sort_tail(float * val, int32_t * idx,
+                                         int n_pad, int stage, int step, bool desc) {
+    __shared__ float   s_val[GK_CU_SORT_SPAN];
+    __shared__ int32_t s_idx[GK_CU_SORT_SPAN];
+
+    const int64_t ir   = blockIdx.y;
+    const int64_t base = (int64_t) blockIdx.x * GK_CU_SORT_SPAN;
+
+    float   * v = val + ir * n_pad;
+    int32_t * x = idx + ir * n_pad;
+
+    for (int e = threadIdx.x; e < GK_CU_SORT_SPAN; e += blockDim.x) {
+        s_val[e] = v[base + e];
+        s_idx[e] = x[base + e];
+    }
+    __syncthreads();
+
+    for (int st = step; st > 0; st >>= 1) {
+        for (int e = threadIdx.x; e < GK_CU_SORT_SPAN / 2; e += blockDim.x) {
+            const int local = (e / st) * 2 * st + (e % st);
+            const int other = local + st;
+
+            // The direction is a property of the slot's position in the whole
+            // row, not in this block, so it is taken from the global index.
+            const bool up = (((int64_t) base + local) & stage) == 0;
+
+            const float vi = s_val[local], vj = s_val[other];
+            const int32_t xi = s_idx[local], xj = s_idx[other];
+
+            bool before;
+            if (vi != vj) {
+                before = desc ? vj > vi : vj < vi;
+            } else {
+                before = xj < xi;
+            }
+
+            if (before == up) {
+                s_val[local] = vj; s_val[other] = vi;
+                s_idx[local] = xj; s_idx[other] = xi;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int e = threadIdx.x; e < GK_CU_SORT_SPAN; e += blockDim.x) {
+        v[base + e] = s_val[e];
+        x[base + e] = s_idx[e];
+    }
+}
+
+// Stages the row into scratch, padded to a power of two with sentinels that
+// lose every comparison so they land past the real elements.
+static __global__ void gk_cu_k_sort_stage(gk_tview a, float * val, int32_t * idx,
+                                          int64_t n, int n_pad, bool desc, int64_t n_rows) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (int64_t) n_pad * n_rows) {
+        return;
+    }
+
+    const int64_t ir = t / n_pad;
+    const int64_t i  = t % n_pad;
+
+    int64_t i1, i2, i3;
+    gk_cu_unrow(ir, a.ne, &i1, &i2, &i3);
+
+    const bool real = i < n;
+    val[t] = real ? gk_cu_get(a, i, i1, i2, i3) : (desc ? -INFINITY : INFINITY);
+    idx[t] = real ? (int32_t) i : INT32_MAX;
+}
+
+// The sorted indices back out, dropping the padding.
+static __global__ void gk_cu_k_sort_emit(const int32_t * idx, gk_tview_mut d,
+                                         int n_pad, int64_t k_out, int64_t n_rows) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= k_out * n_rows) {
+        return;
+    }
+
+    const int64_t ir = t / k_out;
+    const int64_t i  = t % k_out;
+
+    int64_t i1, i2, i3;
+    gk_cu_unrow(ir, d.ne, &i1, &i2, &i3);
+
+    *(int32_t *) (gk_cu_row(d, i1, i2, i3) + i * d.nb[0]) = idx[ir * n_pad + i];
+}
+
+// --------------------------------------------------------------------------
 // top_k on a row too wide for one network
 //
 // The network above holds 4096 slots. A router row is 128 wide and fits with
@@ -992,6 +1333,77 @@ static __global__ void gk_cu_k_top_k_final(const float * in_val, const int32_t *
     for (int64_t i = threadIdx.x; i < k_out; i += blockDim.x) {
         *(int32_t *) (gk_cu_row(d, i1, i2, i3) + i * d.nb[0]) = s.idx[i];
     }
+}
+
+// Drives the out-of-core network. Returns false if the scratch it needs cannot
+// be had, which leaves the caller to fall back rather than fail.
+static bool gk_cu_argsort_wide(gkStream_t stream, struct gk_cuda_scratch * scratch,
+                               const struct gk_tensor * src0, struct gk_tensor * node,
+                               int64_t rows, int64_t n, int64_t k_out, bool desc) {
+    if (scratch == NULL) {
+        return false;
+    }
+
+    int64_t n_pad = 1;
+    while (n_pad < n) {
+        n_pad <<= 1;
+    }
+    // The tail kernel gives every block a full span, so the row has to hold a
+    // whole number of them.
+    if (n_pad < GK_CU_SORT_SPAN) {
+        n_pad = GK_CU_SORT_SPAN;
+    }
+
+    const size_t needed = (size_t) rows * n_pad * (sizeof(float) + sizeof(int32_t));
+
+    char * buf = (char *) gk_cu_scratch_get(scratch, needed, stream);
+    if (buf == NULL) {
+        return false;
+    }
+
+    float   * val = (float *) buf;
+    int32_t * idx = (int32_t *) (val + (size_t) rows * n_pad);
+
+    const int block = GK_CU_SORT_MAX_BLOCK;
+
+    {
+        const int64_t total = (int64_t) n_pad * rows;
+        gk_cu_k_sort_stage<<<(unsigned) ((total + block - 1) / block), block, 0, stream>>>(
+            gk_cu_view(src0), val, idx, n, (int) n_pad, desc, rows);
+    }
+
+    const int64_t pairs = (int64_t) n_pad / 2 * rows;
+    const unsigned pair_grid = (unsigned) ((pairs + block - 1) / block);
+
+    dim3 tail_grid;
+    tail_grid.x = (unsigned) (n_pad / GK_CU_SORT_SPAN);
+    tail_grid.y = (unsigned) rows;
+    tail_grid.z = 1;
+
+    for (int stage = 2; stage <= n_pad; stage <<= 1) {
+        int step = stage >> 1;
+
+        // Wide steps reach outside any one block and have to go through
+        // global memory, one launch each.
+        while (step > GK_CU_SORT_SPAN / 2) {
+            gk_cu_k_sort_step<<<pair_grid, block, 0, stream>>>(
+                val, idx, (int) n_pad, stage, step, desc, rows);
+            step >>= 1;
+        }
+
+        // Everything left in this stage is inside a span, so it is one launch
+        // however many steps remain.
+        gk_cu_k_sort_tail<<<tail_grid, block, 0, stream>>>(
+            val, idx, (int) n_pad, stage, step, desc);
+    }
+
+    {
+        const int64_t total = k_out * rows;
+        gk_cu_k_sort_emit<<<(unsigned) ((total + block - 1) / block), block, 0, stream>>>(
+            idx, gk_cu_view_mut(node), (int) n_pad, k_out, rows);
+    }
+
+    return true;
 }
 
 // Rounds until what is left fits one network. Returns false if the scratch it
@@ -1328,6 +1740,352 @@ static __global__ void gk_cu_k_conv_2d(gk_tview a, gk_tview b, gk_tview_mut d,
     }
 }
 
+// The 3-D unrolling. One thread per output element, which means undoing the
+// destination's flat layout twice: once to find which output cell the element
+// belongs to, and once to find which of the cell's (channel, kernel position)
+// slots it is. The destination is contiguous - the op asserts it - so the two
+// decompositions are plain divisions rather than stride arithmetic.
+static __global__ void gk_cu_k_im2col_3d(gk_tview b, gk_tview_mut d,
+                                         int s0, int s1, int s2,
+                                         int p0, int p1, int p2,
+                                         int d0, int d1, int d2,
+                                         int64_t IC, int64_t IW, int64_t IH, int64_t ID,
+                                         int64_t KW, int64_t KH, int64_t KD,
+                                         int64_t OW, int64_t OH, int64_t OD,
+                                         int64_t total) {
+    const int64_t KH_KW    = KH * KW;
+    const int64_t KD_KH_KW = KD * KH_KW;
+    const int64_t cell_n   = IC * KD_KH_KW;
+
+    GK_CU_FLAT_LOOP(total) {
+        const int64_t at   = k % cell_n;      // slot within the cell
+        const int64_t cell = k / cell_n;
+
+        const int64_t iow  = cell % OW;
+        const int64_t ioh  = (cell / OW) % OH;
+        const int64_t iodn = cell / (OW * OH); // in * OD + iod
+
+        const int64_t iod = iodn % OD;
+        const int64_t in  = iodn / OD;
+
+        const int64_t ikw = at % KW;
+        const int64_t ikh = (at / KW) % KH;
+        const int64_t ikd = (at / KH_KW) % KD;
+        const int64_t iic = at / KD_KH_KW;
+
+        const int64_t iid = iod * s2 + ikd * d2 - p2;
+        const int64_t iih = ioh * s1 + ikh * d1 - p1;
+        const int64_t iiw = iow * s0 + ikw * d0 - p0;
+
+        float v = 0.0f;
+        if (iid >= 0 && iid < ID && iih >= 0 && iih < IH && iiw >= 0 && iiw < IW) {
+            // the volume's outermost axis carries the image and the channel
+            // together, image-major
+            v = gk_cu_get(b, iiw, iih, iid, in * IC + iic);
+        }
+
+        gk_cu_set(d, at, iow, ioh, iodn, v);
+    }
+}
+
+// The direct depthwise convolution: one kernel plane per channel, so there is
+// no input-channel loop and no reduction across channels at all. Both layouts
+// the builder emits - WHCN and the channels-fastest CWHN - fall out of reading
+// the operands through their strides rather than assuming a packing.
+//
+// Note what is absent: the f16 rounding of the input that gk_cu_k_conv_2d does.
+// That is not an oversight, it is the CPU pass's behaviour, and this kernel
+// exists to agree with the CPU pass. It does mean the two spellings of a
+// depthwise convolution disagree - the composite gk_conv_2d_dw lowers through
+// an f16 im2col buffer and so rounds, gk_conv_2d_dw_direct does not - but that
+// is a question about the CPU pass, not something to settle by having the
+// device answer differently from it.
+static __global__ void gk_cu_k_conv_2d_dw(gk_tview a, gk_tview b, gk_tview_mut d,
+                                          int s0, int s1, int p0, int p1, int d0, int d1,
+                                          int64_t IW, int64_t IH,
+                                          int64_t KW, int64_t KH, int64_t n) {
+    GK_CU_FLAT_LOOP(n) {
+        const gk_cu_idx o = gk_cu_decompose(k, d.ne);
+
+        float acc = 0.0f;
+
+        for (int64_t ky = 0; ky < KH; ++ky) {
+            const int64_t sy = o.i1 * s1 + ky * d1 - p1;
+            if (sy < 0 || sy >= IH) {
+                continue;
+            }
+            for (int64_t kx = 0; kx < KW; ++kx) {
+                const int64_t sx = o.i0 * s0 + kx * d0 - p0;
+                if (sx < 0 || sx >= IW) {
+                    continue;
+                }
+
+                // the kernel is [KW, KH, 1, C]: one plane per channel, indexed
+                // by the output's channel
+                acc += gk_cu_get(a, kx, ky, 0, o.i2) * gk_cu_get(b, sx, sy, o.i2, o.i3);
+            }
+        }
+
+        gk_cu_set(d, o.i0, o.i1, o.i2, o.i3, acc);
+    }
+}
+
+// --------------------------------------------------------------------------
+// the linear-attention recurrences
+//
+// RWKV's two kernels and the gated delta rule share a shape: a state matrix
+// per head that a token loop walks forward, one token at a time. Time cannot
+// be parallelised - that is what makes them recurrences - so the threads go
+// everywhere else, and the useful observation in all three is that a thread
+// can be given a slice of the state that nobody else reads or writes.
+//
+// That is what removes the barriers. A thread owning one row (or column) of
+// the state matrix carries it across the whole token loop without ever
+// synchronizing with its neighbours, because the recurrence for that slice
+// depends only on that slice and on per-token vectors every thread reads
+// alike.
+// --------------------------------------------------------------------------
+
+// RWKV-6. One block per (head, sequence); thread j owns column j of the state.
+//
+// The CPU pass accumulates the output over the i loop; here thread j runs that
+// loop itself and keeps the running sum in a register, which is the same sum
+// in the same order.
+static __global__ void gk_cu_k_rwkv_wkv6(const float * k_in, const float * v_in,
+                                         const float * r_in, const float * tf,
+                                         const float * td, const float * s_in,
+                                         float * out, float * state,
+                                         int64_t T, int64_t C, int64_t S, int64_t T_per) {
+    const int64_t h    = blockIdx.x;
+    const int64_t iseq = blockIdx.y;
+    const int64_t j    = threadIdx.x;
+
+    if (j >= S) {
+        return;
+    }
+
+    const int64_t h_off = h * S;
+    const int64_t h2d   = h * S * S;
+    const int64_t state_off = S * C * iseq;
+
+    float * state_cur = state + state_off;
+
+    for (int64_t t = iseq * T_per; t < (iseq + 1) * T_per; ++t) {
+        const int64_t th_off = t * C + h_off;
+
+        // the first token of a sequence reads the state it was handed; the
+        // rest read what the previous token left
+        const float * state_prev = (t % T_per) ? state_cur : s_in + state_off;
+
+        const float vj = v_in[th_off + j];
+
+        float acc = 0.0f;
+        for (int64_t i = 0; i < S; ++i) {
+            const float kv  = k_in[th_off + i];
+            const float rv  = r_in[th_off + i];
+            const float tfv = tf[h_off + i];
+            const float tdv = td[th_off + i];
+
+            const float kvv  = vj * kv;
+            const float prev = state_prev[h2d + i * S + j];
+
+            acc += (kvv * tfv + prev) * rv;
+            state_cur[h2d + i * S + j] = prev * tdv + kvv;
+        }
+
+        out[th_off + j] = acc;
+    }
+}
+
+// RWKV-7. Transposed from the above: this recurrence reduces along j twice -
+// once for the in-context learning rate, once for the output - so a row of the
+// state is the unit of work.
+//
+// A thread per row would put consecutive threads S floats apart and cost a
+// separate memory transaction each; measured that way this kernel lost to the
+// CPU. So a *warp* owns a row instead, its lanes walking j together, which
+// makes every access contiguous and turns both reductions into shuffles. The
+// butterfly leaves the sum in all lanes, so there is nothing to broadcast
+// afterwards and no barrier anywhere in the loop.
+static __global__ void gk_cu_k_rwkv_wkv7(const float * r_in, const float * w_in,
+                                         const float * k_in, const float * v_in,
+                                         const float * a_in, const float * b_in,
+                                         const float * s_in,
+                                         float * out, float * state,
+                                         int64_t T, int64_t C, int64_t S, int64_t T_per) {
+    const int64_t h    = blockIdx.x;
+    const int64_t iseq = blockIdx.y;
+
+    const int lane    = threadIdx.x % GK_WARP_SIZE;
+    const int warp    = threadIdx.x / GK_WARP_SIZE;
+    const int n_warps = blockDim.x / GK_WARP_SIZE;
+
+    const int64_t h_off = h * S;
+    const int64_t h2d   = h * S * S;
+    const int64_t state_off = S * C * iseq;
+
+    float * state_cur = state + state_off;
+
+    for (int64_t t = iseq * T_per; t < (iseq + 1) * T_per; ++t) {
+        const int64_t th_off = t * C + h_off;
+
+        const float * state_prev = (t % T_per) ? state_cur : s_in + state_off;
+
+        for (int64_t i = warp; i < S; i += n_warps) {
+            const float vv = v_in[th_off + i];
+
+            // project the previous state row onto a
+            float sa_part = 0.0f;
+            for (int64_t j = lane; j < S; j += GK_WARP_SIZE) {
+                sa_part += a_in[th_off + j] * state_prev[h2d + i * S + j];
+            }
+            // Every lane leaves with the whole sum, and with its reads to this
+            // row finished - which is what lets the loop below overwrite the
+            // row the loop above was reading.
+            const float sa = gk_cu_warp_sum(sa_part);
+
+            float res_part = 0.0f;
+            for (int64_t j = lane; j < S; j += GK_WARP_SIZE) {
+                const float kvv  = vv * k_in[th_off + j];
+                const float prev = state_prev[h2d + i * S + j];
+                const float cur  = prev * w_in[th_off + j] + kvv + sa * b_in[th_off + j];
+
+                state_cur[h2d + i * S + j] = cur;
+                res_part += cur * r_in[th_off + j];
+            }
+            const float res = gk_cu_warp_sum(res_part);
+
+            if (lane == 0) {
+                out[th_off + i] = res;
+            }
+        }
+    }
+}
+
+// The gated delta rule. One block per (head, sequence); a warp owns row j of
+// the working state, which the layout stores transposed - row j holds column j
+// of the state.
+//
+// A warp rather than a thread for the same reason as RWKV-7 above: every one
+// of the four passes a token makes over a row walks it along i, so lanes
+// spread along i keep the accesses contiguous and the two reductions become
+// shuffles. A thread per row instead put consecutive threads S floats apart
+// and ran at less than half the CPU's speed.
+//
+// Every step is per-row except the per-channel decay, whose factors are
+// indexed by the other axis and so are shared across rows. That is the only
+// barrier in the loop, and the scalar-gate form does not need even that.
+static __global__ void gk_cu_k_gated_delta_net(gk_tview q, gk_tview k_t, gk_tview v,
+                                               gk_tview g, gk_tview beta,
+                                               const float * s_in, int64_t s_in_stride3,
+                                               float * attn_base, float * state_base,
+                                               int64_t S, int64_t H, int64_t n_tokens,
+                                               int64_t snap_elems, int64_t K,
+                                               int64_t rq3, int64_t rk3, bool kda,
+                                               float scale) {
+    extern __shared__ float gk_cu_gdn_decay[]; // S floats, only used when kda
+
+    const int64_t iv1 = blockIdx.x; // head
+    const int64_t iv3 = blockIdx.y; // sequence
+
+    const int lane    = threadIdx.x % GK_WARP_SIZE;
+    const int warp    = threadIdx.x / GK_WARP_SIZE;
+    const int n_warps = blockDim.x / GK_WARP_SIZE;
+
+    const int64_t iq1 = iv1 % q.ne[1];
+    const int64_t ik1 = iv1 % k_t.ne[1];
+    const int64_t iq3 = iv3 / rq3;
+    const int64_t ik3 = iv3 / rk3;
+
+    // slot 0 of the output doubles as the working state
+    float * s_work = state_base + (iv3 * H + iv1) * S * S;
+
+    // The handed-in state, indexed the way the CPU pass indexes it: flat
+    // within a sequence, with only the sequence axis carrying a stride.
+    const float * s0 = s_in + iv3 * s_in_stride3 + iv1 * S * S;
+    for (int64_t e = threadIdx.x; e < S * S; e += blockDim.x) {
+        s_work[e] = s0[e];
+    }
+    __syncthreads();
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const int64_t q_off = iq3 * q.nb[3]    + t * q.nb[2]    + iq1 * q.nb[1];
+        const int64_t k_off = ik3 * k_t.nb[3]  + t * k_t.nb[2]  + ik1 * k_t.nb[1];
+        const int64_t v_off = iv3 * v.nb[3]    + t * v.nb[2]    + iv1 * v.nb[1];
+        const int64_t g_off = iv3 * g.nb[3]    + t * g.nb[2]    + iv1 * g.nb[1];
+        const int64_t b_off = iv3 * beta.nb[3] + t * beta.nb[2] + iv1 * beta.nb[1];
+
+        const float * q_d = (const float *) (q.data   + q_off);
+        const float * k_d = (const float *) (k_t.data + k_off);
+        const float * v_d = (const float *) (v.data   + v_off);
+        const float * g_d = (const float *) (g.data   + g_off);
+
+        const float beta_v = *(const float *) (beta.data + b_off);
+
+        if (kda) {
+            for (int64_t i = threadIdx.x; i < S; i += blockDim.x) {
+                gk_cu_gdn_decay[i] = expf(g_d[i]);
+            }
+            __syncthreads();
+        }
+
+        for (int64_t j = warp; j < S; j += n_warps) {
+            float * row = s_work + j * S;
+
+            // decay: per channel for KDA, one scalar otherwise
+            if (kda) {
+                for (int64_t i = lane; i < S; i += GK_WARP_SIZE) {
+                    row[i] *= gk_cu_gdn_decay[i];
+                }
+            } else {
+                const float dg = expf(g_d[0]);
+                for (int64_t i = lane; i < S; i += GK_WARP_SIZE) {
+                    row[i] *= dg;
+                }
+            }
+
+            // how far the state's prediction of v misses, then the rank-one
+            // update that closes the gap
+            float part = 0.0f;
+            for (int64_t i = lane; i < S; i += GK_WARP_SIZE) {
+                part += row[i] * k_d[i];
+            }
+            const float dj = (v_d[j] - gk_cu_warp_sum(part)) * beta_v;
+
+            for (int64_t i = lane; i < S; i += GK_WARP_SIZE) {
+                row[i] += k_d[i] * dj;
+            }
+
+            // read the state out against q
+            float acc = 0.0f;
+            for (int64_t i = lane; i < S; i += GK_WARP_SIZE) {
+                acc += row[i] * q_d[i];
+            }
+            const float outv = gk_cu_warp_sum(acc);
+
+            if (lane == 0) {
+                attn_base[(iv3 * n_tokens * H + iv1) * S + t * S * H + j] = outv * scale;
+            }
+
+            if (K > 1) {
+                const int64_t slot = n_tokens - 1 - t;
+                if (slot > 0 && slot < K) {
+                    float * snap = state_base + slot * snap_elems + (iv3 * H + iv1) * S * S;
+                    for (int64_t i = lane; i < S; i += GK_WARP_SIZE) {
+                        snap[j * S + i] = row[i];
+                    }
+                }
+            }
+        }
+
+        // The decay buffer is rewritten at the top of the next token, and the
+        // rows above are still reading this one's.
+        if (kda) {
+            __syncthreads();
+        }
+    }
+}
+
 // The Mamba selective scan.
 //
 // The recurrence runs along time and cannot be parallelised across it, so the
@@ -1499,7 +2257,23 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         case GK_OP_SET_ROWS:
         case GK_OP_ROLL: case GK_OP_SSM_CONV: case GK_OP_POOL_2D:
         case GK_OP_CONV_2D: case GK_OP_SSM_SCAN:
+        case GK_OP_CONV_2D_DW:
+        case GK_OP_RWKV_WKV6: case GK_OP_RWKV_WKV7: case GK_OP_GATED_DELTA_NET:
+        case GK_OP_PAD_REFLECT_1D: case GK_OP_CUMSUM:
             break;
+
+        case GK_OP_ARGMAX:
+            // positions out, not values, like argsort and top_k above
+            return op->type == GKT_I32 && gk_cu_readable(s0) &&
+                   s0->type == GKT_F32 && s0->ne[2] == 1 && s0->ne[3] == 1;
+
+        case GK_OP_IM2COL_3D:
+            // The unrolled buffer is the operand of a matmul, so it is f32 or
+            // f16; the volume is always f32. The destination is written by
+            // flat index, which the op's own contiguity assertion guarantees.
+            return (op->type == GKT_F32 || op->type == GKT_F16) &&
+                   s1 != NULL && s1->type == GKT_F32 &&
+                   gk_is_contiguous(op) && gk_cu_readable(s1);
 
         default:
             return false;
@@ -1552,6 +2326,42 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
                gk_is_contiguous(op->src[3]) &&
                op->src[2]->type == GKT_F32 && op->src[3]->type == GKT_F32 &&
                op->src[6]->type == GKT_I32;
+    }
+    if ((int) op->op == GK_OP_CONV_2D_DW) {
+        // The image and the result are f32; the kernel may be half. Unlike
+        // conv_2d there is no rounding of the input either way, which matches
+        // the CPU pass - see the kernel.
+        return op->type == GKT_F32 && s1 != NULL && s1->type == GKT_F32 &&
+               (s0->type == GKT_F32 || s0->type == GKT_F16);
+    }
+    if ((int) op->op == GK_OP_RWKV_WKV6 || (int) op->op == GK_OP_RWKV_WKV7 ||
+        (int) op->op == GK_OP_GATED_DELTA_NET) {
+        // RWKV-6 gives a head's state one slot per thread, so a head wider
+        // than a block would go partly uncomputed. The other two stride whole
+        // rows over warps and have no such limit, but the bound is applied to
+        // all three: it is above anything published - RWKV heads are 64 and
+        // the delta rule's 128 - and one rule is easier to keep true than
+        // three. A wider head falls back to the CPU.
+        const int64_t S = (int) op->op == GK_OP_GATED_DELTA_NET
+            ? op->src[2]->ne[0]
+            : op->ne[0] / op->src[1]->ne[1];
+
+        if (S > GK_CUDA_RECURRENT_MAX_S) {
+            return false;
+        }
+
+        // Every operand is read as a flat float array with only the outermost
+        // axis strided, exactly as the CPU pass reads them, so a non-contiguous
+        // one would be read wrongly rather than slowly.
+        const int n_src = (int) op->op == GK_OP_RWKV_WKV7 ? 7
+                        : (int) op->op == GK_OP_RWKV_WKV6 ? 6 : 6;
+        for (int i = 0; i < n_src; ++i) {
+            const struct gk_tensor * t = op->src[i];
+            if (t == NULL || t->type != GKT_F32 || !gk_is_contiguous(t)) {
+                return false;
+            }
+        }
+        return op->type == GKT_F32;
     }
     if ((int) op->op == GK_OP_UPSCALE) {
         // only nearest and plain bilinear; the antialiased and bicubic filters
@@ -1821,17 +2631,23 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 return true;
             }
 
-            // Too wide for one network. A selection can be done in rounds; a
-            // sort cannot, so only top_k takes this path.
-            if (op == GK_OP_TOP_K && k_out <= GK_CU_TOPK_MAX_K &&
-                gk_cu_top_k_wide(stream, scratch, src0, node, rows, n, k_out)) {
+            // Too wide for one network. A selection composes, so top_k can be
+            // done in rounds over chunks; a sort cannot, so argsort runs the
+            // same network out of global memory instead.
+            if (op == GK_OP_TOP_K && k_out <= GK_CU_TOPK_MAX_K) {
+                if (gk_cu_top_k_wide(stream, scratch, src0, node, rows, n, k_out)) {
+                    return true;
+                }
+            } else if (gk_cu_argsort_wide(stream, scratch, src0, node,
+                                          rows, n, k_out, desc)) {
                 return true;
             }
 
-            // What is left: a wide argsort, or a top_k with a k so large that
-            // rounds would not converge. Every element against every other,
-            // which is slow but finite - and the single-backend caller has no
-            // CPU to fall back to.
+            // What is left: a row so wide that even the scratch for it could
+            // not be had, or a top_k with a k so large that rounds would not
+            // converge. Every element against every other, which is slow but
+            // finite - and the single-backend caller has no CPU to fall back
+            // to.
             gk_cu_k_argsort_rank<<<grid, GK_CU_SORT_MAX_BLOCK, 0, stream>>>(
                 gk_cu_view(src0), gk_cu_view_mut(node),
                 n, k_out, desc, op == GK_OP_TOP_K, rows);
@@ -1940,6 +2756,153 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_get_op_params_i32(node, 5), gk_get_op_params_i32(node, 6),
                 src0->ne[0], src0->ne[1], ne);
             return true;
+
+        case GK_OP_PAD_REFLECT_1D:
+            gk_cu_k_pad_reflect_1d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0), gk_get_op_params_i32(node, 1),
+                src0->ne[0], ne);
+            return true;
+
+        case GK_OP_ARGMAX: {
+            const size_t smem = (size_t) GK_CUDA_BLOCK * (sizeof(float) + sizeof(int32_t));
+            gk_cu_k_argmax<<<(unsigned) src0->ne[1], GK_CUDA_BLOCK, smem, stream>>>(
+                gk_cu_view(src0), (int32_t *) node->data, src0->ne[0]);
+            return true;
+        }
+
+        case GK_OP_CUMSUM: {
+            const int64_t rows = node->ne[1] * node->ne[2] * node->ne[3];
+            const int64_t n    = node->ne[0];
+            const int     n_chunks =
+                (int) ((n + GK_CU_SCAN_CHUNK - 1) / GK_CU_SCAN_CHUNK);
+
+            float * sums = (float *) gk_cu_scratch_get(
+                scratch, (size_t) rows * n_chunks * sizeof(float), stream);
+            if (sums == NULL) {
+                return false;
+            }
+
+            dim3 grid;
+            grid.x = (unsigned) n_chunks;
+            grid.y = (unsigned) rows;
+            grid.z = 1;
+
+            const int n_warps = GK_CU_SCAN_BLOCK / GK_WARP_SIZE;
+
+            gk_cu_k_cumsum_totals<<<grid, GK_CU_SCAN_BLOCK,
+                                    n_warps * sizeof(float), stream>>>(
+                gk_cu_view(src0), sums, n, n_chunks);
+
+            gk_cu_k_cumsum_offsets<<<(unsigned) rows, 1, 0, stream>>>(sums, n_chunks);
+
+            gk_cu_k_cumsum_apply<<<grid, GK_CU_SCAN_BLOCK,
+                                   GK_CU_SCAN_BLOCK * sizeof(float), stream>>>(
+                gk_cu_view(src0), gk_cu_view_mut(node), sums, n, n_chunks);
+            return true;
+        }
+
+        case GK_OP_IM2COL_3D: {
+            const int64_t IC = gk_get_op_params_i32(node, 9);
+            const int64_t N  = src1->ne[3] / IC;
+
+            gk_cu_k_im2col_3d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src1), gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0), gk_get_op_params_i32(node, 1),
+                gk_get_op_params_i32(node, 2), gk_get_op_params_i32(node, 3),
+                gk_get_op_params_i32(node, 4), gk_get_op_params_i32(node, 5),
+                gk_get_op_params_i32(node, 6), gk_get_op_params_i32(node, 7),
+                gk_get_op_params_i32(node, 8),
+                IC, src1->ne[0], src1->ne[1], src1->ne[2],
+                src0->ne[0], src0->ne[1], src0->ne[2],
+                node->ne[1], node->ne[2], node->ne[3] / N, ne);
+            return true;
+        }
+
+        case GK_OP_CONV_2D_DW:
+            gk_cu_k_conv_2d_dw<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0), gk_get_op_params_i32(node, 1),
+                gk_get_op_params_i32(node, 2), gk_get_op_params_i32(node, 3),
+                gk_get_op_params_i32(node, 4), gk_get_op_params_i32(node, 5),
+                src1->ne[0], src1->ne[1], src0->ne[0], src0->ne[1], ne);
+            return true;
+
+        case GK_OP_RWKV_WKV6: {
+            const int64_t T = src1->ne[2];
+            const int64_t C = node->ne[0];
+            const int64_t H = src1->ne[1];
+            const int64_t n_seqs = node->src[5]->ne[1];
+            const int64_t S = C / H;
+
+            dim3 grid;
+            grid.x = (unsigned) H;
+            grid.y = (unsigned) n_seqs;
+            grid.z = 1;
+
+            gk_cu_k_rwkv_wkv6<<<grid, (unsigned) gk_cu_round_warp(S), 0, stream>>>(
+                (const float *) src0->data, (const float *) src1->data,
+                (const float *) node->src[2]->data, (const float *) node->src[3]->data,
+                (const float *) node->src[4]->data, (const float *) node->src[5]->data,
+                (float *) node->data, (float *) node->data + C * T,
+                T, C, S, T / n_seqs);
+            return true;
+        }
+
+        case GK_OP_RWKV_WKV7: {
+            const int64_t T = src1->ne[2];
+            const int64_t C = node->ne[0];
+            const int64_t H = src1->ne[1];
+            const int64_t n_seqs = node->src[6]->ne[1];
+            const int64_t S = C / H;
+
+            dim3 grid;
+            grid.x = (unsigned) H;
+            grid.y = (unsigned) n_seqs;
+            grid.z = 1;
+
+            gk_cu_k_rwkv_wkv7<<<grid, GK_CU_RECURRENT_BLOCK, 0, stream>>>(
+                (const float *) src0->data, (const float *) src1->data,
+                (const float *) src2->data, (const float *) node->src[3]->data,
+                (const float *) node->src[4]->data, (const float *) node->src[5]->data,
+                (const float *) node->src[6]->data,
+                (float *) node->data, (float *) node->data + C * T,
+                T, C, S, T / n_seqs);
+            return true;
+        }
+
+        case GK_OP_GATED_DELTA_NET: {
+            const struct gk_tensor * v    = node->src[2];
+            const struct gk_tensor * g    = node->src[3];
+            const struct gk_tensor * s_in = node->src[5];
+
+            const int64_t S = v->ne[0];
+            const int64_t H = v->ne[1];
+            const int64_t n_tokens = v->ne[2];
+            const int64_t n_seqs   = v->ne[3];
+
+            const int64_t K = gk_get_op_params_i32(node, 0);
+            const bool  kda = g->ne[0] == S;
+
+            const int64_t attn_elems = S * H * n_tokens * n_seqs;
+            const int64_t snap_elems = S * S * H * n_seqs;
+
+            dim3 grid;
+            grid.x = (unsigned) H;
+            grid.y = (unsigned) n_seqs;
+            grid.z = 1;
+
+            gk_cu_k_gated_delta_net<<<grid, GK_CU_RECURRENT_BLOCK,
+                                      kda ? (size_t) S * sizeof(float) : 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view(src1), gk_cu_view(v),
+                gk_cu_view(g), gk_cu_view(node->src[4]),
+                (const float *) s_in->data, (int64_t) (s_in->nb[3] / sizeof(float)),
+                (float *) node->data, (float *) node->data + attn_elems,
+                S, H, n_tokens, snap_elems, K,
+                v->ne[3] / src0->ne[3], v->ne[3] / src1->ne[3], kda,
+                1.0f / sqrtf((float) S));
+            return true;
+        }
 
         case GK_OP_CONV_2D:
             gk_cu_k_conv_2d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(

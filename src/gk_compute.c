@@ -1829,26 +1829,57 @@ static void gk_compute_argsort(struct gk_compute_state * st, struct gk_tensor * 
                 const float * pa = gk_row_read(src0, i1, i2, i3, a);
 
                 int32_t * idx = (int32_t *) gk_row_ptr_mut(dst, i1, i2, i3);
+                int32_t * tmp = (int32_t *) gk_scratch_bytes(st, 1, (size_t) n * sizeof(int32_t));
 
                 for (int64_t i = 0; i < n; ++i) {
                     idx[i] = (int32_t) i;
                 }
 
-                for (int64_t i = 1; i < n; ++i) {
-                    const int32_t key = idx[i];
-                    int64_t j = i - 1;
+                // A bottom-up merge sort, ping-ponging between the output row
+                // and one scratch slot.
+                //
+                // This was an insertion sort, which is fine for the router
+                // rows this op sees most of the time - a hundred experts - and
+                // quadratic everywhere else. A sampler argsorts the whole
+                // vocabulary, a quarter of a million wide, and that is around
+                // 10^10 comparisons: tens of seconds, per token, on one
+                // thread, because a single row cannot be split across them.
+                int32_t * from = idx;
+                int32_t * to   = tmp;
 
-                    while (j >= 0) {
-                        const bool swap = order == GK_SORT_ORDER_ASC
-                            ? pa[idx[j]] > pa[key]
-                            : pa[idx[j]] < pa[key];
-                        if (!swap) {
-                            break;
+                for (int64_t width = 1; width < n; width *= 2) {
+                    for (int64_t lo = 0; lo < n; lo += 2 * width) {
+                        const int64_t mid = GK_MIN(lo + width, n);
+                        const int64_t hi  = GK_MIN(lo + 2 * width, n);
+
+                        int64_t p = lo, q = mid, o = lo;
+
+                        while (p < mid && q < hi) {
+                            // Ties go to the lower index, which is what makes
+                            // the order total: two equal values are ordered by
+                            // where they came from, so the answer does not
+                            // depend on how the sort happened to move them.
+                            const float vp = pa[from[p]];
+                            const float vq = pa[from[q]];
+
+                            bool take_p;
+                            if (vp != vq) {
+                                take_p = order == GK_SORT_ORDER_ASC ? vp < vq : vp > vq;
+                            } else {
+                                take_p = from[p] < from[q];
+                            }
+
+                            to[o++] = take_p ? from[p++] : from[q++];
                         }
-                        idx[j + 1] = idx[j];
-                        --j;
+                        while (p < mid) { to[o++] = from[p++]; }
+                        while (q < hi)  { to[o++] = from[q++]; }
                     }
-                    idx[j + 1] = key;
+
+                    int32_t * swap = from; from = to; to = swap;
+                }
+
+                if (from != idx) {
+                    memcpy(idx, from, (size_t) n * sizeof(int32_t));
                 }
             }
         }
