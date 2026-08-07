@@ -529,6 +529,173 @@ static __device__ __forceinline__ float gk_cu_dq_tq2_0(const uint8_t * b, int j)
 // rather than by every caller.
 // --------------------------------------------------------------------------
 
+// --------------------------------------------------------------------------
+// the integer dot path
+//
+// Everything above turns packed weights into floats and multiplies. That costs
+// a decode per element, and measurement says the decode is what a quantized
+// matvec spends its time on: q4_K reads a third of the bytes f16 does and
+// takes more time.
+//
+// This is the other way round. The activations are quantized to 8 bits once
+// per matmul, and then a weight's own 4- or 8-bit codes are dotted against
+// them as integers - four at a time through one instruction - with the scales
+// applied once per 32-element group instead of once per element. Nothing is
+// converted to float until the group is done.
+//
+// The accuracy question is already settled by the CPU: gk's own vec_dot
+// converts the activation side to Q8_0/Q8_1/Q8_K before dotting, so this makes
+// the device agree with the CPU more closely than the float path did, not less.
+// --------------------------------------------------------------------------
+
+// 32 activations, quantized. `s` is the sum of the codes, which is what the
+// asymmetric formats need: their weights carry a minimum that multiplies the
+// plain sum of the activations rather than the dot product.
+struct gk_cu_q8blk {
+    float   d;    // value ~= d * code
+    float   s;    // sum of the 32 codes
+    int32_t q[8]; // the codes, four to a word
+};
+
+// Four 8-bit products accumulated into an int, in one instruction where the
+// part has it. Every NVIDIA part since Pascal does; the fallback is here so
+// that a build for an older one, or for HIP, is slow rather than broken.
+static __device__ __forceinline__ int gk_cu_dp4a(int a, int b, int c) {
+#if !defined(GK_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610)
+    return __dp4a(a, b, c);
+#else
+    const int8_t * va = (const int8_t *) &a;
+    const int8_t * vb = (const int8_t *) &b;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        c += (int) va[i] * (int) vb[i];
+    }
+    return c;
+#endif
+}
+
+// Four packed bytes as an int, read as two 16-bit halves.
+//
+// A direct 32-bit load would be wrong: a q4_0 block is 18 bytes, so every
+// other block's payload starts two bytes off a 4-byte boundary. Every format
+// here is at least 2-byte aligned, which this only needs.
+static __device__ __forceinline__ int gk_cu_int_b2(const uint8_t * p, int i32) {
+    const uint16_t * p16 = (const uint16_t *) p;
+    return (int) ((uint32_t) p16[2 * i32] | ((uint32_t) p16[2 * i32 + 1] << 16));
+}
+
+// Whether this format has an integer dot below. The rest keep the float path.
+template <int TYPE>
+static __device__ __host__ __forceinline__ bool gk_cu_has_dp4a() {
+    return TYPE == GKT_Q4_0 || TYPE == GKT_Q4_1 ||
+           TYPE == GKT_Q8_0 || TYPE == GKT_Q4_K;
+}
+
+// One 32-element group of a weight row, as integer codes plus the two floats
+// that turn a code-dot back into a value.
+//
+// Every format here has the same shape once unpacked: a value is
+// `scale * code + offset`, so a group's contribution to a dot product against
+// activations `a.d * c_j` is
+//
+//     a.d * ( scale * sum_j code_j*c_j  +  offset * sum_j c_j )
+//
+// - one integer dot and one multiple of the activation block's code sum. The
+// bias in a symmetric format (q4_0's -8) and the minimum in an asymmetric one
+// (q4_1's m, q4_K's dmin*mn) are the same term seen twice.
+//
+// `codes[i]` holds elements 4i..4i+3 in natural order, matching how the
+// activation block packs its own, which is what lets the two be dotted
+// directly.
+template <int TYPE>
+static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t g,
+                                                    int (&codes)[8],
+                                                    float & scale, float & offset) {
+    if (TYPE == GKT_Q4_0 || TYPE == GKT_Q4_1) {
+        const int       stride = TYPE == GKT_Q4_0 ? 18 : 20;
+        const int       hdr    = TYPE == GKT_Q4_0 ?  2 :  4;
+        const uint8_t * blk    = row + g * stride;
+        const uint8_t * qs     = blk + hdr;
+
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            // one word holds four low nibbles and four high ones, which are
+            // elements 4i.. and 16+4i.. - the order the decoder above reads
+            const int w = gk_cu_int_b2(qs, i);
+            codes[i]     = (w >> 0) & 0x0F0F0F0F;
+            codes[i + 4] = (w >> 4) & 0x0F0F0F0F;
+        }
+
+        const float d = gk_cu_h2f(blk);
+        scale  = d;
+        offset = TYPE == GKT_Q4_0 ? -8.0f * d : gk_cu_h2f(blk + 2);
+        return;
+    }
+
+    if (TYPE == GKT_Q8_0) {
+        const uint8_t * blk = row + g * 34;
+        const uint8_t * qs  = blk + 2;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            codes[i] = gk_cu_int_b2(qs, i);
+        }
+
+        scale  = gk_cu_h2f(blk);
+        offset = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_Q4_K) {
+        // eight groups to a super-block, each with its own 6-bit scale and
+        // minimum out of the packed twelve-byte field
+        const uint8_t * blk = row + (g / 8) * 144;
+        const int       sub = (int) (g % 8);
+
+        int sc, mn;
+        gk_cu_scale_min_6(blk + 4, sub, &sc, &mn);
+
+        const uint8_t * qs    = blk + 16 + (sub / 2) * 32;
+        const int       shift = (sub % 2) * 4;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            codes[i] = (gk_cu_int_b2(qs, i) >> shift) & 0x0F0F0F0F;
+        }
+
+        scale  =  gk_cu_h2f(blk)     * (float) sc;
+        offset = -gk_cu_h2f(blk + 2) * (float) mn;
+        return;
+    }
+
+    // unreachable: gk_cu_has_dp4a filtered it
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        codes[i] = 0;
+    }
+    scale  = 0.0f;
+    offset = 0.0f;
+}
+
+// The dot of one 32-element group of a weight row against one quantized
+// activation block. `g` counts groups from the start of the row, so a format
+// whose block holds more than 32 elements finds its block from it.
+template <int TYPE>
+static __device__ __forceinline__ float gk_cu_vecdot32(const uint8_t * row, int64_t g,
+                                                       const gk_cu_q8blk & ab) {
+    int   codes[8];
+    float scale, offset;
+    gk_cu_wblk32<TYPE>(row, g, codes, scale, offset);
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sumi = gk_cu_dp4a(codes[i], ab.q[i], sumi);
+    }
+
+    return ab.d * (scale * (float) sumi + offset * ab.s);
+}
+
 // One element of an already-located block.
 //
 // Split out of gk_cu_row_elem_t below so that a caller walking several

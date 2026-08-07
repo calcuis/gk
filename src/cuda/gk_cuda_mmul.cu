@@ -25,6 +25,37 @@
 
 #define GK_CU_MM_BLOCK 128
 
+// Blocks to cover n items, uncapped: the activation quantizer indexes a flat
+// range and needs the whole grid, not gk_cu_blocks' first 65535 of it.
+static __host__ __forceinline__ unsigned gk_cu_blocks_1d(int64_t n, int block) {
+    return (unsigned) ((n + block - 1) / block);
+}
+
+// Output rows below which the integer path is not worth taking. It costs one
+// extra launch to quantize the activations, and that is amortized over the
+// rows: at a few thousand it disappears, at a couple of hundred the matmul is
+// too small to fill the device either way and the extra launch is most of the
+// difference. Measured, the crossover is a few hundred rows; attn_k and attn_v
+// are the shapes that sit below it.
+#define GK_CU_MM_Q8_MIN_ROWS 512
+
+// Whether the integer dot path applies: the format has one, the row cuts into
+// whole 32-element groups so a group never straddles two of them, and there
+// are enough rows to pay for the quantize pass.
+static __host__ __forceinline__ bool gk_cuda_mm_q8_supported(int type, int64_t k_len,
+                                                             int64_t n_rows) {
+    if (k_len % 32 != 0 || n_rows < GK_CU_MM_Q8_MIN_ROWS) {
+        return false;
+    }
+    switch (type) {
+        case GK_TYPE_Q4_0: case GK_TYPE_Q4_1:
+        case GK_TYPE_Q8_0: case GK_TYPE_Q4_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Activation columns one pass over a weight row serves. Each column costs a
 // register accumulator and a shared-memory slot in the reduction; four is
 // where the reuse stops paying for the occupancy it costs.
@@ -230,6 +261,300 @@ static __global__ void gk_cu_k_mul_mat(gk_tview a, gk_tview b, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The integer path: the same mat-vec, dotted as 8-bit integers.
+//
+// Two kernels. The first quantizes the activation columns once per matmul -
+// cheap, because there are at most a couple of dozen of them against thousands
+// of weight rows. The second is the mat-vec, shaped exactly like the float one
+// above (a warp per output row, no barriers, shuffles for the reduction) but
+// with the inner loop replaced by an integer dot.
+// --------------------------------------------------------------------------
+
+// One thread per 32-element group. The absolute maximum sets the scale, and
+// the sum of the codes is carried alongside because the asymmetric formats
+// need it.
+static __global__ void gk_cu_k_quantize_act(gk_tview b, gk_cu_q8blk * out,
+                                            int64_t n_grp, int64_t n_cols, int64_t total) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= total) {
+        return;
+    }
+
+    const int64_t g   = t % n_grp;
+    const int64_t col = (t / n_grp) % n_cols;
+    const int64_t i23 = t / (n_grp * n_cols);
+
+    const int64_t i2 = i23 % b.ne[2];
+    const int64_t i3 = i23 / b.ne[2];
+
+    float v[32];
+    float amax = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 32; ++e) {
+        v[e] = gk_cu_get(b, g * 32 + e, col, i2, i3);
+        amax = fmaxf(amax, fabsf(v[e]));
+    }
+
+    gk_cu_q8blk blk;
+    blk.d = amax / 127.0f;
+
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int packed = 0;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int q = (int) rintf(v[i * 4 + e] * inv);
+            sum += q;
+            packed |= (q & 0xff) << (8 * e);
+        }
+        blk.q[i] = packed;
+    }
+    blk.s = (float) sum;
+
+    out[t] = blk;
+}
+
+template <int NC, int ATYPE>
+static __global__ void gk_cu_k_mul_mat_q8(gk_tview a, gk_tview_mut d,
+                                          const gk_cu_q8blk * aq, int64_t n_grp,
+                                          int64_t r2, int64_t r3) {
+    const int lane    = threadIdx.x % GK_WARP_SIZE;
+    const int warp    = threadIdx.x / GK_WARP_SIZE;
+    const int n_warps = blockDim.x / GK_WARP_SIZE;
+
+    const int64_t i0  = (int64_t) blockIdx.x * n_warps + warp;
+    const int64_t c0  = (int64_t) blockIdx.y * NC;
+    const int64_t i23 = blockIdx.z;
+
+    if (i0 >= d.ne[0]) {
+        return; // whole-warp uniform, so the shuffles below stay well formed
+    }
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    float acc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        acc[j] = 0.0f;
+    }
+
+    const uint8_t * a_row = (const uint8_t *) gk_cu_row(a, i0, a2, a3);
+
+    // The quantized activations for this (i2, i3) slice, one run of groups per
+    // column.
+    const gk_cu_q8blk * aq23 = aq + i23 * d.ne[1] * n_grp;
+
+    for (int64_t g = lane; g < n_grp; g += GK_WARP_SIZE) {
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            const int64_t col = c0 + j;
+            if (col < d.ne[1]) {
+                acc[j] += gk_cu_vecdot32<ATYPE>(a_row, g, aq23[col * n_grp + g]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        acc[j] = gk_cu_warp_sum(acc[j]);
+    }
+
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            const int64_t col = c0 + j;
+            if (col < d.ne[1]) {
+                gk_cu_set(d, i0, col, i2, i3, acc[j]);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// The tiled path, dotted as integers.
+//
+// The float tiled kernel below already decodes each weight element once and
+// uses it TILE_N times, so decoding is not what it spends its time on -
+// measured, f16 with no decode at all and q4_K are within 14% of each other
+// there. What it spends its time on is the multiply-accumulate itself, one
+// FFMA per element pair.
+//
+// So the win here is not avoiding the decode, it is `__dp4a`: four
+// multiply-accumulates in one instruction instead of one. The weights are
+// staged as their integer codes rather than as floats, which also makes the
+// tile a quarter of the size in shared memory, and each group's two scaling
+// constants are applied once per 32 elements instead of once per element.
+//
+// A block owns a TILE_M x TILE_N patch and marches over k a group at a time.
+// --------------------------------------------------------------------------
+
+#define GK_CU_MMQ_TILE_M 64
+#define GK_CU_MMQ_TILE_N 64
+#define GK_CU_MMQ_T      4   // results per thread per axis (TILE / 16)
+
+template <int ATYPE>
+static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
+                                                const gk_cu_q8blk * aq, int64_t n_grp,
+                                                int64_t r2, int64_t r3) {
+    // Transposed - [element word][row] - so that a warp walking rows or
+    // columns for a fixed word reads consecutive shared addresses.
+    __shared__ int   Wc[8][GK_CU_MMQ_TILE_M];
+    __shared__ int   Ac[8][GK_CU_MMQ_TILE_N];
+    __shared__ float Wscale[GK_CU_MMQ_TILE_M];
+    __shared__ float Woff  [GK_CU_MMQ_TILE_M];
+    __shared__ float Ad    [GK_CU_MMQ_TILE_N];
+    __shared__ float Asum  [GK_CU_MMQ_TILE_N];
+
+    const int tx  = threadIdx.x;          // 0..15, column group
+    const int ty  = threadIdx.y;          // 0..15, row group
+    const int tid = ty * 16 + tx;         // 0..255
+
+    const int64_t m0  = (int64_t) blockIdx.x * GK_CU_MMQ_TILE_M;
+    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMQ_TILE_N;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
+
+    float acc[GK_CU_MMQ_T][GK_CU_MMQ_T];
+#pragma unroll
+    for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+#pragma unroll
+        for (int j = 0; j < GK_CU_MMQ_T; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int64_t g = 0; g < n_grp; ++g) {
+        // Staging. The first 64 threads take a weight row each, the next 64 an
+        // activation column each; a row or column past the end stages zeros so
+        // that the arithmetic below needs no bounds test.
+        if (tid < GK_CU_MMQ_TILE_M) {
+            const int64_t m = m0 + tid;
+
+            int   codes[8];
+            float sc = 0.0f, off = 0.0f;
+
+            if (m < n_rows) {
+                gk_cu_wblk32<ATYPE>((const uint8_t *) gk_cu_row(a, m, a2, a3),
+                                    g, codes, sc, off);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    codes[i] = 0;
+                }
+            }
+
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                Wc[i][tid] = codes[i];
+            }
+            Wscale[tid] = sc;
+            Woff  [tid] = off;
+        } else if (tid < GK_CU_MMQ_TILE_M + GK_CU_MMQ_TILE_N) {
+            const int     slot = tid - GK_CU_MMQ_TILE_M;
+            const int64_t n    = n0 + slot;
+
+            if (n < n_cols) {
+                const gk_cu_q8blk & ab = aq23[n * n_grp + g];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    Ac[i][slot] = ab.q[i];
+                }
+                Ad  [slot] = ab.d;
+                Asum[slot] = ab.s;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    Ac[i][slot] = 0;
+                }
+                Ad  [slot] = 0.0f;
+                Asum[slot] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // The integer dot: eight instructions per output pair, against the
+        // thirty-two a float pass would take.
+        int sumi[GK_CU_MMQ_T][GK_CU_MMQ_T];
+#pragma unroll
+        for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+#pragma unroll
+            for (int j = 0; j < GK_CU_MMQ_T; ++j) {
+                sumi[i][j] = 0;
+            }
+        }
+
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            int wv[GK_CU_MMQ_T];
+            int av[GK_CU_MMQ_T];
+#pragma unroll
+            for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+                wv[i] = Wc[e][ty * GK_CU_MMQ_T + i];
+            }
+#pragma unroll
+            for (int j = 0; j < GK_CU_MMQ_T; ++j) {
+                av[j] = Ac[e][tx * GK_CU_MMQ_T + j];
+            }
+#pragma unroll
+            for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+#pragma unroll
+                for (int j = 0; j < GK_CU_MMQ_T; ++j) {
+                    sumi[i][j] = gk_cu_dp4a(wv[i], av[j], sumi[i][j]);
+                }
+            }
+        }
+
+        // The scales, once per group rather than once per element.
+#pragma unroll
+        for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+            const int   mi = ty * GK_CU_MMQ_T + i;
+            const float ws = Wscale[mi];
+            const float wo = Woff[mi];
+#pragma unroll
+            for (int j = 0; j < GK_CU_MMQ_T; ++j) {
+                const int nj = tx * GK_CU_MMQ_T + j;
+                acc[i][j] += Ad[nj] * (ws * (float) sumi[i][j] + wo * Asum[nj]);
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+        const int64_t m = m0 + ty * GK_CU_MMQ_T + i;
+        if (m >= n_rows) {
+            continue;
+        }
+#pragma unroll
+        for (int j = 0; j < GK_CU_MMQ_T; ++j) {
+            const int64_t n = n0 + tx * GK_CU_MMQ_T + j;
+            if (n < n_cols) {
+                gk_cu_set(d, m, n, i2, i3, acc[i][j]);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // The tiled path: same result as gk_cu_k_mul_mat, arranged for reuse.
 //
 // Each block owns a TILE_M x TILE_N patch of `d` and walks the whole of k,
@@ -334,7 +659,8 @@ static __global__ void gk_cu_k_mul_mat_tiled(gk_tview a, gk_tview b, gk_tview_mu
     }
 }
 
-void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
+void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
+                     struct gk_tensor * dst) {
     const struct gk_tensor * src0 = dst->src[0];
     const struct gk_tensor * src1 = dst->src[1];
 
@@ -347,6 +673,39 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
     // Enough columns for a tile to be mostly real work: reuse across the tile
     // beats splitting k across the block, by a wide margin on a batch.
     if (dst->ne[1] >= GK_CU_MM_TILE_MIN_N) {
+        // The integer tile, where the format has one. Same quantized
+        // activations as the mat-vec path, so the same scratch and the same
+        // one-off quantize pass; a batch amortizes it even better.
+        if (gk_cuda_mm_q8_supported((int) src0->type, k_len, dst->ne[0]) &&
+            scratch != NULL) {
+            const int64_t n_grp  = k_len / 32;
+            const int64_t n_cols = dst->ne[1];
+            const int64_t n_23   = dst->ne[2] * dst->ne[3];
+            const int64_t n_blk  = n_grp * n_cols * n_23;
+
+            gk_cu_q8blk * aq = (gk_cu_q8blk *) gk_cu_scratch_get(
+                scratch, (size_t) n_blk * sizeof(gk_cu_q8blk), stream);
+
+            if (aq != NULL) {
+                gk_cu_k_quantize_act<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
+                                       GK_CUDA_BLOCK, 0, stream>>>(
+                    gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
+
+                dim3 qgrid;
+                qgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMQ_TILE_M - 1) / GK_CU_MMQ_TILE_M);
+                qgrid.y = (unsigned) ((n_cols     + GK_CU_MMQ_TILE_N - 1) / GK_CU_MMQ_TILE_N);
+                qgrid.z = (unsigned) n_23;
+
+#define GK_CU_LAUNCH_TILED_Q8(T)                                           \
+                gk_cu_k_mul_mat_tiled_q8<T><<<qgrid, dim3(16, 16), 0, stream>>>( \
+                    gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
+
+                GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_TILED_Q8);
+#undef GK_CU_LAUNCH_TILED_Q8
+                return;
+            }
+        }
+
         dim3 tgrid;
         tgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MM_TILE_M - 1) / GK_CU_MM_TILE_M);
         tgrid.y = (unsigned) ((dst->ne[1] + GK_CU_MM_TILE_N - 1) / GK_CU_MM_TILE_N);
@@ -366,6 +725,47 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_tensor * dst) {
     dim3 grid;
     grid.x = (unsigned) ((dst->ne[0] + n_warps - 1) / n_warps);
     grid.z = (unsigned) (dst->ne[2] * dst->ne[3]);
+
+    // The integer path, where the format has one and the row divides into
+    // whole 32-element groups. It quantizes the activations first, which needs
+    // somewhere to put them; without that scratch it simply does not run and
+    // the float path below gives the same answer more slowly.
+    if (gk_cuda_mm_q8_supported((int) src0->type, k_len, dst->ne[0]) && scratch != NULL) {
+        const int64_t n_grp  = k_len / 32;
+        const int64_t n_cols = dst->ne[1];
+        const int64_t n_23   = dst->ne[2] * dst->ne[3];
+        const int64_t n_blk  = n_grp * n_cols * n_23;
+
+        gk_cu_q8blk * aq = (gk_cu_q8blk *) gk_cu_scratch_get(
+            scratch, (size_t) n_blk * sizeof(gk_cu_q8blk), stream);
+
+        if (aq != NULL) {
+            gk_cu_k_quantize_act<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
+                                   GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
+
+            if (n_cols < GK_CU_MM_NC) {
+                grid.y = (unsigned) n_cols;
+
+#define GK_CU_LAUNCH_Q8_1(T)                                               \
+                gk_cu_k_mul_mat_q8<1, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
+                    gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
+
+                GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8_1);
+#undef GK_CU_LAUNCH_Q8_1
+            } else {
+                grid.y = (unsigned) ((n_cols + GK_CU_MM_NC - 1) / GK_CU_MM_NC);
+
+#define GK_CU_LAUNCH_Q8_N(T)                                               \
+                gk_cu_k_mul_mat_q8<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
+                    gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
+
+                GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8_N);
+#undef GK_CU_LAUNCH_Q8_N
+            }
+            return;
+        }
+    }
 
     // One column at a time when there is only one - the decode case, every
     // token of generation - and blocks of NC once a batch makes the reuse

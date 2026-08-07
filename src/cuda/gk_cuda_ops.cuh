@@ -60,7 +60,8 @@ bool gk_cuda_supports_op(const struct gk_tensor * op);
 
 // The matmuls live in their own translation unit: they are the only kernels
 // here with a performance story worth separating out.
-void gk_cuda_mul_mat   (gkStream_t stream, struct gk_tensor * dst);
+void gk_cuda_mul_mat   (gkStream_t stream, struct gk_cuda_scratch * scratch,
+                        struct gk_tensor * dst);
 void gk_cuda_mul_mat_id(gkStream_t stream, struct gk_tensor * dst);
 void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         struct gk_tensor * dst);

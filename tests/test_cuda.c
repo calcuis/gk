@@ -671,6 +671,90 @@ static struct gk_tensor * build_mul_mat_wide(struct gk_ctx * ctx, struct gk_tens
     return gk_mul_mat(ctx, in[0], in[1]);
 }
 
+// The batched integer tile, which needs all of: a format with an integer dot,
+// enough columns to take the tiled path at all, and enough rows to be worth
+// quantizing the activations for. Nothing else in this file meets all three -
+// build_mul_mat_wide_q is nvfp4 and a hundred rows, so it takes the float
+// tile - so these exist to reach it.
+//
+// The shapes are deliberately off every tile boundary: 64 is the tile in both
+// directions, so rows and columns that are not multiples of it are what
+// exercise the edge guards.
+static struct gk_tensor * mmq_case(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in,
+                                   enum gk_type type, int64_t k, int64_t rows, int64_t cols) {
+    in[0] = gk_new_tensor_2d(ctx, type, k, rows);
+    in[1] = gk_new_tensor_2d(ctx, GK_TYPE_F32, k, cols);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_mmq_q4_0(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_0, 256, 600, 40);
+}
+
+static struct gk_tensor * build_mmq_q4_1(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_1, 256, 1024, 64);
+}
+
+static struct gk_tensor * build_mmq_q8_0(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q8_0, 256, 576, 33);
+}
+
+static struct gk_tensor * build_mmq_q4_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 512, 700, 70);
+}
+
+// One super-block rather than two, so the group-to-super-block indexing never
+// has to cross a boundary. If this agrees and the wider one drifts, the drift
+// is accumulation, not indexing.
+static struct gk_tensor * build_mmq_q4_K_1sb(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 256, 700, 70);
+}
+
+// The integer *mat-vec*, which is a different kernel from the tile above and
+// needs the opposite shape to reach: enough rows to be worth quantizing the
+// activations for, few enough columns to stay off the tiled path.
+//
+// This is the path lm_head takes, and it went untested the moment the row
+// threshold was introduced - run_type's sixteen rows fall below it, so the
+// per-weight-type sweep quietly stopped covering the integer kernel it used to.
+static struct gk_tensor * build_mmv_q4_0(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_0, 256, 600, 1);
+}
+
+static struct gk_tensor * build_mmv_q4_1(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_1, 256, 1024, 2);
+}
+
+static struct gk_tensor * build_mmv_q8_0(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q8_0, 256, 576, 1);
+}
+
+static struct gk_tensor * build_mmv_q4_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 512, 700, 3);
+}
+
+// Eight columns: still short of the tiled path, but past the point where the
+// mat-vec kernel serves several columns from one pass over a weight row.
+static struct gk_tensor * build_mmv_q4_0_nc(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_0, 256, 600, 8);
+}
+
+// A k that is not a whole number of 32-element groups, which the integer path
+// declines - so this checks the fall back to the float tile still works.
+static struct gk_tensor * build_mmq_ragged_k(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_F16, 130, 600, 40);
+}
+
+// Higher dimensions, so the per-slice indexing of the quantized activations
+// has to be right rather than accidentally zero.
+static struct gk_tensor * build_mmq_batched(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_Q4_0, 256, 520, 3);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32,  256, 40,  3);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
 static struct gk_tensor * build_mul_mat_wide_q(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     in[0] = gk_new_tensor_2d(ctx, GK_TYPE_NVFP4, 128, 100);
     in[1] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 128, 145);
@@ -1435,6 +1519,29 @@ int main(void) {
     failures += run_op_tol(gpu, "mul_mat wide q", build_mul_mat_wide_q, 4e-2f);
     failures += run_op_tol(gpu, "mul_mat narw q", build_mul_mat_narrow_q, 4e-2f);
     failures += run_op(gpu, "mul_mat wide b", build_mul_mat_wide_batched);
+
+    // The batched integer tile. Held to the same bound as the other quantized
+    // matmuls: both sides quantize, so they differ by the activation rounding
+    // rather than by anything structural.
+    failures += run_op_tol(gpu, "mmq q4_0",      build_mmq_q4_0,     4e-2f);
+    failures += run_op_tol(gpu, "mmq q4_1",      build_mmq_q4_1,     4e-2f);
+    failures += run_op_tol(gpu, "mmq q8_0",      build_mmq_q8_0,     4e-2f);
+    // q4_K is held looser than the rest, and for a reason that is about the
+    // CPU rather than the device: gk's q4_K vec_dot converts the activation
+    // side to Q8_K, which carries one scale per 256 values, while the device
+    // carries one per 32. The device is the more accurate of the two and the
+    // gap widens with k - 0.040 at one super-block, 0.056 at two - so this
+    // bound is set above where that lands rather than where a bug would.
+    failures += run_op_tol(gpu, "mmq q4_K 1sb",  build_mmq_q4_K_1sb, 8e-2f);
+    failures += run_op_tol(gpu, "mmq q4_K",      build_mmq_q4_K,     8e-2f);
+    failures += run_op_tol(gpu, "mmq batched",   build_mmq_batched,  4e-2f);
+    failures += run_op_tol(gpu, "mmq ragged k",  build_mmq_ragged_k, 4e-2f);
+
+    failures += run_op_tol(gpu, "mmv q4_0",      build_mmv_q4_0,     4e-2f);
+    failures += run_op_tol(gpu, "mmv q4_1",      build_mmv_q4_1,     4e-2f);
+    failures += run_op_tol(gpu, "mmv q8_0",      build_mmv_q8_0,     4e-2f);
+    failures += run_op_tol(gpu, "mmv q4_K",      build_mmv_q4_K,     8e-2f);
+    failures += run_op_tol(gpu, "mmv q4_0 nc",   build_mmv_q4_0_nc,  4e-2f);
     failures += run_op(gpu, "rope",           build_rope);
     failures += run_op(gpu, "get_rows",       build_get_rows);
     failures += run_op(gpu, "scale",          build_scale);

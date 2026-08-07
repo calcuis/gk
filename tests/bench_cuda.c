@@ -287,6 +287,19 @@ static struct gk_tensor * b_dec_q4_0 (struct gk_ctx * c) { return mul_mat_case(c
 static struct gk_tensor * b_dec_q4_K (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_K,  N_EMBD, N_FF, N_DECODE); }
 static struct gk_tensor * b_dec_q6_K (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q6_K,  N_EMBD, N_FF, N_DECODE); }
 static struct gk_tensor * b_dec_mxfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_MXFP4, N_EMBD, N_FF, N_DECODE); }
+static struct gk_tensor * b_dec_nvfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, N_EMBD, N_FF, N_DECODE); }
+
+// The same sweep at a batch, which is the regime a diffusion transformer runs
+// in: hundreds of tokens per matmul, never one. It is a different kernel from
+// the decode sweep above - the tiled one - so a format can be fine in one and
+// poor in the other, and a model that only ever runs batched is only ever
+// measured here.
+static struct gk_tensor * b_pre_f16  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,   N_EMBD, N_FF, N_PREFILL); }
+static struct gk_tensor * b_pre_q8_0 (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q8_0,  N_EMBD, N_FF, N_PREFILL); }
+static struct gk_tensor * b_pre_q4_0 (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0,  N_EMBD, N_FF, N_PREFILL); }
+static struct gk_tensor * b_pre_q4_K (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_K,  N_EMBD, N_FF, N_PREFILL); }
+static struct gk_tensor * b_pre_mxfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_MXFP4, N_EMBD, N_FF, N_PREFILL); }
+static struct gk_tensor * b_pre_nvfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, N_EMBD, N_FF, N_PREFILL); }
 
 static struct gk_tensor * b_mm_gate_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0, N_EMBD, N_FF,    N_PREFILL); }
 static struct gk_tensor * b_mm_down_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_1, N_FF,   N_EMBD,  N_PREFILL); }
@@ -575,6 +588,15 @@ static const struct bench_case g_cases[] = {
     { NULL,            "q4_K",              " 5.3 MB",       b_dec_q4_K,  ARENA_SMALL },
     { NULL,            "q6_K",              " 7.7 MB",       b_dec_q6_K,  ARENA_SMALL },
     { NULL,            "mxfp4",             " 5.0 MB",       b_dec_mxfp4, ARENA_SMALL },
+    { NULL,            "nvfp4",             " 5.0 MB",       b_dec_nvfp4, ARENA_SMALL },
+
+    { "decoder cost at a batch (1536x6144, 512 columns)",
+                       "f16   (no decode)", "18.9 MB",       b_pre_f16,   ARENA_MID },
+    { NULL,            "q8_0",              "10.0 MB",       b_pre_q8_0,  ARENA_MID },
+    { NULL,            "q4_0",              " 5.3 MB",       b_pre_q4_0,  ARENA_MID },
+    { NULL,            "q4_K",              " 5.3 MB",       b_pre_q4_K,  ARENA_MID },
+    { NULL,            "mxfp4",             " 5.0 MB",       b_pre_mxfp4, ARENA_MID },
+    { NULL,            "nvfp4",             " 5.0 MB",       b_pre_nvfp4, ARENA_MID },
 
     { "matmul (prefill, 512 columns)", "ffn_gate/up q4_0", "1536x6144",   b_mm_gate_pre,  ARENA_MID   },
     { NULL,                            "ffn_down    q4_1", "6144x1536",   b_mm_down_pre,  ARENA_MID   },

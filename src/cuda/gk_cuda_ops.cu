@@ -2947,7 +2947,7 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
         }
 
         case GK_OP_MUL_MAT:
-            gk_cuda_mul_mat(stream, node);
+            gk_cuda_mul_mat(stream, scratch, node);
             return true;
 
         case GK_OP_MUL_MAT_ID:
