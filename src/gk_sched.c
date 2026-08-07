@@ -621,6 +621,58 @@ static struct gk_tensor * gk_sched_stage_for(struct gk_sched * s,
 // splitting
 // --------------------------------------------------------------------------
 
+// What the scheduler decided, per op, when GK_SCHED_REPORT is set in the
+// environment.
+//
+// A node the device declines does not fail and does not warn - it quietly goes
+// to the CPU, taking a split and a round trip over the bus with it. From
+// outside that is indistinguishable from a slow kernel, and on a graph of
+// thousands of nodes it is not something you can find by reading. This prints
+// the count per op per backend once per graph, which is usually enough to see
+// the problem in one line.
+static void gk_sched_report(struct gk_sched * s, struct gk_cgraph * graph) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char * e = getenv("GK_SCHED_REPORT");
+        enabled = e != NULL && e[0] != '0';
+    }
+    if (!enabled) {
+        return;
+    }
+
+    // op x backend, counted. GK_OP_COUNT is small and this runs once.
+    static int counts[GK_OP_COUNT][GK_SCHED_MAX_BACKENDS];
+    memset(counts, 0, sizeof(counts));
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const int bid = s->node_backend[i];
+        if (bid >= 0 && bid < s->n_backends) {
+            counts[graph->nodes[i]->op][bid]++;
+        }
+    }
+
+    gk_logf("gk sched: %d nodes, %d splits across %d backends\n",
+            graph->n_nodes, s->n_splits, s->n_backends);
+
+    for (int op = 0; op < GK_OP_COUNT; ++op) {
+        int total = 0;
+        for (int b = 0; b < s->n_backends; ++b) {
+            total += counts[op][b];
+        }
+        if (total == 0) {
+            continue;
+        }
+
+        gk_logf("gk sched:   %-22s", gk_op_name((enum gk_op) op));
+        for (int b = 0; b < s->n_backends; ++b) {
+            if (counts[op][b] != 0) {
+                gk_logf(" %s=%d", gk_backend_name(s->backends[b]), counts[op][b]);
+            }
+        }
+        gk_logf("\n");
+    }
+}
+
 // Rebuilds the arena and the run graph, then walks the assigned nodes cutting
 // splits and staging whatever crosses a boundary.
 static bool gk_sched_split(struct gk_sched * s, struct gk_cgraph * graph) {
@@ -745,6 +797,8 @@ static bool gk_sched_split(struct gk_sched * s, struct gk_cgraph * graph) {
         }
         s->splits[i].copy_end = next_copy;
     }
+
+    gk_sched_report(s, graph);
 
     return true;
 }

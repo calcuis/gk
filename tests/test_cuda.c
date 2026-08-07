@@ -740,6 +740,30 @@ static struct gk_tensor * build_mmv_q4_0_nc(struct gk_ctx * ctx, struct gk_tenso
     return mmq_case(ctx, in, n_in, GK_TYPE_Q4_0, 256, 600, 8);
 }
 
+// The tensor-core pilot: nvfp4, batched, with k a whole number of 64-element
+// blocks. Shapes off the 64x32 tile in both directions so the edge guards are
+// exercised, and one that is exactly on it.
+static struct gk_tensor * build_mma_nvfp4(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 256, 600, 40);
+}
+
+static struct gk_tensor * build_mma_nvfp4_exact(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 512, 640, 64);
+}
+
+// Several k-blocks and a column count that leaves the last tile ragged.
+static struct gk_tensor * build_mma_nvfp4_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 1024, 130, 33);
+}
+
+// Higher dimensions, so the per-slice activation indexing has to be right.
+static struct gk_tensor * build_mma_nvfp4_batched(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_NVFP4, 256, 100, 3);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32,   256, 40,  3);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
 // A k that is not a whole number of 32-element groups, which the integer path
 // declines - so this checks the fall back to the float tile still works.
 static struct gk_tensor * build_mmq_ragged_k(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
@@ -1542,6 +1566,11 @@ int main(void) {
     failures += run_op_tol(gpu, "mmv q8_0",      build_mmv_q8_0,     4e-2f);
     failures += run_op_tol(gpu, "mmv q4_K",      build_mmv_q4_K,     8e-2f);
     failures += run_op_tol(gpu, "mmv q4_0 nc",   build_mmv_q4_0_nc,  4e-2f);
+
+    failures += run_op_tol(gpu, "mma nvfp4",     build_mma_nvfp4,         4e-2f);
+    failures += run_op_tol(gpu, "mma nvfp4 exct", build_mma_nvfp4_exact,  4e-2f);
+    failures += run_op_tol(gpu, "mma nvfp4 deep", build_mma_nvfp4_deep,   4e-2f);
+    failures += run_op_tol(gpu, "mma nvfp4 batch", build_mma_nvfp4_batched, 4e-2f);
     failures += run_op(gpu, "rope",           build_rope);
     failures += run_op(gpu, "get_rows",       build_get_rows);
     failures += run_op(gpu, "scale",          build_scale);
@@ -1595,6 +1624,37 @@ int main(void) {
         // still split, but with more than one query row per head
         failures += run_flash_attn(gpu, "small batch",
             (struct fa_shape) { 8, 4, 4, 1024, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+
+        // The tiled path, which many query rows and a narrow head select. A
+        // cache that is not a whole number of 32-key tiles is what checks the
+        // tail, and no mask at all is the shape a diffusion transformer runs.
+        failures += run_flash_attn(gpu, "tiled ragged kv",
+            (struct fa_shape) { 40, 4, 4, 1000, DK, DV, FA_MASK_NONE, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "tiled square",
+            (struct fa_shape) { 128, 4, 4, 128, DK, DV, FA_MASK_NONE, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "tiled gqa mask",
+            (struct fa_shape) { 96, 8, 2, 320, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "tiled sinks",
+            (struct fa_shape) { 64, 4, 4, 200, DK, DV, FA_MASK_CAUSAL, true }, 2e-3f);
+        failures += run_flash_attn(gpu, "tiled masked tail",
+            (struct fa_shape) { 48, 4, 4, 300, DK, DV, FA_MASK_SUFFIX, false }, 2e-3f);
+
+        // Wider heads. 128 is what a diffusion transformer usually runs, and
+        // the shared tiles grow with it - this is the case that decides
+        // whether the tiled path can be taken at all.
+        failures += run_flash_attn(gpu, "tiled d96",
+            (struct fa_shape) { 64, 4, 4, 256, 96, 96, FA_MASK_NONE, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "tiled d128",
+            (struct fa_shape) { 64, 4, 4, 256, 128, 128, FA_MASK_NONE, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "tiled d128 mask",
+            (struct fa_shape) { 40, 8, 2, 300, 128, 128, FA_MASK_CAUSAL, false }, 2e-3f);
+
+        // Past what a lane's accumulator array covers, so this has to fall
+        // back rather than drop the dimensions it cannot hold.
+        failures += run_flash_attn(gpu, "wide dv falls back",
+            (struct fa_shape) { 64, 4, 4, 256, 160, 160, FA_MASK_NONE, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "very wide dv",
+            (struct fa_shape) { 32, 4, 4, 128, 256, 256, FA_MASK_CAUSAL, false }, 2e-3f);
     }
 
     // top_k on both sides of the width where one network stops fitting: 4096

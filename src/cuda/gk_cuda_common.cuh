@@ -266,6 +266,8 @@ struct gk_cuda_scratch {
     void * ptr;
     size_t size;
     int    n_sm;   // multiprocessors on this device
+    int    cc;     // compute capability, major*10 + minor
+    int    smem_max; // dynamic shared memory a block may opt in to, bytes
 };
 
 // Returns a buffer of at least `bytes`, or NULL if the device has no room.

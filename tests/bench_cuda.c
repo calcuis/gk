@@ -328,6 +328,41 @@ static struct gk_tensor * b_fa_pre_512 (struct gk_ctx * c) { return fattn_case(c
 
 // Unfused attention: the path a model takes when flash attention is off or
 // refused. Timed because it is the fallback the FA kernel is competing with.
+// Self-attention over a whole image's worth of tokens, which is the shape a
+// diffusion transformer runs: every token attends to every other, so both the
+// query count and the cache grow together and the work grows with the square.
+// Nothing in the decode cases above reaches this regime.
+static struct gk_tensor * fattn_square(struct gk_ctx * ctx, int64_t n_tok, int64_t n_head) {
+    const int64_t DK = 64;
+    struct gk_tensor * q = gk_new_tensor_4d(ctx, GK_TYPE_F32, DK, n_tok, n_head, 1);
+    struct gk_tensor * k = gk_new_tensor_4d(ctx, GK_TYPE_F16, DK, n_tok, n_head, 1);
+    struct gk_tensor * v = gk_new_tensor_4d(ctx, GK_TYPE_F16, DK, n_tok, n_head, 1);
+    gk_set_name(q, "q");
+    gk_set_name(k, "k");
+    gk_set_name(v, "v");
+    return gk_flash_attn_ext(ctx, q, k, v, NULL, 1.0f / sqrtf((float) DK), 0.0f, 0.0f);
+}
+
+// Head width 128, which is what most diffusion transformers actually use and
+// what the shared tiles have to be sized for.
+static struct gk_tensor * fattn_square_d(struct gk_ctx * ctx, int64_t n_tok, int64_t n_head,
+                                         int64_t DK) {
+    struct gk_tensor * q = gk_new_tensor_4d(ctx, GK_TYPE_F32, DK, n_tok, n_head, 1);
+    struct gk_tensor * k = gk_new_tensor_4d(ctx, GK_TYPE_F16, DK, n_tok, n_head, 1);
+    struct gk_tensor * v = gk_new_tensor_4d(ctx, GK_TYPE_F16, DK, n_tok, n_head, 1);
+    gk_set_name(q, "q");
+    gk_set_name(k, "k");
+    gk_set_name(v, "v");
+    return gk_flash_attn_ext(ctx, q, k, v, NULL, 1.0f / sqrtf((float) DK), 0.0f, 0.0f);
+}
+
+static struct gk_tensor * b_fa_dit_2k_d128(struct gk_ctx * c) { return fattn_square_d(c, 2048, 16, 128); }
+static struct gk_tensor * b_fa_dit_4k_d128(struct gk_ctx * c) { return fattn_square_d(c, 4096, 16, 128); }
+
+static struct gk_tensor * b_fa_dit_1k(struct gk_ctx * c) { return fattn_square(c, 1024, 16); }
+static struct gk_tensor * b_fa_dit_2k(struct gk_ctx * c) { return fattn_square(c, 2048, 16); }
+static struct gk_tensor * b_fa_dit_4k(struct gk_ctx * c) { return fattn_square(c, 4096, 16); }
+
 static struct gk_tensor * b_softmax_dec(struct gk_ctx * ctx) {
     struct gk_tensor * kq = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2048, N_DECODE, N_HEAD, 1);
     struct gk_tensor * m  = gk_new_tensor_4d(ctx, GK_TYPE_F16, 2048, N_DECODE, 1, 1);
@@ -607,6 +642,11 @@ static const struct bench_case g_cases[] = {
     { NULL,        "flash_attn decode",  "n_kv=2048",      b_fa_dec_2k,   ARENA_SMALL },
     { NULL,        "flash_attn decode",  "n_kv=8192",      b_fa_dec_8k,   ARENA_MID   },
     { NULL,        "flash_attn prefill", "n_kv=512 nb=512", b_fa_pre_512, ARENA_MID   },
+    { NULL,        "flash_attn DiT",     "1024 tok x16",   b_fa_dit_1k,   ARENA_MID   },
+    { NULL,        "flash_attn DiT",     "2048 tok x16",   b_fa_dit_2k,   ARENA_BIG   },
+    { NULL,        "flash_attn DiT",     "4096 tok x16",   b_fa_dit_4k,   ARENA_BIG   },
+    { NULL,        "flash_attn DiT d128","2048 tok x16",   b_fa_dit_2k_d128, ARENA_BIG },
+    { NULL,        "flash_attn DiT d128","4096 tok x16",   b_fa_dit_4k_d128, ARENA_BIG },
     { NULL,        "soft_max decode",    "2048x1x8",       b_softmax_dec, ARENA_SMALL },
     { NULL,        "soft_max prefill",   "512x512x8",      b_softmax_pre, ARENA_MID   },
 

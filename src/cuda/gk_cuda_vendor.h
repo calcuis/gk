@@ -26,6 +26,10 @@
 #define gkGetErrorString        hipGetErrorString
 #define gkGetLastError          hipGetLastError
 
+#define gkStreamPerThread       hipStreamPerThread
+#define gkFuncSetAttribute      hipFuncSetAttribute
+#define gkFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+
 #define gkMalloc                hipMalloc
 #define gkFree                  hipFree
 #define gkHostAlloc(p, s)       hipHostMalloc(p, s, hipHostMallocDefault)
@@ -70,6 +74,10 @@
 #define gkSuccess               cudaSuccess
 #define gkGetErrorString        cudaGetErrorString
 #define gkGetLastError          cudaGetLastError
+
+#define gkStreamPerThread       cudaStreamPerThread
+#define gkFuncSetAttribute      cudaFuncSetAttribute
+#define gkFuncAttributeMaxDynamicSharedMemorySize cudaFuncAttributeMaxDynamicSharedMemorySize
 
 #define gkMalloc                cudaMalloc
 #define gkFree                  cudaFree

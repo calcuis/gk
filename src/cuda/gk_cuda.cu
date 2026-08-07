@@ -50,6 +50,8 @@ struct gk_cuda_device_ctx {
     size_t total_memory;
     bool   integrated;
     int    n_sm;         // multiprocessors; a launcher sizing a grid wants it
+    int    cc;           // compute capability; the tensor-core path needs 8.0
+    int    smem_max;     // shared memory a block may opt in to, past the 48 KB default
 
     struct gk_backend_buffer_type buft;
     struct gk_backend_buffer_type host_buft;
@@ -93,7 +95,16 @@ static void gk_cuda_buffer_set_tensor(gk_backend_buffer_t buffer, struct gk_tens
     GK_CUDA_CHECK(gkSetDevice(ctx->device));
     // Synchronous by contract: the caller may free `data` the moment this
     // returns, so the copy cannot be left in flight.
-    GK_CUDA_CHECK(gkMemcpy((char *) tensor->data + offset, data, size, gkMemcpyHostToDevice));
+    //
+    // The wait is on the per-thread stream rather than the legacy default one,
+    // and that is the whole point. A plain gkMemcpy is ordered against every
+    // other stream on the device, so a model loader filling tensors from
+    // several threads has them queue behind one another instead of overlapping.
+    // Same contract, same cost for a single thread, several times the
+    // throughput for a loader that uses more than one.
+    GK_CUDA_CHECK(gkMemcpyAsync((char *) tensor->data + offset, data, size,
+                                gkMemcpyHostToDevice, gkStreamPerThread));
+    GK_CUDA_CHECK(gkStreamSynchronize(gkStreamPerThread));
 }
 
 static void gk_cuda_buffer_get_tensor(gk_backend_buffer_t buffer, const struct gk_tensor * tensor,
@@ -101,7 +112,9 @@ static void gk_cuda_buffer_get_tensor(gk_backend_buffer_t buffer, const struct g
     struct gk_cuda_buffer_ctx * ctx = (struct gk_cuda_buffer_ctx *) buffer->context;
 
     GK_CUDA_CHECK(gkSetDevice(ctx->device));
-    GK_CUDA_CHECK(gkMemcpy(data, (const char *) tensor->data + offset, size, gkMemcpyDeviceToHost));
+    GK_CUDA_CHECK(gkMemcpyAsync(data, (const char *) tensor->data + offset, size,
+                                gkMemcpyDeviceToHost, gkStreamPerThread));
+    GK_CUDA_CHECK(gkStreamSynchronize(gkStreamPerThread));
 }
 
 static void gk_cuda_buffer_clear(gk_backend_buffer_t buffer, uint8_t value) {
@@ -520,6 +533,8 @@ static gk_backend_t gk_cuda_device_init_backend(gk_device_t dev) {
     ctx->scratch.ptr  = NULL;
     ctx->scratch.size = 0;
     ctx->scratch.n_sm = d->n_sm;
+    ctx->scratch.cc   = d->cc;
+    ctx->scratch.smem_max = d->smem_max;
 
     GK_CUDA_CHECK(gkSetDevice(d->index));
 
@@ -620,6 +635,13 @@ extern "C" void gk_cuda_register_devices(void) {
         d->total_memory = prop.totalGlobalMem;
         d->integrated   = prop.integrated != 0;
         d->n_sm         = prop.multiProcessorCount;
+        d->cc           = prop.major * 10 + prop.minor;
+        // Every part gives a block 48 KB without asking; Ampere and later will
+        // give most of the multiprocessor's store to one block on request.
+        d->smem_max     = (int) prop.sharedMemPerBlockOptin;
+        if (d->smem_max < (int) prop.sharedMemPerBlock) {
+            d->smem_max = (int) prop.sharedMemPerBlock;
+        }
 
         snprintf(d->name, sizeof(d->name), "%s%d", GK_CUDA_BACKEND_NAME, i);
         snprintf(d->description, sizeof(d->description), "%s", prop.name);
