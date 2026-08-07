@@ -1079,7 +1079,18 @@ GK_API void gk_backend_tensor_copy(const struct gk_tensor * src, struct gk_tenso
 GK_API const char *              gk_backend_name                   (gk_backend_t backend);
 GK_API void                      gk_backend_free                   (gk_backend_t backend);
 GK_API gk_backend_buffer_type_t  gk_backend_get_default_buffer_type(gk_backend_t backend);
+// Evaluates the graph and waits for it. When this returns, every result the
+// graph produced is readable - by the host, by another backend, by anything.
+// A device backend queues its work on a stream that nothing else is ordered
+// against, so without the wait a caller reading a result would race the
+// kernels still writing it.
 GK_API enum gk_status            gk_backend_graph_compute          (gk_backend_t backend,
+                                                                    struct gk_cgraph * graph);
+
+// The same, without the wait, for a caller that will synchronize itself. Only
+// worth reaching for when several graphs are queued back to back; anything
+// that reads a result in between wants the form above.
+GK_API enum gk_status            gk_backend_graph_compute_async    (gk_backend_t backend,
                                                                     struct gk_cgraph * graph);
 GK_API bool                      gk_backend_supports_op            (gk_backend_t backend,
                                                                     const struct gk_tensor * op);

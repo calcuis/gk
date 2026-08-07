@@ -357,7 +357,285 @@ static struct gk_tensor * build_ssm_scan_m1(struct gk_ctx * ctx, struct gk_tenso
     return build_ssm_scan_common(ctx, in, n_in, 8); // Mamba-1, d_state decays
 }
 
+
+// --------------------------------------------------------------------------
+// The diffusion op set.
+//
+// A transformer decoder exercises a narrow slice of this backend; an image
+// model asks for a different one - normalisations over spatial groups, the
+// broadcasts a residual stack builds, the im2col a convolution decomposes to.
+// These are the ops the diffusion graphs actually contain, and the geometry is
+// theirs: channel counts that are not multiples of the block, a token count
+// that is not a multiple of the warp.
+// --------------------------------------------------------------------------
+
+static struct gk_tensor * build_norm(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 320, 37, 2);
+    *n_in = 1;
+    return gk_norm(ctx, in[0], 1e-5f);
+}
+
+static struct gk_tensor * build_group_norm(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    // [W, H, C, N] with 32 groups over C, the shape every VAE block uses
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 9, 7, 64, 2);
+    *n_in = 1;
+    return gk_group_norm(ctx, in[0], 32, 1e-6f);
+}
+
+static struct gk_tensor * build_mean(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 133, 5, 3);
+    *n_in = 1;
+    return gk_mean(ctx, in[0]);
+}
+
+static struct gk_tensor * build_repeat(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    // repeat_4d rather than repeat: the shape argument of the two-tensor form
+    // is a template, not a graph input, and the harness only fills inputs.
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 64, 1, 3);
+    *n_in = 1;
+    return gk_repeat_4d(ctx, in[0], 64, 37, 3, 1);
+}
+
+static struct gk_tensor * build_concat(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 48, 37, 2);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 48, 11, 2);
+    *n_in = 2;
+    return gk_concat(ctx, in[0], in[1], 1);
+}
+
+static struct gk_tensor * build_timestep_embedding(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_1d(ctx, GK_TYPE_F32, 3);
+    *n_in = 1;
+    return gk_timestep_embedding(ctx, in[0], 256, 10000);
+}
+
+static struct gk_tensor * build_im2col_f16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    // the destination type a composite conv_2d asks for, which is the route
+    // every convolution in these models actually takes
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 3, 4, 5);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 14, 12, 4, 2);
+    *n_in = 2;
+    return gk_im2col(ctx, in[0], in[1], 1, 1, 1, 1, 1, 1, true, GK_TYPE_F16);
+}
+
+static struct gk_tensor * build_soft_max(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 37, 37, 5);
+    *n_in = 1;
+    return gk_soft_max(ctx, in[0]);
+}
+
+static struct gk_tensor * build_silu(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 133, 7);
+    *n_in = 1;
+    return gk_silu(ctx, in[0]);
+}
+
+static struct gk_tensor * build_gelu(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 133, 7);
+    *n_in = 1;
+    return gk_gelu(ctx, in[0]);
+}
+
+// A residual add where the bias broadcasts over rows - the shape a linear
+// layer's bias arrives in, and the one a per-element kernel gets wrong.
+static struct gk_tensor * build_add_broadcast(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 320, 37, 2);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 320, 1, 1);
+    *n_in = 2;
+    return gk_add(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_mul_broadcast(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 320, 37, 2);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 320, 1, 2);
+    *n_in = 2;
+    return gk_mul(ctx, in[0], in[1]);
+}
+
+// cont of a permuted view: the attention stacks do this between every
+// projection, and it is where a kernel that assumes contiguity shows up.
+static struct gk_tensor * build_cont_permuted(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 64, 5, 37, 2);
+    *n_in = 1;
+    return gk_cont(ctx, gk_permute(ctx, in[0], 0, 2, 1, 3));
+}
+
+// A matmul whose activations are a permuted view rather than a packed buffer.
+static struct gk_tensor * build_mul_mat_permuted(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 64, 96);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 64, 37, 2);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], gk_cont(ctx, gk_permute(ctx, in[1], 0, 2, 1, 3)));
+}
+
+// The tiled matmul path: wide enough to take it, and deliberately not a
+// multiple of the tile in either direction.
+static struct gk_tensor * build_mul_mat_wide(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 130, 100);
+    in[1] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 130, 145);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_mul_mat_wide_q(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_NVFP4, 128, 100);
+    in[1] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 128, 145);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+// Batched, so the broadcast of the weight's higher dimensions onto the
+// activations' is exercised on the tiled path too.
+// The same quantized weight through the mat-vec path, as a control: the CPU
+// dots a quantized weight against quantized activations and the device decodes
+// to float, so the two differ by the activation quantization on *both* paths.
+// If this control mismatches too, the tolerance is what is wrong, not the tile.
+static struct gk_tensor * build_mul_mat_narrow_q(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_NVFP4, 128, 100);
+    in[1] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 128, 8);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_mul_mat_wide_batched(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 96, 70, 2);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 96, 133, 4);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_rope(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 64, 8, 37);
+    in[1] = gk_new_tensor_1d(ctx, GK_TYPE_I32, 37);
+    *n_in = 2;
+    return gk_rope(ctx, in[0], in[1], 64, 0);
+}
+
+static struct gk_tensor * build_get_rows(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 96, 40);
+    in[1] = gk_new_tensor_1d(ctx, GK_TYPE_I32, 13);
+    *n_in = 2;
+    return gk_get_rows(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_scale(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 133, 7);
+    *n_in = 1;
+    return gk_scale(ctx, in[0], 0.375f);
+}
+
+static struct gk_tensor * build_pad(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 9, 7, 5, 2);
+    *n_in = 1;
+    return gk_pad(ctx, in[0], 3, 2, 1, 0);
+}
+
+static struct gk_tensor * build_upscale(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 9, 7, 5, 2);
+    *n_in = 1;
+    return gk_upscale(ctx, in[0], 2, GK_SCALE_MODE_NEAREST);
+}
+
+
+// --------------------------------------------------------------------------
+// Composite graphs.
+//
+// Every op above passes on its own, which is not the same as a graph passing.
+// A deep chain is where buffer reuse in the allocator, aliasing between a node
+// and its source, and any dependence on evaluation order actually show up - a
+// single-op test allocates two live tensors and never reuses anything. These
+// mirror the two shapes the engine really runs.
+// --------------------------------------------------------------------------
+
+static struct gk_tensor * build_vae_stack(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t W = 16, H = 16, C = 64;
+
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, W, H, C, 1);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 3, C, C);
+    in[2] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 3, C, C);
+    in[3] = gk_new_tensor_1d(ctx, GK_TYPE_F32, C);
+    *n_in = 4;
+
+    struct gk_tensor * x = in[0];
+    for (int layer = 0; layer < 3; ++layer) {
+        struct gk_tensor * h = gk_group_norm(ctx, x, 32, 1e-6f);
+        h = gk_silu(ctx, h);
+        h = gk_conv_2d(ctx, in[1], h, 1, 1, 1, 1, 1, 1);
+        h = gk_add(ctx, h, gk_reshape_4d(ctx, in[3], 1, 1, C, 1));
+        h = gk_group_norm(ctx, h, 32, 1e-6f);
+        h = gk_silu(ctx, h);
+        h = gk_conv_2d(ctx, in[2], h, 1, 1, 1, 1, 1, 1);
+        x = gk_add(ctx, x, h);
+    }
+    return x;
+}
+
+static struct gk_tensor * build_transformer_block(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t D = 128, T = 37, HD = 32, NH = 4;
+
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, D, T);
+    in[1] = gk_new_tensor_2d(ctx, GK_TYPE_F32, D, D);
+    in[2] = gk_new_tensor_2d(ctx, GK_TYPE_F32, D, D);
+    in[3] = gk_new_tensor_2d(ctx, GK_TYPE_F32, D, D);
+    in[4] = gk_new_tensor_2d(ctx, GK_TYPE_F32, D, D);
+    in[5] = gk_new_tensor_2d(ctx, GK_TYPE_F32, D, D * 2);
+    in[6] = gk_new_tensor_2d(ctx, GK_TYPE_F32, D * 2, D);
+    *n_in = 7;
+
+    struct gk_tensor * x = in[0];
+    for (int layer = 0; layer < 2; ++layer) {
+        struct gk_tensor * h = gk_norm(ctx, x, 1e-5f);
+
+        struct gk_tensor * q = gk_mul_mat(ctx, in[1], h);
+        struct gk_tensor * k = gk_mul_mat(ctx, in[2], h);
+        struct gk_tensor * v = gk_mul_mat(ctx, in[3], h);
+
+        q = gk_cont(ctx, gk_permute(ctx, gk_reshape_3d(ctx, q, HD, NH, T), 0, 2, 1, 3));
+        k = gk_cont(ctx, gk_permute(ctx, gk_reshape_3d(ctx, k, HD, NH, T), 0, 2, 1, 3));
+        v = gk_cont(ctx, gk_permute(ctx, gk_reshape_3d(ctx, v, HD, NH, T), 0, 2, 1, 3));
+
+        struct gk_tensor * att = gk_mul_mat(ctx, k, q);
+        att = gk_soft_max_ext(ctx, att, NULL, 1.0f / sqrtf((float) HD), 0.0f);
+
+        struct gk_tensor * o = gk_mul_mat(ctx, gk_cont(ctx, gk_transpose(ctx, v)), att);
+        o = gk_cont(ctx, gk_permute(ctx, o, 0, 2, 1, 3));
+        o = gk_reshape_2d(ctx, o, D, T);
+        o = gk_mul_mat(ctx, in[4], o);
+
+        x = gk_add(ctx, x, o);
+
+        h = gk_norm(ctx, x, 1e-5f);
+        h = gk_mul_mat(ctx, in[5], h);
+        h = gk_gelu(ctx, h);
+        h = gk_mul_mat(ctx, in[6], h);
+        x = gk_add(ctx, x, h);
+    }
+    return x;
+}
+
+static int run_op_tol(gk_backend_t gpu, const char * name, op_builder build, float tol);
+static int run_op(gk_backend_t gpu, const char * name, op_builder build);
+
+// Most ops are exact to f32 rounding against the CPU and are held to 1e-4. Two
+// families legitimately are not, and loosening those here is the difference
+// between a suite that catches a regression and one that always prints
+// failures:
+//
+//   * a quantized weight: the CPU dots it against activations it has
+//     quantized to 8 bits, the device decodes to float and does not. The
+//     device answer is the more accurate one; they differ by the activation
+//     quantization, not by a bug.
+//   * an f16 intermediate: a composite conv_2d hands its im2col result on as
+//     f16 and the CPU keeps it there, while the device widens to f32 to
+//     accumulate. Again the device is closer to the truth.
+//
+// Both bounds are set just above what the difference actually measures, so a
+// real regression in either still trips them.
 static int run_op(gk_backend_t gpu, const char * name, op_builder build) {
+    return run_op_tol(gpu, name, build, 1e-4f);
+}
+
+static int run_op_tol(gk_backend_t gpu, const char * name, op_builder build, float tol) {
     struct gk_tensor * gpu_in[GK_MAX_SRC] = { NULL };
     struct gk_tensor * cpu_in[GK_MAX_SRC] = { NULL };
     int n_in = 0;
@@ -444,23 +722,40 @@ static int run_op(gk_backend_t gpu, const char * name, op_builder build) {
     float max_abs = 0.0f;
 
     if (no > 0) {
+        // The output need not be f32 - im2col hands a convolution an f16
+        // buffer - so both sides are read as raw bytes and widened through the
+        // type's own converter rather than assumed to be floats already.
+        const size_t out_bytes = gk_nbytes(gpu_out);
+        void  * raw = malloc(out_bytes);
         float * got = (float *) malloc((size_t) no * sizeof(float));
-        if (got == NULL) {
+        float * exp_buf = (float *) malloc((size_t) no * sizeof(float));
+        if (raw == NULL || got == NULL || exp_buf == NULL) {
             return 1;
         }
-        gk_backend_tensor_get(gpu_out, got, 0, (size_t) no * sizeof(float));
+        gk_backend_tensor_get(gpu_out, raw, 0, out_bytes);
 
-        const float * expected = (const float *) cpu_out->data;
+        if (gpu_out->type == GK_TYPE_F32) {
+            memcpy(got, raw, (size_t) no * sizeof(float));
+            memcpy(exp_buf, cpu_out->data, (size_t) no * sizeof(float));
+        } else {
+            const struct gk_type_traits * tr = gk_get_type_traits(gpu_out->type);
+            tr->to_float(raw, got, no);
+            tr->to_float(cpu_out->data, exp_buf, no);
+        }
+        free(raw);
+
+        const float * expected = exp_buf;
         for (int64_t i = 0; i < no; ++i) {
             const float diff = fabsf(got[i] - expected[i]);
             if (diff > max_abs) {
                 max_abs = diff;
             }
-            if (!(diff <= 1e-4f + 1e-4f * fabsf(expected[i]))) {
+            if (!(diff <= tol + tol * fabsf(expected[i]))) {
                 bad++;
             }
         }
         free(got);
+        free(exp_buf);
     }
 
     printf("  %-14s %5lld outputs, max abs error %.8g, %d mismatches%s\n",
@@ -470,6 +765,186 @@ static int run_op(gk_backend_t gpu, const char * name, op_builder build) {
     gk_gallocr_free(alloc);
     gk_free(gpu_ctx);
 
+    return bad == 0 ? 0 : 1;
+}
+
+// --------------------------------------------------------------------------
+// fused attention
+//
+// This op gets its own harness rather than joining run_op's list, for one
+// reason: run_op fills every input from the same generator, and an attention
+// mask filled that way holds arbitrary finite numbers. The interesting values
+// in a mask are the infinities - a position the kernel must skip entirely -
+// and whole regions of them, because the device splits the cache across blocks
+// and a block whose entire slice is masked contributes nothing to the merge.
+// That path cannot be reached with a mask of ordinary floats.
+//
+// So the mask is built here, in three shapes: absent, causal, and a suffix
+// window that leaves early slices completely masked.
+// --------------------------------------------------------------------------
+
+enum fa_mask_mode {
+    FA_MASK_NONE = 0,
+    FA_MASK_CAUSAL,   // position ic visible to query iq1 if it precedes it
+    FA_MASK_SUFFIX,   // only the last quarter of the cache is visible
+};
+
+struct fa_shape {
+    int64_t n_batch;
+    int64_t n_head;
+    int64_t n_head_kv;   // fewer than n_head is grouped-query attention
+    int64_t n_kv;
+    int64_t DK;
+    int64_t DV;
+    enum fa_mask_mode mask;
+    bool    sinks;
+};
+
+// Builds the graph into `ctx`, and hands back the inputs so both sides can be
+// given identical bytes.
+static struct gk_tensor * fa_build(struct gk_ctx * ctx, const struct fa_shape * s,
+                                   struct gk_tensor ** q, struct gk_tensor ** k,
+                                   struct gk_tensor ** v, struct gk_tensor ** m,
+                                   struct gk_tensor ** sk) {
+    *q = gk_new_tensor_4d(ctx, GK_TYPE_F32, s->DK, s->n_batch, s->n_head,    1);
+    *k = gk_new_tensor_4d(ctx, GK_TYPE_F16, s->DK, s->n_kv,    s->n_head_kv, 1);
+    *v = gk_new_tensor_4d(ctx, GK_TYPE_F16, s->DV, s->n_kv,    s->n_head_kv, 1);
+    *m = s->mask == FA_MASK_NONE
+        ? NULL
+        : gk_new_tensor_4d(ctx, GK_TYPE_F16, s->n_kv, s->n_batch, 1, 1);
+
+    struct gk_tensor * out = gk_flash_attn_ext(ctx, *q, *k, *v, *m,
+                                               1.0f / sqrtf((float) s->DK), 0.0f, 0.0f);
+    *sk = NULL;
+    if (s->sinks) {
+        *sk = gk_new_tensor_1d(ctx, GK_TYPE_F32, s->n_head);
+        gk_flash_attn_ext_add_sinks(out, *sk);
+    }
+    return out;
+}
+
+// The mask, as f16, in whichever shape the case asked for.
+static void fa_fill_mask(const struct fa_shape * s, gk_fp16_t * dst) {
+    for (int64_t j = 0; j < s->n_batch; ++j) {
+        for (int64_t i = 0; i < s->n_kv; ++i) {
+            bool visible = true;
+            if (s->mask == FA_MASK_CAUSAL) {
+                visible = i <= j + (s->n_kv - s->n_batch);
+            } else if (s->mask == FA_MASK_SUFFIX) {
+                visible = i >= (s->n_kv * 3) / 4;
+            }
+            dst[j * s->n_kv + i] = gk_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+        }
+    }
+}
+
+static void fa_fill(struct gk_tensor * gpu_t, struct gk_tensor * cpu_t, int * seed) {
+    if (gpu_t == NULL) {
+        return;
+    }
+    const int64_t n = gk_nelements(cpu_t);
+    const size_t bytes = gk_nbytes(cpu_t);
+
+    float * f = (float *) malloc((size_t) n * sizeof(float));
+    void  * raw = malloc(bytes);
+    for (int64_t i = 0; i < n; ++i) {
+        f[i] = input_value((*seed)++);
+    }
+    if (cpu_t->type == GK_TYPE_F32) {
+        memcpy(raw, f, bytes);
+    } else {
+        gk_get_type_traits(cpu_t->type)->from_float(f, raw, n);
+    }
+
+    memcpy(cpu_t->data, raw, bytes);
+    gk_backend_tensor_set(gpu_t, raw, 0, bytes);
+
+    free(raw);
+    free(f);
+}
+
+static int run_flash_attn(gk_backend_t gpu, const char * name,
+                          struct fa_shape s, float tol) {
+    struct gk_tensor *gq, *gk_, *gv, *gm, *gs;
+    struct gk_tensor *cq, *ck, *cv, *cm, *cs;
+
+    struct gk_ctx * gpu_ctx = gk_init((struct gk_init_params) {
+        .mem_size = 64u << 20, .mem_buffer = NULL, .no_alloc = true,
+    });
+    struct gk_tensor * gpu_out = fa_build(gpu_ctx, &s, &gq, &gk_, &gv, &gm, &gs);
+    gk_set_output(gpu_out);
+    struct gk_cgraph * gpu_graph = gk_new_graph(gpu_ctx);
+    gk_build_forward_expand(gpu_graph, gpu_out);
+
+    if (!gk_backend_supports_op(gpu, gpu_out)) {
+        printf("  %-16s FAIL: the backend declines the op\n", name);
+        gk_free(gpu_ctx);
+        return 1;
+    }
+
+    struct gk_gallocr * alloc = gk_gallocr_new(gk_backend_get_default_buffer_type(gpu));
+    if (alloc == NULL || !gk_gallocr_alloc_graph(alloc, gpu_graph)) {
+        printf("  %-16s FAIL: could not allocate the device graph\n", name);
+        gk_free(gpu_ctx);
+        return 1;
+    }
+
+    struct gk_ctx * cpu_ctx = gk_init((struct gk_init_params) {
+        .mem_size = 128u << 20, .mem_buffer = NULL, .no_alloc = false,
+    });
+    struct gk_tensor * cpu_out = fa_build(cpu_ctx, &s, &cq, &ck, &cv, &cm, &cs);
+    struct gk_cgraph * cpu_graph = gk_new_graph(cpu_ctx);
+    gk_build_forward_expand(cpu_graph, cpu_out);
+
+    int seed = 0;
+    fa_fill(gq,  cq,  &seed);
+    fa_fill(gk_, ck,  &seed);
+    fa_fill(gv,  cv,  &seed);
+    fa_fill(gs,  cs,  &seed);
+
+    if (cm != NULL) {
+        const size_t bytes = gk_nbytes(cm);
+        gk_fp16_t * mbuf = (gk_fp16_t *) malloc(bytes);
+        fa_fill_mask(&s, mbuf);
+        memcpy(cm->data, mbuf, bytes);
+        gk_backend_tensor_set(gm, mbuf, 0, bytes);
+        free(mbuf);
+    }
+
+    if (gk_graph_compute(cpu_graph, 4) != GK_STATUS_SUCCESS) {
+        printf("  %-16s FAIL: the CPU reference failed\n", name);
+        return 1;
+    }
+    if (gk_backend_graph_compute(gpu, gpu_graph) != GK_STATUS_SUCCESS) {
+        printf("  %-16s FAIL: the device graph failed\n", name);
+        return 1;
+    }
+    gk_backend_synchronize(gpu);
+
+    const int64_t no = gk_nelements(gpu_out);
+    float * got = (float *) malloc((size_t) no * sizeof(float));
+    gk_backend_tensor_get(gpu_out, got, 0, (size_t) no * sizeof(float));
+    const float * want = (const float *) cpu_out->data;
+
+    int   bad = 0;
+    float max_abs = 0.0f;
+    for (int64_t i = 0; i < no; ++i) {
+        const float diff = fabsf(got[i] - want[i]);
+        if (diff > max_abs) {
+            max_abs = diff;
+        }
+        if (!(diff <= tol)) { // catches NaN, which a comparison the other way lets past
+            bad++;
+        }
+    }
+
+    printf("  %-16s %6lld outputs, max abs error %.8g, %d mismatches%s\n",
+           name, (long long) no, max_abs, bad, bad == 0 ? "" : "  FAIL");
+
+    free(got);
+    gk_free(cpu_ctx);
+    gk_gallocr_free(alloc);
+    gk_free(gpu_ctx);
     return bad == 0 ? 0 : 1;
 }
 
@@ -505,6 +980,84 @@ int main(void) {
     failures += run_op(gpu, "ssm_scan m2",   build_ssm_scan_m2);
     failures += run_op(gpu, "ssm_scan m1",   build_ssm_scan_m1);
     failures += run_op(gpu, "mul_mat empty", build_empty_mul_mat);
+
+    printf("diffusion op set:\n");
+    failures += run_op(gpu, "norm",           build_norm);
+    failures += run_op(gpu, "group_norm",     build_group_norm);
+    failures += run_op(gpu, "mean",           build_mean);
+    failures += run_op(gpu, "repeat",         build_repeat);
+    failures += run_op(gpu, "concat",         build_concat);
+    failures += run_op(gpu, "timestep_emb",   build_timestep_embedding);
+    failures += run_op(gpu, "im2col f16",     build_im2col_f16);
+    failures += run_op(gpu, "soft_max",       build_soft_max);
+    failures += run_op(gpu, "silu",           build_silu);
+    failures += run_op(gpu, "gelu",           build_gelu);
+    failures += run_op(gpu, "add broadcast",  build_add_broadcast);
+    failures += run_op(gpu, "mul broadcast",  build_mul_broadcast);
+    failures += run_op(gpu, "cont permuted",  build_cont_permuted);
+    failures += run_op(gpu, "mul_mat permut", build_mul_mat_permuted);
+    failures += run_op(gpu, "mul_mat wide",   build_mul_mat_wide);
+    failures += run_op_tol(gpu, "mul_mat wide q", build_mul_mat_wide_q, 4e-2f);
+    failures += run_op_tol(gpu, "mul_mat narw q", build_mul_mat_narrow_q, 4e-2f);
+    failures += run_op(gpu, "mul_mat wide b", build_mul_mat_wide_batched);
+    failures += run_op(gpu, "rope",           build_rope);
+    failures += run_op(gpu, "get_rows",       build_get_rows);
+    failures += run_op(gpu, "scale",          build_scale);
+    failures += run_op(gpu, "pad",            build_pad);
+    failures += run_op(gpu, "upscale",        build_upscale);
+
+    // Attention, both ways the device can spread it. "prefill" has enough
+    // query rows to fill the card, so the cache is walked whole; "decode" has
+    // one token, so the cache is cut into slices and merged. The two paths sum
+    // in different orders and are held to a looser bound than an exact op -
+    // 2e-3 is above what the reordering measures and below anything a real
+    // merge bug would produce.
+    printf("fused attention:\n");
+    {
+        const int64_t DK = 64, DV = 64;
+
+        // one block per row: the unsplit path
+        failures += run_flash_attn(gpu, "prefill",
+            (struct fa_shape) { 256, 4, 4, 256, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+
+        // few rows and a long cache: the split path
+        failures += run_flash_attn(gpu, "decode",
+            (struct fa_shape) { 1, 4, 4, 1024, DK, DV, FA_MASK_NONE, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "decode causal",
+            (struct fa_shape) { 1, 4, 4, 1024, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+
+        // grouped-query: four query heads share one key head
+        failures += run_flash_attn(gpu, "decode gqa",
+            (struct fa_shape) { 1, 8, 2, 1024, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+
+        // the sink belongs to the row, not to a slice, and must be counted
+        // once however many slices there are
+        failures += run_flash_attn(gpu, "decode sinks",
+            (struct fa_shape) { 1, 4, 4, 1024, DK, DV, FA_MASK_CAUSAL, true }, 2e-3f);
+        failures += run_flash_attn(gpu, "prefill sinks",
+            (struct fa_shape) { 256, 4, 4, 256, DK, DV, FA_MASK_CAUSAL, true }, 2e-3f);
+
+        // only the tail of the cache is visible, so the early slices are
+        // entirely masked and contribute nothing - the merge has to skip them
+        // rather than let their empty maximum poison the common one
+        failures += run_flash_attn(gpu, "decode masked slices",
+            (struct fa_shape) { 1, 4, 4, 1024, DK, DV, FA_MASK_SUFFIX, false }, 2e-3f);
+        failures += run_flash_attn(gpu, "masked slices+sinks",
+            (struct fa_shape) { 1, 4, 4, 1024, DK, DV, FA_MASK_SUFFIX, true }, 2e-3f);
+
+        // a cache the split cannot divide evenly
+        failures += run_flash_attn(gpu, "decode ragged",
+            (struct fa_shape) { 1, 4, 4, 1000, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+
+        // a few tokens rather than one: still short of filling the card, so
+        // still split, but with more than one query row per head
+        failures += run_flash_attn(gpu, "small batch",
+            (struct fa_shape) { 8, 4, 4, 1024, DK, DV, FA_MASK_CAUSAL, false }, 2e-3f);
+    }
+
+    printf("composite graphs:\n");
+    failures += run_op_tol(gpu, "vae stack",      build_vae_stack, 4e-2f);
+    failures += run_op_tol(gpu, "transformer",    build_transformer_block, 4e-3f);
 
     gk_backend_free(gpu);
 

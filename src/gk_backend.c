@@ -293,6 +293,20 @@ gk_backend_buffer_type_t gk_backend_get_default_buffer_type(gk_backend_t backend
 }
 
 enum gk_status gk_backend_graph_compute(gk_backend_t backend, struct gk_cgraph * graph) {
+    const enum gk_status st = backend->iface.graph_compute(backend, graph);
+    if (st != GK_STATUS_SUCCESS) {
+        return st;
+    }
+
+    // A device backend has only queued the work at this point. Waiting here is
+    // what makes the results readable, and it is the contract every caller
+    // above already assumes: they compute a graph and then read its output
+    // without a synchronize of their own. On the CPU this is a no-op.
+    gk_backend_synchronize(backend);
+    return st;
+}
+
+enum gk_status gk_backend_graph_compute_async(gk_backend_t backend, struct gk_cgraph * graph) {
     return backend->iface.graph_compute(backend, graph);
 }
 

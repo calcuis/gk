@@ -302,7 +302,9 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 }
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    return ggml_backend_graph_compute(backend, cgraph);
+    // Genuinely async, as the name promises: the caller is expected to follow
+    // it with ggml_backend_synchronize before reading anything.
+    return ggml_compat_status(gk_backend_graph_compute_async((gk_backend_t) backend, GKG(cgraph)));
 }
 
 enum ggml_status ggml_compat_graph_compute_range(struct ggml_backend * backend,

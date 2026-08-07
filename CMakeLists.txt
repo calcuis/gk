@@ -37,6 +37,11 @@ set(GK_HIP_ARCHITECTURES  "" CACHE STRING "gk: HIP architectures (e.g. gfx1030;g
 option(GK_NATIVE "gk: build for the host CPU (-march=native)" ON)
 set(GK_ARCH_FLAGS "" CACHE STRING "gk: explicit architecture flags, used when GK_NATIVE is off")
 
+# MSVC has no equivalent of -march=native, so GK_NATIVE means nothing there and
+# the baseline is a choice instead. AVX2 is the default; this raises it. Both
+# are overridden by GK_ARCH_FLAGS.
+option(GK_AVX512 "gk: target AVX512 instead of AVX2 (MSVC only)" OFF)
+
 # The block formats come from the quantizer, which is the one place in this
 # tree where the GGUF on-disk layouts are implemented. Compiling those sources
 # in rather than duplicating them is what keeps the engine and the quantizer
@@ -92,6 +97,32 @@ if (NOT MSVC)
     target_link_libraries(gk PUBLIC m)
     find_package(Threads REQUIRED)
     target_link_libraries(gk PUBLIC Threads::Threads)
+else()
+    # MSVC has no -march=native, and left alone it targets plain SSE2: none of
+    # the SIMD paths in gk_simd.h compile in, and every f16 weight is converted
+    # in software. That is worth a factor of ten or more on a quantized model,
+    # so a default build has to ask for something newer.
+    #
+    # It also never defines __FMA__ or __F16C__, even with /arch:AVX2 enabling
+    # exactly those instructions - they are GCC/Clang spellings. gk_simd.h
+    # gates on them, so they have to be defined here or the AVX2 paths stay
+    # dark with the flag on. AVX2 hardware always has FMA and F16C; they
+    # shipped together in Haswell, so this is the ISA rather than a guess.
+    # The flag is scoped to C/C++: nvcc does not understand /arch and would
+    # read it as an input file. The device code has no use for it anyway - it
+    # only governs which host SIMD paths compile in.
+    if (GK_ARCH_FLAGS)
+        separate_arguments(GK_ARCH_FLAGS_LIST NATIVE_COMMAND "${GK_ARCH_FLAGS}")
+        target_compile_options(gk PUBLIC $<$<COMPILE_LANGUAGE:C,CXX>:${GK_ARCH_FLAGS_LIST}>)
+    elseif (GK_AVX512)
+        # /arch:AVX512 implies AVX2's instructions as well, so the AVX512 path
+        # in gk_simd.h and its f16 helpers both need the same manual defines.
+        target_compile_options(gk PUBLIC $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX512>)
+        target_compile_definitions(gk PUBLIC __FMA__ __F16C__)
+    else()
+        target_compile_options(gk PUBLIC $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>)
+        target_compile_definitions(gk PUBLIC __FMA__ __F16C__)
+    endif()
 endif()
 
 set_target_properties(gk PROPERTIES POSITION_INDEPENDENT_CODE ON)

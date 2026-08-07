@@ -38,7 +38,12 @@ static __host__ __forceinline__ int64_t gk_cu_nelements(const struct gk_tensor *
 // Evaluates one node. Returns false for an op this backend has no kernel for,
 // which never happens for a graph the scheduler placed here - supports_op is
 // asked first - and is a loud failure rather than a wrong answer if it does.
-bool gk_cuda_compute_op(gkStream_t stream, struct gk_tensor * node);
+//
+// `scratch` is the backend's, and belongs to the same stream. It is passed
+// rather than reached for globally so that two backends on two devices cannot
+// end up sharing one buffer.
+bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
+                        struct gk_tensor * node);
 
 // Whether this backend can evaluate the node, operand types included. The
 // scheduler calls this before placing anything.
@@ -53,4 +58,5 @@ bool gk_cuda_supports_op(const struct gk_tensor * op);
 // here with a performance story worth separating out.
 void gk_cuda_mul_mat   (gkStream_t stream, struct gk_tensor * dst);
 void gk_cuda_mul_mat_id(gkStream_t stream, struct gk_tensor * dst);
-void gk_cuda_flash_attn(gkStream_t stream, struct gk_tensor * dst);
+void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
+                        struct gk_tensor * dst);

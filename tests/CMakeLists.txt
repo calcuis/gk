@@ -36,6 +36,13 @@ if (GK_CUDA OR GK_HIP)
     target_link_libraries(test-cuda PRIVATE gk)
     target_include_directories(test-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
     add_test(NAME cuda COMMAND test-cuda)
+
+    # Not a test either: times each op on the device against the same op on
+    # the CPU, and reports which ops have no device kernel at all. Never
+    # fails, so it is not registered with ctest.
+    add_executable(bench-cuda bench_cuda.c)
+    target_link_libraries(bench-cuda PRIVATE gk)
+    target_include_directories(bench-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 endif()
 
 # Not a test: reports rates, never fails. Build the library with GK_NATIVE on

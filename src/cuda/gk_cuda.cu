@@ -49,6 +49,7 @@ struct gk_cuda_device_ctx {
 
     size_t total_memory;
     bool   integrated;
+    int    n_sm;         // multiprocessors; a launcher sizing a grid wants it
 
     struct gk_backend_buffer_type buft;
     struct gk_backend_buffer_type host_buft;
@@ -343,6 +344,7 @@ static const struct gk_backend_buffer_type_i g_cuda_host_buft_iface = {
 struct gk_cuda_backend_ctx {
     struct gk_cuda_device_ctx * dev;
     gkStream_t                  stream;
+    struct gk_cuda_scratch      scratch;
 };
 
 static const char * gk_cuda_backend_name(gk_backend_t backend) {
@@ -354,6 +356,10 @@ static void gk_cuda_backend_free(gk_backend_t backend) {
     if (ctx != NULL) {
         GK_CUDA_CHECK(gkSetDevice(ctx->dev->index));
         GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
+        // After the wait, so nothing is still reading it.
+        if (ctx->scratch.ptr != NULL) {
+            GK_CUDA_CHECK(gkFree(ctx->scratch.ptr));
+        }
         GK_CUDA_CHECK(gkStreamDestroy(ctx->stream));
         free(ctx);
     }
@@ -374,7 +380,7 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
     for (int i = 0; i < n; ++i) {
         struct gk_tensor * node = gk_graph_node(graph, i);
 
-        if (!gk_cuda_compute_op(ctx->stream, node)) {
+        if (!gk_cuda_compute_op(ctx->stream, &ctx->scratch, node)) {
             gk_logf("gk %s: no kernel for op %s (node %s)\n",
                     GK_CUDA_BACKEND_NAME, gk_op_name(node->op), node->name);
             return GK_STATUS_NO_STORAGE;
@@ -510,7 +516,10 @@ static gk_backend_t gk_cuda_device_init_backend(gk_device_t dev) {
         return NULL;
     }
 
-    ctx->dev = d;
+    ctx->dev          = d;
+    ctx->scratch.ptr  = NULL;
+    ctx->scratch.size = 0;
+    ctx->scratch.n_sm = d->n_sm;
 
     GK_CUDA_CHECK(gkSetDevice(d->index));
 
@@ -610,6 +619,7 @@ extern "C" void gk_cuda_register_devices(void) {
         d->index        = i;
         d->total_memory = prop.totalGlobalMem;
         d->integrated   = prop.integrated != 0;
+        d->n_sm         = prop.multiProcessorCount;
 
         snprintf(d->name, sizeof(d->name), "%s%d", GK_CUDA_BACKEND_NAME, i);
         snprintf(d->description, sizeof(d->description), "%s", prop.name);

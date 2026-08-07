@@ -223,6 +223,61 @@ static __device__ __forceinline__ float gk_cu_alibi_slope(float max_bias, int64_
 }
 
 // --------------------------------------------------------------------------
+// scratch
+//
+// Device memory a kernel needs while it runs and not afterwards. Only the
+// split attention path wants any so far: it hands each block a slice of the
+// cache and has to put the partial results somewhere until the combine pass
+// merges them.
+//
+// One buffer per backend, grown when a launch needs more than it holds and
+// never shrunk. Allocating per launch is what this exists to avoid - a device
+// allocation synchronizes, which would cost more than the kernel being served
+// and would serialize the queue the rest of the backend works hard to keep
+// full. Growth is rare in practice: the shapes a model runs settle after the
+// first few nodes and the buffer stops moving.
+// --------------------------------------------------------------------------
+
+// Per-backend launch state: the scratch buffer, and what the launchers need
+// to know about the device to size a grid. It is per-backend rather than
+// global because a machine can have two unlike devices, and a grid sized for
+// one of them on the other is a heuristic quietly applied to the wrong card.
+struct gk_cuda_scratch {
+    void * ptr;
+    size_t size;
+    int    n_sm;   // multiprocessors on this device
+};
+
+// Returns a buffer of at least `bytes`, or NULL if the device has no room.
+// The stream is needed because a grow frees the old buffer, and work already
+// queued may still be reading it.
+static __host__ __forceinline__ void * gk_cu_scratch_get(struct gk_cuda_scratch * s,
+                                                         size_t bytes, gkStream_t stream) {
+    if (s->ptr != NULL && s->size >= bytes) {
+        return s->ptr;
+    }
+
+    if (s->ptr != NULL) {
+        // The queued work that was using the old buffer has to finish before
+        // the memory goes back. This is the one synchronize in the path, and
+        // it happens only when a shape grows past every shape before it.
+        gkStreamSynchronize(stream);
+        gkFree(s->ptr);
+        s->ptr  = NULL;
+        s->size = 0;
+    }
+
+    void * p = NULL;
+    if (gkMalloc(&p, bytes) != gkSuccess) {
+        return NULL;
+    }
+
+    s->ptr  = p;
+    s->size = bytes;
+    return p;
+}
+
+// --------------------------------------------------------------------------
 // launch geometry
 // --------------------------------------------------------------------------
 

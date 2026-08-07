@@ -39,7 +39,10 @@
 #define gkMemcpyDeviceToDevice  hipMemcpyDeviceToDevice
 #define gkMemcpyPeerAsync       hipMemcpyPeerAsync
 
-#define gkStreamCreate(s)       hipStreamCreateWithFlags(s, hipStreamNonBlocking)
+// Blocking, for the same reason as the CUDA spelling below: the buffer
+// interface copies on the legacy default stream, and only a blocking stream is
+// ordered against it.
+#define gkStreamCreate(s)       hipStreamCreate(s)
 #define gkStreamDestroy         hipStreamDestroy
 #define gkStreamSynchronize     hipStreamSynchronize
 #define gkDeviceSynchronize     hipDeviceSynchronize
@@ -81,7 +84,15 @@
 #define gkMemcpyDeviceToDevice  cudaMemcpyDeviceToDevice
 #define gkMemcpyPeerAsync       cudaMemcpyPeerAsync
 
-#define gkStreamCreate(s)       cudaStreamCreateWithFlags(s, cudaStreamNonBlocking)
+// A *blocking* stream, deliberately. The buffer interface copies with plain
+// cudaMemcpy/cudaMemset, which run on the legacy default stream, and a
+// non-blocking stream has no ordering relationship with that one - a weight
+// upload or a result readback would race the kernels instead of being
+// sequenced against them. A blocking stream is ordered against the legacy
+// stream, which is the guarantee the rest of this backend assumes. Nothing
+// here overlaps two streams, so the concurrency a non-blocking stream buys is
+// concurrency this backend never uses.
+#define gkStreamCreate(s)       cudaStreamCreate(s)
 #define gkStreamDestroy         cudaStreamDestroy
 #define gkStreamSynchronize     cudaStreamSynchronize
 #define gkDeviceSynchronize     cudaDeviceSynchronize
