@@ -57,22 +57,32 @@ struct gk_dyn_alloc {
     size_t alignment;
     size_t max_size;  // high-water mark: what the buffer has to be
 
+    // What the buffer being placed into actually holds, or SIZE_MAX while
+    // measuring, when there is no buffer yet. Checked against, never allocated
+    // from: the free list below is the same size either way, so that measuring
+    // and placing make the same decisions and arrive at the same layout. Give
+    // the placing pass a smaller arena instead and best-fit starts preferring
+    // the tail block it can now see the end of, which is a different layout
+    // needing a different amount of space than was just measured for it.
+    size_t capacity;
+
     int n_free;
     struct gk_free_block free_blocks[GK_MAX_FREE_BLOCKS];
 };
 
-static void gk_dyn_reset(struct gk_dyn_alloc * a) {
+static void gk_dyn_reset(struct gk_dyn_alloc * a, size_t capacity) {
     a->n_free = 1;
     a->free_blocks[0].offset = 0;
     // Deliberately not SIZE_MAX: offset + size is computed below, and leaving
     // headroom keeps that from overflowing.
     a->free_blocks[0].size = SIZE_MAX / 2;
+    a->capacity = capacity;
     a->max_size = 0;
 }
 
 static void gk_dyn_init(struct gk_dyn_alloc * a, size_t alignment) {
     a->alignment = alignment;
-    gk_dyn_reset(a);
+    gk_dyn_reset(a, SIZE_MAX);
 }
 
 // Best fit rather than first fit. First fit is faster to compute and leaves
@@ -100,6 +110,14 @@ static size_t gk_dyn_alloc(struct gk_dyn_alloc * a, size_t size) {
 
     struct gk_free_block * block = &a->free_blocks[best];
     const size_t offset = block->offset;
+
+    // Past the end of the buffer this is placing into. Reported rather than
+    // handed out: an offset outside the allocation is a pointer a kernel will
+    // write through, and on a device that is a fault at best and somebody
+    // else's memory at worst.
+    if (offset + size > a->capacity) {
+        return SIZE_MAX;
+    }
 
     block->offset += size;
     block->size   -= size;
@@ -348,8 +366,19 @@ static void gk_gallocr_count_uses(struct gk_gallocr * g, struct gk_cgraph * grap
 // the buffer needs before there is a buffer to point into.
 static bool gk_gallocr_run(struct gk_gallocr * g, struct gk_cgraph * graph, bool assign,
                            const int * node_ids, const int * leaf_ids) {
+    // Measuring has no ceiling: the point of the pass is to find out how large
+    // each buffer has to be, and a ceiling would only stop it saying so.
+    //
+    // Placing has one, and it is the whole reason the ceiling exists. Placing
+    // hands out addresses in a buffer that already exists, and the sizes it is
+    // placing are not always the sizes the last measurement saw - a graph grows
+    // whenever the batch does, which for a diffusion sampler is every step
+    // after the first, since classifier-free guidance doubles the batch.
+    // Unchecked, the pass keeps counting past the end of the buffer and reports
+    // success, and the first kernel to write one of those offsets writes
+    // outside the allocation.
     for (int i = 0; i < g->n_bufs; ++i) {
-        gk_dyn_reset(&g->dyn[i]);
+        gk_dyn_reset(&g->dyn[i], assign ? g->buffer_sizes[i] : SIZE_MAX);
     }
     gk_gallocr_count_uses(g, graph);
 
@@ -509,29 +538,29 @@ bool gk_gallocr_reserve(struct gk_gallocr * g, struct gk_cgraph * graph) {
 
 bool gk_gallocr_alloc_graph_n(struct gk_gallocr * g, struct gk_cgraph * graph,
                               const int * node_ids, const int * leaf_ids) {
-    // A graph larger than the reservation is not an error - shapes change with
-    // batch size - so grow rather than fail.
-    bool have_buffers = true;
-    for (int i = 0; i < g->n_bufs; ++i) {
-        if (g->buffers[i] == NULL) {
-            have_buffers = false;
-        }
-    }
-
-    if (!have_buffers) {
-        if (!gk_gallocr_reserve_n(g, graph, node_ids, leaf_ids)) {
-            return false;
-        }
+    // Measure this graph and grow anything too small, then place it. A graph
+    // larger than the last reservation is not an error - shapes change with
+    // batch size, and a diffusion sampler doubles its batch for classifier-free
+    // guidance after the first step - so this reserves rather than fails.
+    //
+    // The measuring pass comes first rather than as a retry after placement
+    // failed, because placement writes as it goes: a pass that ran out half
+    // way would leave some tensors pointing into the old layout and the rest
+    // into the new one, and the pass after it would see the first group as
+    // already placed and leave them there. Reserving first costs one walk over
+    // the graph with no side effects, and is a no-op when what is already
+    // allocated fits.
+    if (!gk_gallocr_reserve_n(g, graph, node_ids, leaf_ids)) {
+        return false;
     }
 
     if (!gk_gallocr_run(g, graph, true, node_ids, leaf_ids)) {
-        // The measure pass may have been done against a different shape, or
-        // against a different placement; redo the reservation and try once
-        // more before giving up.
-        if (!gk_gallocr_reserve_n(g, graph, node_ids, leaf_ids)) {
-            return false;
-        }
-        return gk_gallocr_run(g, graph, true, node_ids, leaf_ids);
+        // The buffers were just sized from this graph's own measurement, so
+        // this is not "too small" - it is fragmentation the free-block table
+        // could not represent.
+        gk_logf("gk: graph allocator could not place the graph in buffers "
+                "sized from its own measurement\n");
+        return false;
     }
 
     return true;

@@ -1268,6 +1268,15 @@ GK_API struct gk_sched * gk_sched_new_ext(gk_backend_t * backends,
                                           int n_backends, bool op_offload);
 GK_API void              gk_sched_free(struct gk_sched * sched);
 
+// A graph is placed across the backends once, and both entry points below do
+// it: gk_sched_alloc_graph places and allocates, and gk_sched_graph_compute
+// places and allocates only if that has not already happened for this graph.
+//
+// This matters to a caller that writes graph inputs, because the only place to
+// write them is the storage allocation hands out - so the order is allocate,
+// write, compute, and the compute must not move the work away from what was
+// written. Placing twice would: the pass reads where tensors already live, and
+// after an allocation that answer is different for every node in the graph.
 GK_API bool           gk_sched_reserve      (struct gk_sched * sched, struct gk_cgraph * graph);
 GK_API bool           gk_sched_alloc_graph  (struct gk_sched * sched, struct gk_cgraph * graph);
 GK_API enum gk_status gk_sched_graph_compute(struct gk_sched * sched, struct gk_cgraph * graph);
@@ -1275,7 +1284,9 @@ GK_API void           gk_sched_synchronize  (struct gk_sched * sched);
 
 // Drops the current placement. Anything the last graph's tensors pointed at is
 // dangling afterwards, which is the price of reusing one buffer set across
-// graphs; callers build a new graph rather than keeping the old one.
+// graphs; callers build a new graph rather than keeping the old one. This is
+// also what ends the arrangement above: a new graph needs a reset before it,
+// or it inherits the last one's storage.
 GK_API void gk_sched_reset(struct gk_sched * sched);
 
 GK_API int    gk_sched_n_splits       (const struct gk_sched * sched);

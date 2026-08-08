@@ -116,6 +116,26 @@ struct gk_sched {
     struct gk_ctx *    ctx;
     struct gk_cgraph * graph;
 
+    // Which caller graph has been placed, split and allocated, if any.
+    //
+    // Placement is not idempotent, and cannot be: the first rule the assigning
+    // pass applies is "a tensor that already has memory belongs to whoever owns
+    // that memory", which is the correct rule and the strongest signal there
+    // is - right up until allocation is what gave the tensor its memory. Run
+    // the pass a second time on an allocated graph and every node now answers
+    // that question, the placement it produces is a different one, and the
+    // split boundaries move with it. The nodes' storage does not move with
+    // them, so a node ends up computed on one device and written to memory on
+    // another - which, with peer access enabled, is not an error. It is a
+    // wrong answer.
+    //
+    // So a graph is placed once. A caller that allocates and then computes -
+    // the usual shape, because inputs are written into the storage allocation
+    // hands out - gets the placement its allocation was built from.
+    // gk_sched_reset ends the arrangement.
+    bool               is_alloc;
+    struct gk_cgraph * alloc_graph;
+
     struct gk_sched_copy * copies;
     int                    n_copies;
     int                    cap_copies;
@@ -258,10 +278,12 @@ void gk_sched_synchronize(struct gk_sched * s) {
 }
 
 void gk_sched_reset(struct gk_sched * s) {
-    s->n_splits   = 0;
-    s->n_copies   = 0;
-    s->n_rewrites = 0;
-    s->graph      = NULL;
+    s->n_splits    = 0;
+    s->n_copies    = 0;
+    s->n_rewrites  = 0;
+    s->graph       = NULL;
+    s->is_alloc    = false;
+    s->alloc_graph = NULL;
 
     gk_free(s->ctx);
     s->ctx = NULL;
@@ -295,6 +317,38 @@ static int gk_sched_backend_of_buffer(const struct gk_sched * s, const struct gk
     for (int i = 0; i < s->n_backends; ++i) {
         if (gk_backend_supports_buft(s->backends[i], buft)) {
             return i;
+        }
+    }
+
+    return -1;
+}
+
+// Ops that produce a view of another tensor and compute nothing. They carry a
+// view_src like an in-place op does, but they never write through it.
+static bool gk_sched_is_view_op(enum gk_op op) {
+    return op == GK_OP_NONE || op == GK_OP_VIEW || op == GK_OP_RESHAPE ||
+           op == GK_OP_PERMUTE || op == GK_OP_TRANSPOSE;
+}
+
+// Which backend's memory a tensor is in or will be in: its buffer if it has
+// one, otherwise the placement the passes above gave it. Unlike
+// gk_sched_backend_of_buffer this answers for a tensor that has not been
+// allocated yet, which is every intermediate at the time placement runs.
+static int gk_sched_backend_of_tensor(const struct gk_sched * s, const struct gk_tensor * t,
+                                      const struct gk_cgraph * graph) {
+    const int id = gk_sched_backend_of_buffer(s, t);
+    if (id >= 0) {
+        return id;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] == t) {
+            return s->node_backend[i];
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        if (graph->leafs[i] == t) {
+            return s->leaf_backend[i];
         }
     }
 
@@ -504,6 +558,50 @@ static bool gk_sched_assign(struct gk_sched * s, struct gk_cgraph * graph) {
         }
 
         s->leaf_backend[i] = id < 0 ? 0 : id;
+    }
+
+    // Last, and after everything else has settled: an op that writes through a
+    // view has to run where the memory it writes into is.
+    //
+    // Staging solves the read side. A split reads a value that lives in memory
+    // it cannot address, so a copy of that value is made in memory it can, and
+    // the read is pointed at the copy. There is no equivalent on the write
+    // side, and there cannot be: an in-place op's result *is* its source's
+    // storage, and the graph after it reads that storage expecting to find the
+    // new values in it. Writing to a copy would leave the original unchanged
+    // and every later reader looking at stale data.
+    //
+    // So the node moves instead. This overrides a caller's pin, because a
+    // caller pinning a run of nodes to a device - the way an engine assigns
+    // whole transformer blocks - is reasoning about layers, and cannot see
+    // which of them alias a tensor from some earlier layer. Left alone, such a
+    // node launches a kernel on one device against a pointer into another's
+    // memory: an illegal access if the two cannot see each other, and a silent
+    // wrong answer written into the other card's memory if they can.
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct gk_tensor * node = graph->nodes[i];
+
+        if (node->view_src == NULL || gk_sched_is_view_op(node->op)) {
+            continue; // no storage of its own, but it does not write either
+        }
+
+        const int oid = gk_sched_backend_of_tensor(s, node->view_src, graph);
+        if (oid < 0 || oid == s->node_backend[i]) {
+            continue;
+        }
+
+        if (!gk_backend_supports_op(s->backends[oid], node)) {
+            // Nothing here can fix this: the op must run where it writes, and
+            // that backend will not run it. It is reported rather than worked
+            // around, because the alternative is producing an answer that is
+            // quietly wrong.
+            gk_logf("gk: %s writes in place into memory on %s, which cannot run it\n",
+                    gk_op_name(node->op), gk_backend_name(s->backends[oid]));
+            continue;
+        }
+
+        s->node_backend[i] = oid;
+        s->node_pinned[i]  = true;
     }
 
     return true;
@@ -741,6 +839,7 @@ static bool gk_sched_split(struct gk_sched * s, struct gk_cgraph * graph) {
         gk_graph_add_node(s->graph, node);
         s->node_bufs[i] = bid;
 
+
         for (int k = 0; k < GK_MAX_SRC; ++k) {
             struct gk_tensor * src = node->src[k];
             if (src == NULL) {
@@ -820,6 +919,11 @@ static void gk_sched_undo_rewrites(struct gk_sched * s) {
 }
 
 bool gk_sched_reserve(struct gk_sched * s, struct gk_cgraph * graph) {
+    // Measuring rebuilds the staging tensors and the run graph, so whatever an
+    // earlier allocation produced no longer describes anything.
+    s->is_alloc    = false;
+    s->alloc_graph = NULL;
+
     if (!gk_sched_assign(s, graph) || !gk_sched_split(s, graph)) {
         return false;
     }
@@ -832,12 +936,24 @@ bool gk_sched_alloc_graph(struct gk_sched * s, struct gk_cgraph * graph) {
         return false;
     }
 
-    return gk_gallocr_alloc_graph_n(s->galloc, s->graph, s->node_bufs, s->leaf_bufs);
+    if (!gk_gallocr_alloc_graph_n(s->galloc, s->graph, s->node_bufs, s->leaf_bufs)) {
+        return false;
+    }
+
+    s->is_alloc    = true;
+    s->alloc_graph = graph;
+    return true;
 }
 
 enum gk_status gk_sched_graph_compute(struct gk_sched * s, struct gk_cgraph * graph) {
-    if (!gk_sched_alloc_graph(s, graph)) {
-        return GK_STATUS_ALLOC_FAILED;
+    // Only if this graph has not been placed already - see `is_alloc`. A
+    // caller that allocated first has written its inputs into the storage that
+    // allocation produced, and re-placing the graph now would move the work
+    // away from that storage.
+    if (!s->is_alloc || s->alloc_graph != graph) {
+        if (!gk_sched_alloc_graph(s, graph)) {
+            return GK_STATUS_ALLOC_FAILED;
+        }
     }
 
     gk_sched_apply_rewrites(s);

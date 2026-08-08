@@ -22,10 +22,11 @@ option(GK_HIP    "gk: ROCm/HIP backend"   OFF)
 option(GK_METAL  "gk: Metal backend"      OFF)
 option(GK_VULKAN "gk: Vulkan backend"     OFF)
 
-# Which architectures the device code is compiled for. Left empty, each
-# toolchain's default is used, which is usually "the card in this machine" -
-# right for development and wrong for anything shipped.
-set(GK_CUDA_ARCHITECTURES "" CACHE STRING "gk: CUDA architectures (e.g. 75;86;89)")
+# Which architectures the device code is compiled for. Left empty, gk works
+# the list out from nvcc and the installed GPUs and adds PTX for the newest -
+# see cmake/gk_cuda_arch.cmake for why the toolchain defaults are not good
+# enough. Set it explicitly for a build that has to run somewhere else.
+set(GK_CUDA_ARCHITECTURES "" CACHE STRING "gk: CUDA architectures (e.g. 75;86;89;120)")
 set(GK_HIP_ARCHITECTURES  "" CACHE STRING "gk: HIP architectures (e.g. gfx1030;gfx1100)")
 
 # Which instruction set the SIMD paths may use.
@@ -152,14 +153,26 @@ if (GK_CUDA)
     target_sources(gk PRIVATE ${GK_CUDA_SOURCES})
     target_compile_definitions(gk PUBLIC GK_USE_CUDA)
 
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/gk_cuda_arch.cmake)
+
     if (GK_CUDA_ARCHITECTURES)
-        set_property(TARGET gk PROPERTY CUDA_ARCHITECTURES ${GK_CUDA_ARCHITECTURES})
-    elseif (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # `native` needs CMake 3.24; below that the toolkit's own default is
-        # what a build without an explicit list would have got anyway.
-        if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
-            set_property(TARGET gk PROPERTY CUDA_ARCHITECTURES native)
-        endif()
+        set(GK_CUDA_ARCH_VALUE "${GK_CUDA_ARCHITECTURES}")
+    elseif (DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # An explicit CMAKE_CUDA_ARCHITECTURES is somebody's decision; leave it.
+        set(GK_CUDA_ARCH_VALUE "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        gk_choose_cuda_architectures(GK_CUDA_ARCH_VALUE)
+    endif()
+
+    if (GK_CUDA_ARCH_VALUE)
+        set_property(TARGET gk PROPERTY CUDA_ARCHITECTURES ${GK_CUDA_ARCH_VALUE})
+
+        # Handed to the device code so that a device with no kernel image can
+        # be told what the binary *was* built for. Without it the run-time
+        # message can say a launch failed but not why, and the answer is
+        # always in this list.
+        gk_cuda_architectures_to_list("${GK_CUDA_ARCH_VALUE}" GK_CUDA_ARCH_LIST)
+        target_compile_definitions(gk PRIVATE GK_CUDA_ARCH_LIST="${GK_CUDA_ARCH_LIST}")
     endif()
 
     set_property(TARGET gk PROPERTY CUDA_SEPARABLE_COMPILATION OFF)

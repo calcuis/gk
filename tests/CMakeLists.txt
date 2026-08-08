@@ -37,6 +37,14 @@ if (GK_CUDA OR GK_HIP)
     target_include_directories(test-cuda PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
     add_test(NAME cuda COMMAND test-cuda)
 
+    # The pair, rather than the device: a graph whose weights are spread over
+    # every GPU present, and the copies between them. Passes on a machine with
+    # one GPU, where it reports that the crossing went unexercised.
+    add_executable(test-cuda-multi test_cuda_multi.c)
+    target_link_libraries(test-cuda-multi PRIVATE gk)
+    target_include_directories(test-cuda-multi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+    add_test(NAME cuda-multi COMMAND test-cuda-multi)
+
     # Not a test either: times each op on the device against the same op on
     # the CPU, and reports which ops have no device kernel at all. Never
     # fails, so it is not registered with ctest.

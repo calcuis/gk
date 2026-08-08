@@ -388,6 +388,13 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
 
     GK_CUDA_CHECK(gkSetDevice(ctx->dev->index));
 
+    // The per-node check below reads the thread's error flag, and that flag
+    // carries whatever the last unchecked runtime call left in it - from
+    // anywhere, including code that has nothing to do with this graph. Clear it
+    // once here so that what the loop reports is this graph's, not a stale
+    // error attributed to node 0 because node 0 happened to look next.
+    (void) gkGetLastError();
+
     const int n = gk_graph_n_nodes(graph);
 
     for (int i = 0; i < n; ++i) {
@@ -603,6 +610,57 @@ static const struct gk_device_i g_cuda_device_iface = {
 // discovery
 // --------------------------------------------------------------------------
 
+// What this binary was compiled for, filled in by the build. Only ever used to
+// say so in an error message.
+#ifndef GK_CUDA_ARCH_LIST
+#define GK_CUDA_ARCH_LIST "unknown"
+#endif
+
+// Launched at discovery to find out whether the binary actually contains code
+// this device can run. It does nothing; the launch itself is the question.
+static __global__ void gk_cuda_probe_kernel(void) {}
+
+// Whether a device can run any of the code in this binary.
+//
+// A build carries SASS for the architectures it was told about and PTX for at
+// most one of them. Put a card in the machine that is newer than both and every
+// launch on it fails with "no kernel image is available for execution on the
+// device" - the first launch and every one after, because nothing about it is
+// transient. It costs one empty launch to find that out here instead, before
+// the device has been registered and before the scheduler has put a graph on
+// it, and the difference in what the user sees is the whole point: a named
+// device and a rebuild flag at startup, rather than a failed generation with a
+// node number in it.
+//
+// The launch is on the default stream and is checked synchronously, because a
+// rejected launch reports through gkGetLastError immediately.
+static bool gk_cuda_device_has_kernel_image(int index) {
+    if (gkSetDevice(index) != gkSuccess) {
+        return false;
+    }
+
+    // Whatever came before is not this launch's fault; the flag is per-thread
+    // and sticky until read.
+    (void) gkGetLastError();
+
+    gk_cuda_probe_kernel<<<1, 1>>>();
+
+    const gkError_t err = gkGetLastError();
+    if (err == gkSuccess) {
+        return true;
+    }
+
+    if (err != gkErrorNoKernelImage) {
+        // Something else is wrong with the device - out of memory at context
+        // creation, a driver that has fallen over. Not this function's
+        // question, and not a reason to claim the binary is at fault, so let
+        // the device register and fail with its own error where it happens.
+        return true;
+    }
+
+    return false;
+}
+
 extern "C" void gk_cuda_register_devices(void) {
     if (g_cuda_discovered) {
         return;
@@ -625,6 +683,19 @@ extern "C" void gk_cuda_register_devices(void) {
     for (int i = 0; i < count; ++i) {
         gkDeviceProp_t prop;
         if (gkGetDeviceProperties(&prop, i) != gkSuccess) {
+            continue;
+        }
+
+        if (!gk_cuda_device_has_kernel_image(i)) {
+            // Registering it would mean the scheduler eventually places work
+            // on it, and every one of those launches fails. Leaving it out
+            // costs the device and keeps the run: the remaining GPUs, or the
+            // CPU, take the graph instead.
+            gk_logf("gk %s: skipping device %d (%s, compute capability %d.%d) - this build has "
+                    "no code for it (built for: %s). Rebuild with "
+                    "-DGK_CUDA_ARCHITECTURES=%d to use it.\n",
+                    GK_CUDA_BACKEND_NAME, i, prop.name, prop.major, prop.minor,
+                    GK_CUDA_ARCH_LIST, prop.major * 10 + prop.minor);
             continue;
         }
 
@@ -664,12 +735,17 @@ extern "C" void gk_cuda_register_devices(void) {
         // move a tensor from one device to another without a host bounce. It
         // is enabled once here rather than per copy, because enabling it is
         // not free and the set of devices does not change.
-        for (int j = 0; j < i; ++j) {
+        //
+        // Paired against the devices already registered rather than every
+        // index below this one: a device that failed the kernel-image probe is
+        // not going to be given work, so there is no copy to make faster.
+        for (int k = 0; k < g_cuda_n_devices; ++k) {
+            const int peer = g_cuda_devices[k].index;
             int can = 0;
-            if (gkDeviceCanAccessPeer(&can, i, j) == gkSuccess && can) {
+            if (gkDeviceCanAccessPeer(&can, i, peer) == gkSuccess && can) {
                 GK_CUDA_CHECK(gkSetDevice(i));
-                gkDeviceEnablePeerAccess(j, 0);
-                GK_CUDA_CHECK(gkSetDevice(j));
+                gkDeviceEnablePeerAccess(peer, 0);
+                GK_CUDA_CHECK(gkSetDevice(peer));
                 gkDeviceEnablePeerAccess(i, 0);
             }
         }
@@ -678,6 +754,12 @@ extern "C" void gk_cuda_register_devices(void) {
 
         gk_device_register(&d->device);
     }
+
+    // Peer access that was already enabled comes back as an error rather than
+    // as success, and an unread error is not discarded - it is handed to
+    // whoever calls gkGetLastError next. That is the graph loop, which would
+    // blame it on its first node. Read it here, where it means nothing.
+    (void) gkGetLastError();
 }
 
 // --------------------------------------------------------------------------
@@ -687,9 +769,15 @@ extern "C" void gk_cuda_register_devices(void) {
 extern "C" gk_backend_t gk_backend_cuda_init(int device) {
     gk_cuda_register_devices();
 
-    if (device < 0 || device >= g_cuda_n_devices) {
-        return NULL;
+    // `device` is a CUDA device index - the number in "CUDA1" and the one
+    // CUDA_VISIBLE_DEVICES speaks - not a position in the registered array.
+    // The two stop agreeing the moment a device is skipped for having no
+    // kernel image, and the caller has no way of knowing that happened.
+    for (int i = 0; i < g_cuda_n_devices; ++i) {
+        if (g_cuda_devices[i].index == device) {
+            return gk_cuda_device_init_backend(&g_cuda_devices[i].device);
+        }
     }
 
-    return gk_cuda_device_init_backend(&g_cuda_devices[device].device);
+    return NULL;
 }

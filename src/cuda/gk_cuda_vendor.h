@@ -60,6 +60,10 @@
 #define gkDeviceCanAccessPeer   hipDeviceCanAccessPeer
 #define gkDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 
+// "this binary has no code this device can run". HIP names it after the
+// binary, CUDA after the image; they mean the same thing.
+#define gkErrorNoKernelImage    hipErrorNoBinaryForGpu
+
 // The name the device list shows, and the name a user types.
 #define GK_CUDA_BACKEND_NAME "ROCm"
 
@@ -113,6 +117,8 @@
 #define gkMemGetInfo            cudaMemGetInfo
 #define gkDeviceCanAccessPeer   cudaDeviceCanAccessPeer
 #define gkDeviceEnablePeerAccess cudaDeviceEnablePeerAccess
+
+#define gkErrorNoKernelImage    cudaErrorNoKernelImageForDevice
 
 #define GK_CUDA_BACKEND_NAME "CUDA"
 

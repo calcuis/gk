@@ -80,8 +80,22 @@ startup - and a binary built with CUDA still runs on a machine with no GPU,
 because discovery failing is not an error.
 
 `GK_CUDA_ARCHITECTURES` / `GK_HIP_ARCHITECTURES` set what the device code is
-compiled for. Left empty, each toolchain targets the building machine, which is
-right for development and wrong for anything shipped elsewhere.
+compiled for. A build that has to run somewhere else should say so explicitly;
+`-DGK_CUDA_ARCHITECTURES="75;86;89;120"` is the shape of it.
+
+Left empty, gk works the CUDA list out itself: nvcc is asked what it can
+target, the driver is asked what is installed, and the result carries PTX for
+the newest architecture so a card newer than anything present JITs rather than
+failing. This is deliberately *not* CMake's `native`, which is filtered against
+CMake's own table of architectures rather than the toolkit's — CMake 3.30 knows
+nothing past 90, so on a machine with an RTX 4050 and an RTX 5090 it silently
+reports `89-real` and the 5090 gets neither SASS nor PTX. Nothing warns, the
+build succeeds, and every launch on that card fails at run time with "no kernel
+image is available for execution on the device".
+
+Discovery guards the remaining cases: each device is probed with an empty
+launch, and one this binary has no code for is named on the log and left
+unregistered rather than being handed work it cannot run.
 
 ## Testing
 
