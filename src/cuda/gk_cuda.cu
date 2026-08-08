@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
+
 #define GK_CUDA_MAX_DEVICES 16
 
 // Device memory is handed out in multiples of this. Coalesced loads want their
@@ -383,6 +385,144 @@ static gk_backend_buffer_type_t gk_cuda_backend_buft(gk_backend_t backend) {
     return &((struct gk_cuda_backend_ctx *) backend->context)->dev->buft;
 }
 
+// --------------------------------------------------------------------------
+// per-op profile
+//
+// What the scheduler report is for placement, this is for time. GK_SCHED_REPORT
+// answers "which backend ran this op"; this answers "where did the graph's
+// milliseconds go", which is the only question worth asking once every op is
+// already on the device and the whole thing is still slower than it should be.
+//
+// Set GK_OP_PROFILE in the environment. Every node is timed by synchronizing
+// the stream around its launch - that serializes what would otherwise overlap,
+// so the total reads high, but a graph this deep is nearly serial anyway and
+// the shares are what the number is for. Rows are keyed by op and by the shape
+// that op saw, because "mul_mat is expensive" is not actionable and "mul_mat,
+// f16 weights, 2880x4096" is.
+// --------------------------------------------------------------------------
+
+#define GK_CU_PROF_MAX 512
+
+struct gk_cu_prof_row {
+    char   key[96];
+    double ms;
+    int64_t calls;
+    double flops;   // multiply-accumulates, for the shapes where it means something
+};
+
+static struct gk_cu_prof_row g_prof[GK_CU_PROF_MAX];
+static int                   g_prof_n       = 0;
+static int                   g_prof_enabled = -1;
+static double                g_prof_total   = 0.0;
+
+static int gk_cu_prof_cmp(const void * a, const void * b) {
+    const double x = ((const struct gk_cu_prof_row *) a)->ms;
+    const double y = ((const struct gk_cu_prof_row *) b)->ms;
+    return x < y ? 1 : (x > y ? -1 : 0);
+}
+
+static void gk_cu_prof_dump(void) {
+    if (g_prof_n == 0) {
+        return;
+    }
+
+    qsort(g_prof, (size_t) g_prof_n, sizeof(g_prof[0]), gk_cu_prof_cmp);
+
+    gk_logf("\ngk cuda profile: %.1f ms over %d distinct shapes\n", g_prof_total, g_prof_n);
+    gk_logf("  %-52s %10s %7s %8s %10s\n", "op / shape", "ms", "%", "calls", "GFLOP/s");
+
+    for (int i = 0; i < g_prof_n; ++i) {
+        char rate[16] = "-";
+        if (g_prof[i].flops > 0.0 && g_prof[i].ms > 0.0) {
+            snprintf(rate, sizeof(rate), "%.0f", g_prof[i].flops * 2.0 / (g_prof[i].ms * 1e6));
+        }
+        gk_logf("  %-52s %10.2f %6.1f%% %8lld %10s\n",
+                g_prof[i].key, g_prof[i].ms,
+                100.0 * g_prof[i].ms / g_prof_total,
+                (long long) g_prof[i].calls, rate);
+    }
+}
+
+static void gk_cu_prof_add(const char * key, double ms, double flops) {
+    for (int i = 0; i < g_prof_n; ++i) {
+        if (strcmp(g_prof[i].key, key) == 0) {
+            g_prof[i].ms    += ms;
+            g_prof[i].flops += flops;
+            g_prof[i].calls++;
+            g_prof_total    += ms;
+            return;
+        }
+    }
+
+    if (g_prof_n >= GK_CU_PROF_MAX) {
+        return;
+    }
+
+    struct gk_cu_prof_row * row = &g_prof[g_prof_n++];
+    snprintf(row->key, sizeof(row->key), "%s", key);
+    row->ms    = ms;
+    row->flops = flops;
+    row->calls = 1;
+    g_prof_total += ms;
+}
+
+// The name a row gets, and the work it did. Only the ops whose cost depends on
+// more than the output size say anything beyond their shape.
+static void gk_cu_prof_key(const struct gk_tensor * node, char * out, size_t out_size,
+                           double * flops) {
+    *flops = 0.0;
+
+    switch ((int) node->op) {
+        case GK_OP_MUL_MAT:
+        case GK_OP_MUL_MAT_ID: {
+            const struct gk_tensor * a = node->src[0];
+            const struct gk_tensor * b = node->src[1];
+            const int64_t k = a->ne[0];
+            const int64_t m = node->ne[0];
+            const int64_t n = node->ne[1] * node->ne[2] * node->ne[3];
+            snprintf(out, out_size, "%s %-6s %lldx%lldx%lld",
+                     gk_op_name(node->op), gk_type_name(a->type),
+                     (long long) m, (long long) n, (long long) k);
+            *flops = (double) m * (double) n * (double) k;
+            GK_UNUSED(b);
+            break;
+        }
+        case GK_OP_FLASH_ATTN_EXT: {
+            const struct gk_tensor * q = node->src[0];
+            const struct gk_tensor * k = node->src[1];
+            snprintf(out, out_size, "flash_attn d=%lld q=%lld kv=%lld h=%lld",
+                     (long long) q->ne[0], (long long) q->ne[1],
+                     (long long) k->ne[1], (long long) q->ne[2]);
+            *flops = 2.0 * (double) q->ne[0] * (double) q->ne[1] *
+                     (double) k->ne[1] * (double) q->ne[2];
+            break;
+        }
+        case GK_OP_IM2COL: {
+            snprintf(out, out_size, "im2col %lldx%lldx%lld",
+                     (long long) node->ne[0], (long long) node->ne[1],
+                     (long long) node->ne[2]);
+            break;
+        }
+        default:
+            snprintf(out, out_size, "%s %lldx%lldx%lldx%lld",
+                     gk_op_name(node->op),
+                     (long long) node->ne[0], (long long) node->ne[1],
+                     (long long) node->ne[2], (long long) node->ne[3]);
+            break;
+    }
+}
+
+static bool gk_cu_prof_on(void) {
+    if (g_prof_enabled < 0) {
+        const char * e = getenv("GK_OP_PROFILE");
+        g_prof_enabled = e != NULL && e[0] != '0';
+        if (g_prof_enabled) {
+            atexit(gk_cu_prof_dump);
+        }
+    }
+    return g_prof_enabled != 0;
+}
+
 static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cgraph * graph) {
     struct gk_cuda_backend_ctx * ctx = (struct gk_cuda_backend_ctx *) backend->context;
 
@@ -395,10 +535,17 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
     // error attributed to node 0 because node 0 happened to look next.
     (void) gkGetLastError();
 
-    const int n = gk_graph_n_nodes(graph);
+    const int  n    = gk_graph_n_nodes(graph);
+    const bool prof = gk_cu_prof_on();
 
     for (int i = 0; i < n; ++i) {
         struct gk_tensor * node = gk_graph_node(graph, i);
+
+        std::chrono::steady_clock::time_point t0;
+        if (prof) {
+            GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
+            t0 = std::chrono::steady_clock::now();
+        }
 
         if (!gk_cuda_compute_op(ctx->stream, &ctx->scratch, node)) {
             gk_logf("gk %s: no kernel for op %s (node %s)\n",
@@ -419,6 +566,18 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
                     (long long) node->ne[0], (long long) node->ne[1],
                     (long long) node->ne[2], (long long) node->ne[3]);
             return GK_STATUS_NO_STORAGE;
+        }
+
+        if (prof) {
+            GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
+            const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+
+            char   key[96];
+            double flops = 0.0;
+            gk_cu_prof_key(node, key, sizeof(key), &flops);
+            gk_cu_prof_add(key,
+                           std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                           flops);
         }
     }
 

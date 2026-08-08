@@ -13,11 +13,12 @@
 // 9 MB packed and 64 MB as f32, and materialising that per matmul would spend
 // more bandwidth than the decode costs arithmetic.
 //
-// What is deliberately absent is a tensor-core path. It would be a large piece
-// of vendor-specific code whose correctness is hard to see, and the honest
-// order to build in is the one this library has followed everywhere else: the
-// clear implementation first, checked against the CPU, and the fast one after,
-// checked against the clear one.
+// The tensor-core paths came last and in that order: the clear implementation
+// first, checked against the CPU, and the fast one after, checked against the
+// clear one. There are two of them - one for nvfp4 through the integer
+// instruction, one for f16 - and both are gated so that any shape, type or
+// device they do not cover falls through to the float tile, which still
+// computes the same thing.
 
 #include "gk_cuda_ops.cuh"
 
@@ -587,6 +588,417 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The tensor-core path, for f16 activations.
+//
+// The nvfp4 pilot above answered what `mma.sync` is worth; this is the same
+// instruction where the shapes that dominate a diffusion graph actually live.
+// Every convolution in a UNet or a VAE lowers to `im2col` plus a matmul whose
+// src0 is that f16 im2col buffer - so this one kernel is most of the time in
+// both, and until it existed all of it ran on the float tile below at roughly
+// a tenth of what the part can do.
+//
+// Three things make this simpler than the nvfp4 case:
+//
+//   * The operands are already f16, so nothing is decoded on the way to the
+//     fragment and nothing is rescaled inside the k loop. The accumulator is
+//     f32 and stays in the tensor core across the whole reduction, which is
+//     what the integer path could not do.
+//
+//   * gk's matmul is `dst[m,n] = sum_k a[k,m] * b[k,n]` with both operands
+//     k-major, and `mma.row.col` wants exactly that: A row-major with k along
+//     the row, B column-major with k along the column. So the fragments are
+//     the operands' own layout, not a transpose of it.
+//
+//   * src1 is read through the runtime accessor rather than a template. It is
+//     touched once per tile and used TILE_M times, so what it costs is a
+//     rounding error on the total, and not templating it keeps this to two
+//     instantiations instead of two per weight format.
+//
+// The tile is sized by memory, not by arithmetic. At these shapes the GEMM is
+// bandwidth-bound - src0 is an im2col buffer of tens of megabytes and gets
+// re-read once per column tile - so what sets the ceiling is TILE_N, and 128
+// is where a 512-channel VAE convolution stops being limited by DRAM. TILE_M
+// only picks how many blocks there are, and drops to 64 when there are not
+// enough rows to fill 128.
+// --------------------------------------------------------------------------
+
+// D += A*B for a 16x8 tile of f32 over 16 of k, warp-wide, f16 operands. The
+// fragment geometry is the s8 instruction's at half the k per register: with
+// `group = lane/4` and `tig = lane%4`, a lane holds A rows `group` and
+// `group+8` at columns `2*tig..+1` and `2*tig+8..+9`, B column `group` at
+// those same rows, and D at rows `group`/`group+8`, columns `2*tig` and
+// `2*tig+1` - the layout the epilogue below and the nvfp4 kernel's share.
+static __device__ __forceinline__ void gk_cu_mma_f16(float (&d)[4], const int (&a)[4],
+                                                     const int (&b)[2]) {
+#if defined(GK_CU_HAVE_MMA)
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    // No such instruction on this target; the host gate keeps the kernel from
+    // being launched. This branch is here so the build still compiles.
+    (void) a; (void) b; (void) d;
+#endif
+}
+
+#define GK_CU_MMA_F16_K   32   // k staged per pass: two mma windows of sixteen
+#define GK_CU_MMA_F16_WM  32   // rows a warp owns: two mma row tiles
+#define GK_CU_MMA_F16_WN  64   // columns a warp owns: eight mma column tiles
+#define GK_CU_MMA_F16_WNT (GK_CU_MMA_F16_WN / 8)
+#define GK_CU_MMA_F16_WARPS_N 2
+#define GK_CU_MMA_F16_TILE_N  (GK_CU_MMA_F16_WARPS_N * GK_CU_MMA_F16_WN)
+
+// The staged rows are padded past the k they hold. A fragment read has the
+// eight lanes of a quadrant on eight different rows at the same k, so an
+// unpadded row of 32 halves - 8 banks apart - would put four of those eight on
+// the banks of another four. At a stride of 40 halves the eight land on eight
+// disjoint quads and a warp's fragment read is conflict-free.
+#define GK_CU_MMA_F16_SK  (GK_CU_MMA_F16_K + 8)
+
+// Columns below which the tile is mostly padding and the paths below, which
+// split k across a block instead of tiling n, keep the device busier.
+#define GK_CU_MMA_F16_MIN_N 32
+
+// The shortest piece of k worth giving a block of its own. Below this the
+// block spends more of itself on its prologue and its share of the combine
+// pass than on the reduction it was split off to do.
+#define GK_CU_MMA_F16_SPLIT_MIN_K 1024
+
+// Warps a shape has to put in flight before splitting k stops paying: one
+// wide-tile block's worth per multiprocessor.
+#define GK_CU_MMA_F16_SPLIT_WARPS 8
+
+// Eight elements of a float-typed operand, widened to half and packed into one
+// 16-byte word - the unit the tile is staged in.
+//
+// Staging one element per instruction is what the float tile does, and there
+// it is affordable because each staged element feeds 16 multiply-accumulates.
+// Here it feeds 128, so an instruction spent per element is an instruction
+// spent against a tensor-core instruction rather than against sixteen FFMAs,
+// and it dominates. Whether the eight can be read as one word is decided on
+// the host, once per launch, and passed in.
+static __device__ __forceinline__ int4 gk_cu_pack8_half(const char * p, int type) {
+    if (type == GKT_F16) {
+        return *(const int4 *) p;
+    }
+
+    __align__(16) __half h[8];
+
+    if (type == GKT_F32) {
+        const float4 lo = *(const float4 *) p;
+        const float4 hi = *(const float4 *) (p + 16);
+
+        h[0] = __float2half(lo.x); h[1] = __float2half(lo.y);
+        h[2] = __float2half(lo.z); h[3] = __float2half(lo.w);
+        h[4] = __float2half(hi.x); h[5] = __float2half(hi.y);
+        h[6] = __float2half(hi.z); h[7] = __float2half(hi.w);
+    } else {
+        const int4       w = *(const int4 *) p;
+        const uint16_t * u = (const uint16_t *) &w;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            h[i] = __float2half(gk_cu_bf2f(u[i]));
+        }
+    }
+
+    return *(const int4 *) h;
+}
+
+// Whether an operand can be staged eight at a time: contiguous along k, every
+// row start 16-byte aligned, and a k that a run of eight either fits inside or
+// starts past the end of, so the guard stays a comparison rather than a
+// per-element mask.
+static __host__ __forceinline__ bool gk_cuda_mma_f16_vec(const struct gk_tensor * t, int64_t k_len) {
+    if ((size_t) t->nb[0] != gk_type_size(t->type) || k_len % 8 != 0) {
+        return false;
+    }
+    const uintptr_t bits = (uintptr_t) t->data | (uintptr_t) t->nb[1]
+                         | (uintptr_t) t->nb[2] | (uintptr_t) t->nb[3];
+    return bits % 16 == 0;
+}
+
+template <int WARPS_M>
+static __global__ __launch_bounds__(WARPS_M * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE, 1)
+void gk_cu_k_mul_mat_mma_f16(gk_tview a, gk_tview b, gk_tview_mut d,
+                             int64_t k_len, int64_t r2, int64_t r3,
+                             bool a_vec, bool b_vec,
+                             float * part, int64_t k_split, int64_t n_23) {
+    const int TILE_M = WARPS_M * GK_CU_MMA_F16_WM;
+
+    __shared__ __half As[2][WARPS_M * GK_CU_MMA_F16_WM][GK_CU_MMA_F16_SK];
+    __shared__ __half Bs[2][GK_CU_MMA_F16_TILE_N]     [GK_CU_MMA_F16_SK];
+
+    const int tid    = (int) threadIdx.x;
+    const int lane   = tid % GK_WARP_SIZE;
+    const int warp   = tid / GK_WARP_SIZE;
+    const int warp_m = warp / GK_CU_MMA_F16_WARPS_N;
+    const int warp_n = warp % GK_CU_MMA_F16_WARPS_N;
+    const int group  = lane / 4;
+    const int tig    = lane % 4;
+
+    const int n_threads = WARPS_M * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE;
+
+    const int64_t m0  = (int64_t) blockIdx.x * TILE_M;
+    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMA_F16_TILE_N;
+
+    // z carries the slice and, when k is split, which piece of k this block
+    // reduces. A split block owns the same output patch as its siblings and
+    // differs only in the range it sums, so it cannot write the destination -
+    // it writes its own plane of `part` and the pass below adds them up.
+    const int64_t i23   = blockIdx.z % n_23;
+    const int64_t split = blockIdx.z / n_23;
+
+    const int64_t k_beg = split * k_split;
+    const int64_t k_end = part != NULL && k_beg + k_split < k_len ? k_beg + k_split : k_len;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    float acc[2][GK_CU_MMA_F16_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < 2; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMA_F16_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    // A thread's share of one k-slice, held in registers between being read
+    // from memory and being written to the tile. Both are known at compile
+    // time: the slice is a fixed size and so is the block.
+    int4 pa[TILE_M * (GK_CU_MMA_F16_K / 8) / (WARPS_M * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE)];
+    int4 pb[GK_CU_MMA_F16_TILE_N * (GK_CU_MMA_F16_K / 8) / (WARPS_M * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE)];
+
+    const int n_runs_a = (int) (sizeof(pa) / sizeof(pa[0]));
+    const int n_runs_b = (int) (sizeof(pb) / sizeof(pb[0]));
+
+    // Reading a k-slice into those registers. A run of eight per thread:
+    // consecutive threads take consecutive k of one row, which is the
+    // direction both operands are contiguous in, so a run is one 16-byte
+    // load. The scalar arms are what an operand that is permuted, misaligned
+    // or ragged in k falls to - the same answer, an instruction at a time.
+#define GK_CU_MMA_F16_LOAD(k0)                                                       \
+    do {                                                                             \
+        _Pragma("unroll")                                                            \
+        for (int i = 0; i < n_runs_a; ++i) {                                         \
+            const int     e  = tid + i * n_threads;                                  \
+            const int     r  = e / (GK_CU_MMA_F16_K / 8);                            \
+            const int     kr = e % (GK_CU_MMA_F16_K / 8);                            \
+            const int64_t m  = m0 + r;                                               \
+            const int64_t k  = (k0) + kr * 8;                                        \
+                                                                                     \
+            pa[i] = make_int4(0, 0, 0, 0);                                           \
+                                                                                     \
+            if (m < n_rows) {                                                        \
+                const char * row = gk_cu_row(a, m, a2, a3);                          \
+                if (a_vec && k + 8 <= k_end) {                                       \
+                    pa[i] = *(const int4 *) (row + k * a.nb[0]);                     \
+                } else {                                                             \
+                    __align__(16) __half h[8];                                       \
+                    _Pragma("unroll")                                                \
+                    for (int j = 0; j < 8; ++j) {                                    \
+                        h[j] = (k + j < k_end)                                       \
+                             ? *(const __half *) (row + (k + j) * a.nb[0])           \
+                             : __float2half(0.0f);                                   \
+                    }                                                                \
+                    pa[i] = *(const int4 *) h;                                       \
+                }                                                                    \
+            }                                                                        \
+        }                                                                            \
+                                                                                     \
+        _Pragma("unroll")                                                            \
+        for (int i = 0; i < n_runs_b; ++i) {                                         \
+            const int     e  = tid + i * n_threads;                                  \
+            const int     c  = e / (GK_CU_MMA_F16_K / 8);                            \
+            const int     kr = e % (GK_CU_MMA_F16_K / 8);                            \
+            const int64_t n  = n0 + c;                                               \
+            const int64_t k  = (k0) + kr * 8;                                        \
+                                                                                     \
+            pb[i] = make_int4(0, 0, 0, 0);                                           \
+                                                                                     \
+            if (n < n_cols) {                                                        \
+                if (b_vec && k + 8 <= k_end) {                                       \
+                    pb[i] = gk_cu_pack8_half(gk_cu_row(b, n, i2, i3) + k * b.nb[0],  \
+                                             b.type);                                \
+                } else {                                                             \
+                    __align__(16) __half h[8];                                       \
+                    _Pragma("unroll")                                                \
+                    for (int j = 0; j < 8; ++j) {                                    \
+                        h[j] = __float2half((k + j < k_end)                          \
+                                            ? gk_cu_get(b, k + j, n, i2, i3)         \
+                                            : 0.0f);                                 \
+                    }                                                                \
+                    pb[i] = *(const int4 *) h;                                       \
+                }                                                                    \
+            }                                                                        \
+        }                                                                            \
+    } while (0)
+
+#define GK_CU_MMA_F16_STORE(buf)                                                     \
+    do {                                                                             \
+        _Pragma("unroll")                                                            \
+        for (int i = 0; i < n_runs_a; ++i) {                                         \
+            const int e = tid + i * n_threads;                                       \
+            *(int4 *) &As[buf][e / (GK_CU_MMA_F16_K / 8)]                            \
+                            [(e % (GK_CU_MMA_F16_K / 8)) * 8] = pa[i];               \
+        }                                                                            \
+        _Pragma("unroll")                                                            \
+        for (int i = 0; i < n_runs_b; ++i) {                                         \
+            const int e = tid + i * n_threads;                                       \
+            *(int4 *) &Bs[buf][e / (GK_CU_MMA_F16_K / 8)]                            \
+                            [(e % (GK_CU_MMA_F16_K / 8)) * 8] = pb[i];               \
+        }                                                                            \
+    } while (0)
+
+    // The tile is double-buffered and the next slice is read while the current
+    // one is being multiplied. That ordering is the point: a global read costs
+    // several hundred cycles and a slice's worth of mma covers it, where a
+    // kernel that loads and then waits at a barrier pays the two in series.
+    // What it costs is one more copy of the tile in shared memory and the
+    // registers to hold a slice in flight.
+    GK_CU_MMA_F16_LOAD(k_beg);
+    GK_CU_MMA_F16_STORE(0);
+    __syncthreads();
+
+    int buf = 0;
+
+    for (int64_t k0 = k_beg; k0 < k_end; k0 += GK_CU_MMA_F16_K) {
+        const bool more = k0 + GK_CU_MMA_F16_K < k_end;
+
+        if (more) {
+            GK_CU_MMA_F16_LOAD(k0 + GK_CU_MMA_F16_K);
+        }
+
+        // Two mma windows over the staged k. The A fragments are read once
+        // and used for every column tile - that reuse is the whole point of
+        // giving a warp 64 columns rather than 8.
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int kk = h * 16;
+
+            int af[2][4];
+#pragma unroll
+            for (int wt = 0; wt < 2; ++wt) {
+                const int r_lo = warp_m * GK_CU_MMA_F16_WM + wt * 16 + group;
+                const int r_hi = r_lo + 8;
+
+                af[wt][0] = *(const int *) &As[buf][r_lo][kk + 2 * tig];
+                af[wt][1] = *(const int *) &As[buf][r_hi][kk + 2 * tig];
+                af[wt][2] = *(const int *) &As[buf][r_lo][kk + 8 + 2 * tig];
+                af[wt][3] = *(const int *) &As[buf][r_hi][kk + 8 + 2 * tig];
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_MMA_F16_WNT; ++ct) {
+                const int c = warp_n * GK_CU_MMA_F16_WN + ct * 8 + group;
+
+                int bf[2];
+                bf[0] = *(const int *) &Bs[buf][c][kk + 2 * tig];
+                bf[1] = *(const int *) &Bs[buf][c][kk + 8 + 2 * tig];
+
+#pragma unroll
+                for (int wt = 0; wt < 2; ++wt) {
+                    gk_cu_mma_f16(acc[wt][ct], af[wt], bf);
+                }
+            }
+        }
+
+        // Into the other half, which nothing is reading, so the only barrier
+        // in the loop is the one that publishes it.
+        if (more) {
+            GK_CU_MMA_F16_STORE(1 - buf);
+        }
+
+        __syncthreads();
+        buf = 1 - buf;
+    }
+
+#undef GK_CU_MMA_F16_LOAD
+#undef GK_CU_MMA_F16_STORE
+
+#pragma unroll
+    for (int wt = 0; wt < 2; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMA_F16_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_MMA_F16_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_MMA_F16_WN + ct * 8
+                                + tig * 2 + (i & 1);
+
+                if (m < n_rows && n < n_cols) {
+                    if (part != NULL) {
+                        part[((split * n_23 + i23) * n_cols + n) * n_rows + m] = acc[wt][ct][i];
+                    } else {
+                        gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Adding the split blocks' planes back together. Summed in slice order rather
+// than by whichever block finished first, so a split matmul returns the same
+// bits every run - which an atomic accumulation into the destination, the
+// other way to write this, would not.
+static __global__ void gk_cu_k_mma_f16_combine(const float * part, gk_tview_mut d,
+                                               int64_t n_splits, int64_t n_23,
+                                               int64_t n_rows, int64_t n_cols) {
+    const int64_t n_out = n_rows * n_cols * n_23;
+
+    for (int64_t e = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
+         e < n_out; e += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t m   = e % n_rows;
+        const int64_t n   = (e / n_rows) % n_cols;
+        const int64_t i23 = e / (n_rows * n_cols);
+
+        float sum = 0.0f;
+        for (int64_t s = 0; s < n_splits; ++s) {
+            sum += part[((s * n_23 + i23) * n_cols + n) * n_rows + m];
+        }
+
+        gk_cu_set(d, m, n, i23 % d.ne[2], i23 / d.ne[2], sum);
+    }
+}
+
+// Whether this matmul goes to the tensor core. The instruction is Ampere and
+// later and has no HIP spelling here, the operand has to already be f16 for
+// the fragments to be its own bytes, and a caller that asked for f32 precision
+// asked for the float path - the accumulator is f32 either way, but the
+// products are not.
+static __host__ __forceinline__ bool gk_cuda_mma_f16_supported(const struct gk_tensor * dst,
+                                                               const struct gk_cuda_scratch * s) {
+#if defined(GK_USE_HIP)
+    GK_UNUSED(dst);
+    GK_UNUSED(s);
+    return false;
+#else
+    if (s == NULL || s->cc < 80) {
+        return false;
+    }
+    if ((int) dst->src[0]->type != GK_TYPE_F16) {
+        return false;
+    }
+    if (gk_get_op_params_i32(dst, 0) == GK_PREC_F32) {
+        return false;
+    }
+    return dst->ne[1] >= GK_CU_MMA_F16_MIN_N;
+#endif
+}
+
+// --------------------------------------------------------------------------
 // The tiled path, dotted as integers.
 //
 // The float tiled kernel below already decodes each weight element once and
@@ -908,6 +1320,110 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
 
                 gk_cu_k_mul_mat_mma_nvfp4<<<mgrid, 128, 0, stream>>>(
                     gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                return;
+            }
+        }
+
+        // The f16 tensor-core tile - the convolution path of every diffusion
+        // model, and the one shape class where the float tile below is an
+        // order of magnitude off what the part can do.
+        if (gk_cuda_mma_f16_supported(dst, scratch)) {
+            // Rows only pick how many blocks there are, so a shape with too
+            // few of them for the wide tile takes the narrow one rather than
+            // launching half-empty blocks.
+            const int warps_m = dst->ne[0] >= 4 * GK_CU_MMA_F16_WM ? 4 : 2;
+            const int tile_m  = warps_m * GK_CU_MMA_F16_WM;
+
+            const int64_t n_23   = dst->ne[2] * dst->ne[3];
+            const int64_t n_rows = dst->ne[0];
+            const int64_t n_cols = dst->ne[1];
+
+            const int64_t grid_m = (n_rows + tile_m - 1) / tile_m;
+            const int64_t grid_n = (n_cols + GK_CU_MMA_F16_TILE_N - 1) / GK_CU_MMA_F16_TILE_N;
+
+            // A tile this wide buys its reuse by making blocks scarce, and an
+            // output too small to cover the device leaves multiprocessors
+            // standing still no matter how much arithmetic each block does.
+            // A UNet's deepest levels are exactly that shape - 64 pixels
+            // against 1280 channels is ten blocks on a twenty multiprocessor
+            // part - and the only axis left to cut is k, because it is the one
+            // dimension the output does not have.
+            //
+            // What decides it is warps rather than blocks, and the difference
+            // is not pedantic: the narrow tile has half the warps of the wide
+            // one, so counting blocks says the same thing about a shape that
+            // fills the device and one that half-fills it. Measured, 20 blocks
+            // of the wide tile want no split and splitting them costs half the
+            // throughput, while 10 blocks of the narrow tile - the same block
+            // count, half the warps - gain three times over.
+            //
+            // A split costs a plane of f32 per piece and a pass to add them
+            // up, so it is also capped by k being long enough that a piece of
+            // it is still a reasonable unit of work.
+            const int64_t n_warps = warps_m * GK_CU_MMA_F16_WARPS_N;
+            const int64_t want    = (int64_t) scratch->n_sm * GK_CU_MMA_F16_SPLIT_WARPS;
+            const int64_t have    = grid_m * grid_n * n_23 * n_warps;
+
+            int64_t n_splits = 1;
+
+            if (have < want) {
+                n_splits = (want + have - 1) / have;
+                if (n_splits > k_len / GK_CU_MMA_F16_SPLIT_MIN_K) {
+                    n_splits = k_len / GK_CU_MMA_F16_SPLIT_MIN_K;
+                }
+                if (n_splits < 1) {
+                    n_splits = 1;
+                }
+            }
+
+            // Rounded up to the staged k so that every split starts on a
+            // boundary the vectorized staging can still read from.
+            const int64_t k_split =
+                ((k_len + n_splits - 1) / n_splits + GK_CU_MMA_F16_K - 1)
+                / GK_CU_MMA_F16_K * GK_CU_MMA_F16_K;
+
+            n_splits = (k_len + k_split - 1) / k_split;
+
+            float * part = NULL;
+            if (n_splits > 1) {
+                part = (float *) gk_cu_scratch_get(
+                    scratch, (size_t) n_splits * n_23 * n_cols * n_rows * sizeof(float), stream);
+                if (part == NULL) {
+                    n_splits = 1;   // no room; one block per patch still works
+                }
+            }
+
+            // Still short of warps with k already cut up as far as it goes:
+            // the output is simply too small for a tile this wide, and the
+            // paths below - narrower tiles, k split across a block rather than
+            // across blocks - keep more of the device busy.
+            if (have * n_splits >= want / 2) {
+                const bool a_vec = gk_cuda_mma_f16_vec(src0, k_len);
+                const bool b_vec = gk_cuda_mma_f16_vec(src1, k_len);
+
+                dim3 fgrid;
+                fgrid.x = (unsigned) grid_m;
+                fgrid.y = (unsigned) grid_n;
+                fgrid.z = (unsigned) (n_23 * n_splits);
+
+                if (warps_m == 4) {
+                    gk_cu_k_mul_mat_mma_f16<4><<<fgrid, 4 * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE, 0, stream>>>(
+                        gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst),
+                        k_len, r2, r3, a_vec, b_vec,
+                        n_splits > 1 ? part : NULL, k_split, n_23);
+                } else {
+                    gk_cu_k_mul_mat_mma_f16<2><<<fgrid, 2 * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE, 0, stream>>>(
+                        gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst),
+                        k_len, r2, r3, a_vec, b_vec,
+                        n_splits > 1 ? part : NULL, k_split, n_23);
+                }
+
+                if (n_splits > 1) {
+                    const int64_t n_out = n_rows * n_cols * n_23;
+                    gk_cu_k_mma_f16_combine<<<gk_cu_blocks_1d(n_out, GK_CUDA_BLOCK),
+                                              GK_CUDA_BLOCK, 0, stream>>>(
+                        part, gk_cu_view_mut(dst), n_splits, n_23, n_rows, n_cols);
+                }
                 return;
             }
         }

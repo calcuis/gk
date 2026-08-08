@@ -764,8 +764,95 @@ static struct gk_tensor * build_mma_nvfp4_batched(struct gk_ctx * ctx, struct gk
     return gk_mul_mat(ctx, in[0], in[1]);
 }
 
+// The f16 tensor-core tile. Its tile is 128 rows by 128 columns by 32 of k,
+// and it has two instantiations picked by row count, so what these vary is
+// which side of every one of those boundaries the shape falls on.
+//
+// src1's type is varied too, and that is not incidental: a convolution reaches
+// this kernel with its weights as src1, and those are f16, while f32 is what
+// activations arrive as everywhere else. Only those two, and bf16 - supports_op
+// requires src1 to be a float type, so a quantized src1 never reaches here.
+static struct gk_tensor * mma_f16_case(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in,
+                                       int64_t k, int64_t rows, int64_t cols, enum gk_type btype) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F16, k, rows);
+    in[1] = gk_new_tensor_2d(ctx, btype,       k, cols);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+// These are larger than the rest of the file's cases, and they have to be: the
+// kernel declines any shape whose grid would leave multiprocessors idle, so a
+// case built at the scale of the others would quietly measure the float tile
+// instead and pass without ever running the code it names. Every shape here
+// clears that gate on a twenty-multiprocessor part.
+
+// Off the tile in every direction, on the wide instantiation.
+static struct gk_tensor * build_mma_f16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 256, 2600, 140, GK_TYPE_F32);
+}
+
+// Exactly on it, which is the case where an off-by-one in the edge guards
+// hides rather than showing.
+static struct gk_tensor * build_mma_f16_exact(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 256, 2560, 128, GK_TYPE_F32);
+}
+
+// Too few rows for the wide tile, so the narrow instantiation runs, and enough
+// columns that it still fills the device. A UNet's deepest levels are this
+// shape - a hundred-odd pixels against a thousand-odd channels.
+static struct gk_tensor * build_mma_f16_narrow(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 256, 100, 1400, GK_TYPE_F32);
+}
+
+// A k that is neither a whole number of the staged 32 nor a multiple of the
+// run of 8, so the last pass of the k loop is partly padding and both operands
+// fall to the scalar staging arm.
+static struct gk_tensor * build_mma_f16_ragged(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 100, 2600, 140, GK_TYPE_F32);
+}
+
+// f16 weights on the src1 side: a convolution's, and the one combination
+// where nothing is rounded on the way to the fragment.
+static struct gk_tensor * build_mma_f16_wf16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 288, 2600, 140, GK_TYPE_F16);
+}
+
+// bf16 on the src1 side, which is neither the fragment's type nor f32 and so
+// takes its own arm of the staging pack.
+static struct gk_tensor * build_mma_f16_wbf16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 256, 2600, 140, GK_TYPE_BF16);
+}
+
+// Higher dimensions, and src0 with fewer of them than src1 so the broadcast
+// divisors are exercised rather than left at one.
+static struct gk_tensor * build_mma_f16_batched(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F16, 128, 700, 2);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 128, 140, 4);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+// Too small in both output directions to cover the device, with a k long
+// enough to be cut up - so this is the one case that splits k across blocks
+// and sums the pieces afterwards. Nothing else here reaches that path, and
+// what it gets wrong if the combine is wrong is a partial sum, which looks
+// like a plausible number rather than like a failure.
+static struct gk_tensor * build_mma_f16_split(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 8192, 100, 256, GK_TYPE_F16);
+}
+
+// Activations that arrive as a permuted view rather than in the order they
+// were written, which is the normal shape of an attention projection.
+static struct gk_tensor * build_mma_f16_permuted(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F16, 128, 2600);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 128, 2, 140);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], gk_cont(ctx, gk_permute(ctx, in[1], 0, 2, 1, 3)));
+}
+
 // A k that is not a whole number of 32-element groups, which the integer path
-// declines - so this checks the fall back to the float tile still works.
+// declines - so this checks that whichever path an f16 weight falls to at this
+// k still computes the same thing.
 static struct gk_tensor * build_mmq_ragged_k(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     return mmq_case(ctx, in, n_in, GK_TYPE_F16, 130, 600, 40);
 }
@@ -1571,6 +1658,25 @@ int main(void) {
     failures += run_op_tol(gpu, "mma nvfp4 exct", build_mma_nvfp4_exact,  4e-2f);
     failures += run_op_tol(gpu, "mma nvfp4 deep", build_mma_nvfp4_deep,   4e-2f);
     failures += run_op_tol(gpu, "mma nvfp4 batch", build_mma_nvfp4_batched, 4e-2f);
+
+    // The f16 tensor-core tile. Held looser than the float paths for one
+    // reason, and it is worth being explicit about it: the fragments are f16,
+    // so an f32 src1 is rounded to half on the way in and the products are
+    // half-precision even though the accumulator is not. That is the same
+    // trade cuBLAS makes for an f16 GEMM, and a caller who does not want it
+    // says so with GK_PREC_F32, which sends the matmul to the float tile. The
+    // bound below is set just above what the rounding measures at these k;
+    // the cases whose src1 is already f16 or quantized round nothing and sit
+    // an order of magnitude inside it.
+    failures += run_op_tol(gpu, "mma f16",       build_mma_f16,          5e-3f);
+    failures += run_op_tol(gpu, "mma f16 exact", build_mma_f16_exact,    5e-3f);
+    failures += run_op_tol(gpu, "mma f16 narrow", build_mma_f16_narrow,  5e-3f);
+    failures += run_op_tol(gpu, "mma f16 ragged", build_mma_f16_ragged,  5e-3f);
+    failures += run_op_tol(gpu, "mma f16 w f16", build_mma_f16_wf16,     5e-3f);
+    failures += run_op_tol(gpu, "mma f16 w bf16", build_mma_f16_wbf16,   5e-3f);
+    failures += run_op_tol(gpu, "mma f16 batch", build_mma_f16_batched,  5e-3f);
+    failures += run_op_tol(gpu, "mma f16 split", build_mma_f16_split,    5e-3f);
+    failures += run_op_tol(gpu, "mma f16 permut", build_mma_f16_permuted, 5e-3f);
     failures += run_op(gpu, "rope",           build_rope);
     failures += run_op(gpu, "get_rows",       build_get_rows);
     failures += run_op(gpu, "scale",          build_scale);
