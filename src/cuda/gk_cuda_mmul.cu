@@ -1889,6 +1889,447 @@ static __global__ void gk_cu_k_flash_attn_tiled(gk_tview q, gk_tview k, gk_tview
     }
 }
 
+// --------------------------------------------------------------------------
+// The tensor-core path.
+//
+// The kernel above is the same algorithm as this one and runs at about a
+// tenth of the speed, for a reason that is not the algorithm. Its two inner
+// loops each read five values out of shared memory to feed four FFMAs - one
+// K element and four Q elements, then one V element and four probabilities -
+// and shared memory issues one warp-wide load per multiprocessor-cycle where
+// the FFMA pipe issues four. So five loads cost five cycles to feed one
+// cycle of arithmetic, and the kernel spends five sixths of itself waiting on
+// the memory it is reading operands out of. Measured at the shape a 64x64
+// UNet layer runs - 4096 queries against 4096 keys, eight heads, d_head 40 -
+// that is 934 GFLOP/s where the same card's f16 GEMM does 12 to 16 TFLOP/s.
+//
+// The fix is to stop moving operands one element at a time. `mma.sync`
+// consumes a whole 16x16-by-16x8 tile per instruction from registers, so the
+// ratio inverts: a warp reads its operands once into fragments and gets 2048
+// multiply-accumulates out of them.
+//
+// Three things make the mapping work out better here than a GEMM's:
+//
+//   * Q is read once, into registers, and stays there for the whole cache.
+//     It is the operand a query block reuses across every key tile, so it
+//     never belongs in shared memory at all - which is also what frees the
+//     room for K and V to be staged at a 64-key tile instead of 32.
+//
+//   * The S fragment that comes out of the first mma is bit-for-bit the A
+//     fragment the second one wants. `mma.m16n8k16` leaves a lane holding D
+//     rows `group`/`group+8` at columns `2*tig`/`2*tig+1`, and wants A rows
+//     `group`/`group+8` at columns `2*tig`/`2*tig+1` of each 16-wide window.
+//     Those are the same elements in the same lanes, so the probabilities go
+//     from the softmax straight into the next instruction as registers. No
+//     staging, no barrier, and no shared memory for P.
+//
+//   * The softmax's row reductions shrink from a warp to a quadrant. A row of
+//     S lives in the four lanes that share a `group`, so the maximum and the
+//     sum are two shuffles over the low two lane bits instead of the five a
+//     whole-warp reduction costs.
+//
+// What the tile costs in exchange is that the products are f16. The
+// accumulator is f32 across the whole reduction, and K and V arrive f16 from
+// the caller already, so what is new is Q and the probabilities being rounded
+// before they are multiplied - the same trade the f16 GEMM makes, and the
+// reason the host gate below insists on f16 K and V rather than converting
+// an f32 cache down to reach this path.
+// --------------------------------------------------------------------------
+
+#define GK_CU_FAM_WARPS   4                                  // warps per block
+#define GK_CU_FAM_BR      (GK_CU_FAM_WARPS * 16)             // query rows a block owns
+#define GK_CU_FAM_THREADS (GK_CU_FAM_WARPS * GK_WARP_SIZE)
+
+// Key positions per tile. A wide head already spends its registers on the
+// output accumulator - a lane holds DV/2 floats of it - and the S tile is
+// what it can give back: halving the tile halves S and the probability
+// fragments both, and halves the staged K and V with them, which is the
+// difference between two blocks resident per multiprocessor and five.
+// Narrow heads have the registers to spare and would rather sync half as
+// often.
+#define GK_CU_FAM_BC(D)   ((D) <= 80 ? 64 : 32)
+#define GK_CU_FAM_NTC(D)  (GK_CU_FAM_BC(D) /  8)             // 8-wide S tiles a warp holds
+#define GK_CU_FAM_NKW(D)  (GK_CU_FAM_BC(D) / 16)             // 16-wide PV windows
+
+// The head width is a template parameter because the accumulator it sizes is
+// registers, which have to be counted at compile time. The buckets are the
+// widths that exist: 40 and 80 and 160 are SD's three levels, 64 and 128 are
+// what a language model and a diffusion transformer run. A head is rounded up
+// to the next bucket and the slack is zero-padded, so 40 costs a 48-wide
+// reduction and nothing else.
+#define GK_CU_FAM_NTK(D)  (((D) + 15) / 16)                  // 16-wide k windows
+#define GK_CU_FAM_NTV(D)  (((D) +  7) /  8)                  // 8-wide value tiles
+
+// Staged rows are padded past the width they hold, for the same reason the
+// GEMM's are: a fragment read puts the eight lanes of a quadrant on eight
+// different rows at one k, and eight rows an exact power of two apart would
+// land on one bank. Every bucket's padded stride is a multiple of 8 halves
+// past a multiple of 16, which spreads those eight over eight disjoint quads.
+#define GK_CU_FAM_SK(D)   (GK_CU_FAM_NTK(D) * 16 + 8)
+#define GK_CU_FAM_SC(D)   (GK_CU_FAM_BC(D) + 8)
+
+// Two floats into the half2 an mma fragment register is. The low half is the
+// lower k, which is the order both operands are read out of shared memory in.
+static __device__ __forceinline__ int gk_cu_pack2_half(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *(const int *) &h;
+}
+
+// Eight f16 out of a row, as one 16-byte word, with the tail of a head that is
+// not a multiple of eight zero-filled.
+//
+// Staging is why this matters. A tile is 64 keys of K and 64 of V, so a block
+// moves several thousand elements into shared memory per iteration and issues
+// a few hundred mma against them - which means an instruction spent per staged
+// element costs several times what the arithmetic does, and the kernel becomes
+// a memcpy with a tensor core attached. Whether the eight can be taken as one
+// word is decided on the host, once per launch.
+static __device__ __forceinline__ int4 gk_cu_fam_run8(const gk_tview & t, bool vec,
+                                                      int64_t i0, int64_t i1,
+                                                      int64_t i2, int64_t i3,
+                                                      int64_t n0) {
+    const char * row = gk_cu_row(t, i1, i2, i3);
+
+    if (vec && i0 + 8 <= n0) {
+        return *(const int4 *) (row + i0 * 2);
+    }
+
+    __align__(16) __half h[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        h[j] = i0 + j < n0 ? *(const __half *) (row + (i0 + j) * t.nb[0])
+                           : __float2half(0.0f);
+    }
+    return *(const int4 *) h;
+}
+
+template <int D_PAD>
+static __global__ __launch_bounds__(GK_CU_FAM_THREADS)
+void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
+                            gk_tview mask, bool has_mask,
+                            const float * sinks, gk_tview_mut d,
+                            float scale, float max_bias,
+                            float logit_softcap, int64_t n_head_log2,
+                            int64_t rk2, int64_t rk3,
+                            int64_t rv2, int64_t rv3,
+                            bool k_vec, bool v_vec) {
+    const int NT_K = GK_CU_FAM_NTK(D_PAD);
+    const int NT_V = GK_CU_FAM_NTV(D_PAD);
+
+    __shared__ __half Ks[GK_CU_FAM_BC(D_PAD)]          [GK_CU_FAM_SK(D_PAD)];
+    __shared__ __half Vt[GK_CU_FAM_NTV(D_PAD)*8][GK_CU_FAM_SC(D_PAD)];
+
+    const int64_t DK   = k.ne[0];
+    const int64_t DV   = v.ne[0];
+    const int64_t n_kv = k.ne[1];
+    const int64_t n_q  = q.ne[1];
+
+    const int tid   = (int) threadIdx.x;
+    const int lane  = tid % GK_WARP_SIZE;
+    const int warp  = tid / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int64_t iq2 = blockIdx.y;
+    const int64_t iq3 = blockIdx.z;
+
+    const int64_t ik2 = iq2 / rk2, ik3 = iq3 / rk3;
+    const int64_t iv2 = iq2 / rv2, iv3 = iq3 / rv3;
+
+    const float slope = gk_cu_alibi_slope(max_bias, iq2, n_head_log2);
+
+    // The two query rows this lane owns, in the warp's 16-row tile.
+    const int64_t q1_0 = (int64_t) blockIdx.x * GK_CU_FAM_BR + warp * 16;
+    const int64_t row0 = q1_0 + group;
+    const int64_t row1 = q1_0 + group + 8;
+
+    const bool live0 = row0 < n_q;
+    const bool live1 = row1 < n_q;
+
+    // Q, once, as fragments. Rows past the end and k past the head read zero,
+    // which contributes nothing to a dot product - so the ragged tail needs no
+    // branch anywhere below this point.
+    int qf[GK_CU_FAM_NTK(D_PAD)][4];
+#pragma unroll
+    for (int kt = 0; kt < NT_K; ++kt) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t r  = (j & 1) ? row1 : row0;
+            const int64_t k0 = kt * 16 + (j >= 2 ? 8 : 0) + 2 * tig;
+
+            const float a = r < n_q && k0     < DK ? gk_cu_get(q, k0,     r, iq2, iq3) : 0.0f;
+            const float b = r < n_q && k0 + 1 < DK ? gk_cu_get(q, k0 + 1, r, iq2, iq3) : 0.0f;
+
+            qf[kt][j] = gk_cu_pack2_half(a, b);
+        }
+    }
+
+    float acc[GK_CU_FAM_NTV(D_PAD)][4];
+#pragma unroll
+    for (int ct = 0; ct < NT_V; ++ct) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            acc[ct][i] = 0.0f;
+        }
+    }
+
+    // The running softmax, one pair per lane: row0 in slot 0, row1 in slot 1.
+    // Both are replicated across the four lanes of a quadrant, because that is
+    // what the reductions below leave behind.
+    float M[2] = { -INFINITY, -INFINITY };
+    float S[2] = { 0.0f, 0.0f };
+
+    for (int64_t c0 = 0; c0 < n_kv; c0 += GK_CU_FAM_BC(D_PAD)) {
+        // K as [key][k] and V transposed to [value dim][key], which is the
+        // layout `mma.row.col` wants for the B operand of each of the two
+        // products. V's transpose is paid here, on the staging store, rather
+        // than in the inner loop - the read side of it is what runs 64 times
+        // per tile in the arithmetic below, and the write side once.
+        //
+        // Both are staged eight elements to the instruction. The divisors are
+        // template constants, so the index arithmetic is shifts rather than
+        // the 64-bit division a runtime divisor would compile to.
+#pragma unroll
+        for (int e = tid; e < GK_CU_FAM_BC(D_PAD) * GK_CU_FAM_NTK(D_PAD) * 2;
+             e += GK_CU_FAM_THREADS) {
+            const int     c  = e / (NT_K * 2);
+            const int     i  = (e - c * (NT_K * 2)) * 8;
+            const int64_t ic = c0 + c;
+
+            *(int4 *) &Ks[c][i] = ic < n_kv
+                ? gk_cu_fam_run8(k, k_vec, i, ic, ik2, ik3, DK)
+                : make_int4(0, 0, 0, 0);
+        }
+
+#pragma unroll
+        for (int e = tid; e < GK_CU_FAM_BC(D_PAD) * GK_CU_FAM_NTV(D_PAD);
+             e += GK_CU_FAM_THREADS) {
+            const int     c  = e / NT_V;
+            const int     i  = (e - c * NT_V) * 8;
+            const int64_t ic = c0 + c;
+
+            const int4 w = ic < n_kv
+                ? gk_cu_fam_run8(v, v_vec, i, ic, iv2, iv3, DV)
+                : make_int4(0, 0, 0, 0);
+
+            // The one scattered write in the kernel: eight value dimensions of
+            // one key, which land a row apart in the transposed tile.
+            const __half * h = (const __half *) &w;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                Vt[i + j][c] = h[j];
+            }
+        }
+        __syncthreads();
+
+        // S = Q K^T, for this warp's 16 query rows against all 64 keys.
+        float s[GK_CU_FAM_NTC(D_PAD)][4];
+#pragma unroll
+        for (int nt = 0; nt < GK_CU_FAM_NTC(D_PAD); ++nt) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                s[nt][i] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int kt = 0; kt < NT_K; ++kt) {
+#pragma unroll
+            for (int nt = 0; nt < GK_CU_FAM_NTC(D_PAD); ++nt) {
+                int bf[2];
+                bf[0] = *(const int *) &Ks[nt * 8 + group][kt * 16 + 2 * tig];
+                bf[1] = *(const int *) &Ks[nt * 8 + group][kt * 16 + 8 + 2 * tig];
+
+                gk_cu_mma_f16(s[nt], qf[kt], bf);
+            }
+        }
+
+        // Scale, softcap and mask, and mark everything that is not a real
+        // (query, key) pair as -inf so the softmax gives it no weight. A key
+        // past the end of the cache was staged as zero, and a zero logit is
+        // not a zero probability - this is the guard that matters.
+        //
+        // Only the last tile of the cache can be ragged, and whether a query
+        // row exists does not change across the cache at all, so both bounds
+        // are decided once rather than per element. Without that, the 32
+        // elements a lane holds each carry two comparisons against a 64-bit
+        // extent into what is otherwise a multiply and an exponential.
+        const bool whole = c0 + GK_CU_FAM_BC(D_PAD) <= n_kv;
+
+#pragma unroll
+        for (int nt = 0; nt < GK_CU_FAM_NTC(D_PAD); ++nt) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t r  = (i >= 2) ? row1 : row0;
+                const int64_t ic = c0 + nt * 8 + 2 * tig + (i & 1);
+
+                float x = -INFINITY;
+                if (((i >= 2) ? live1 : live0) && (whole || ic < n_kv)) {
+                    x = s[nt][i] * scale;
+                    if (logit_softcap != 0.0f) {
+                        x = logit_softcap * tanhf(x);
+                    }
+                    if (has_mask) {
+                        const float mv = slope * gk_cu_get(mask, ic, r,
+                                                           iq2 % mask.ne[2],
+                                                           iq3 % mask.ne[3]);
+                        x = mv == -INFINITY ? -INFINITY : x + mv;
+                    }
+                }
+                s[nt][i] = x;
+            }
+        }
+
+        // The row maximum. A row lives in the four lanes that share a group,
+        // so the reduction is over the low two lane bits and nothing else.
+        float m[2] = { -INFINITY, -INFINITY };
+#pragma unroll
+        for (int nt = 0; nt < GK_CU_FAM_NTC(D_PAD); ++nt) {
+            m[0] = fmaxf(m[0], fmaxf(s[nt][0], s[nt][1]));
+            m[1] = fmaxf(m[1], fmaxf(s[nt][2], s[nt][3]));
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            m[r] = fmaxf(m[r], __shfl_xor_sync(0xffffffffu, m[r], 1));
+            m[r] = fmaxf(m[r], __shfl_xor_sync(0xffffffffu, m[r], 2));
+        }
+
+        float corr[2];
+        float sum[2] = { 0.0f, 0.0f };
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const float m_new = fmaxf(M[r], m[r]);
+            // A tile that was entirely masked leaves the running maximum
+            // where it was; expf(-inf - -inf) is not a number, so it is not
+            // asked.
+            corr[r] = m_new == -INFINITY ? 1.0f : expf(M[r] - m_new);
+            M[r]    = m_new;
+        }
+
+#pragma unroll
+        for (int nt = 0; nt < GK_CU_FAM_NTC(D_PAD); ++nt) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int   r = (i >= 2) ? 1 : 0;
+                const float p = s[nt][i] == -INFINITY || M[r] == -INFINITY
+                              ? 0.0f : expf(s[nt][i] - M[r]);
+                s[nt][i] = p;
+                sum[r]  += p;
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 1);
+            sum[r] += __shfl_xor_sync(0xffffffffu, sum[r], 2);
+            S[r]    = S[r] * corr[r] + sum[r];
+        }
+
+        // O = O * corr + P V. The probabilities are already in the lanes and
+        // the registers the A operand wants, so they are packed rather than
+        // staged: window `kw` covers keys `kw*16 .. +15`, which is exactly the
+        // pair of 8-wide S tiles `2*kw` and `2*kw+1`.
+        int pf[GK_CU_FAM_NKW(D_PAD)][4];
+#pragma unroll
+        for (int kw = 0; kw < GK_CU_FAM_NKW(D_PAD); ++kw) {
+            pf[kw][0] = gk_cu_pack2_half(s[2 * kw + 0][0], s[2 * kw + 0][1]);
+            pf[kw][1] = gk_cu_pack2_half(s[2 * kw + 0][2], s[2 * kw + 0][3]);
+            pf[kw][2] = gk_cu_pack2_half(s[2 * kw + 1][0], s[2 * kw + 1][1]);
+            pf[kw][3] = gk_cu_pack2_half(s[2 * kw + 1][2], s[2 * kw + 1][3]);
+        }
+
+#pragma unroll
+        for (int ct = 0; ct < NT_V; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[ct][i] *= corr[(i >= 2) ? 1 : 0];
+            }
+#pragma unroll
+            for (int kw = 0; kw < GK_CU_FAM_NKW(D_PAD); ++kw) {
+                int bf[2];
+                bf[0] = *(const int *) &Vt[ct * 8 + group][kw * 16 + 2 * tig];
+                bf[1] = *(const int *) &Vt[ct * 8 + group][kw * 16 + 8 + 2 * tig];
+
+                gk_cu_mma_f16(acc[ct], pf[kw], bf);
+            }
+        }
+
+        // The tile is read by every warp, so it cannot be overwritten until
+        // every warp is done with it.
+        __syncthreads();
+    }
+
+    // The sink is one more virtual position, with a logit but no value row.
+    if (sinks != NULL) {
+        const float sv = sinks[iq2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            if (sv > M[r]) {
+                const float c = M[r] == -INFINITY ? 0.0f : expf(M[r] - sv);
+                M[r] = sv;
+                S[r] = S[r] * c + 1.0f;
+#pragma unroll
+                for (int ct = 0; ct < NT_V; ++ct) {
+                    acc[ct][2 * r + 0] *= c;
+                    acc[ct][2 * r + 1] *= c;
+                }
+            } else {
+                S[r] += expf(sv - M[r]);
+            }
+        }
+    }
+
+    const float inv[2] = { S[0] == 0.0f ? 0.0f : 1.0f / S[0],
+                           S[1] == 0.0f ? 0.0f : 1.0f / S[1] };
+
+#pragma unroll
+    for (int ct = 0; ct < NT_V; ++ct) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int64_t r  = (i >= 2) ? row1 : row0;
+            const int64_t dv = ct * 8 + 2 * tig + (i & 1);
+
+            if (r < n_q && dv < DV) {
+                gk_cu_set(d, dv, iq2, r, iq3, acc[ct][i] * inv[(i >= 2) ? 1 : 0]);
+            }
+        }
+    }
+}
+
+// Which instantiation a head goes to, or zero for one that has none. Both
+// widths have to fit: the k windows are sized from the bucket and so are the
+// value tiles, so a head that is narrow in V and wide in K - which is what
+// multi-head latent attention is - has no bucket here and takes the float
+// path instead of a bucket that would silently drop the rest of K.
+// Whether a cache can be staged eight elements at a time: packed along the
+// head, and every row start 16-byte aligned so the run is one word. A cache
+// that is neither still works, an element at a time, through the scalar arm of
+// gk_cu_fam_run8 - which is what a permuted or offset view of one falls to.
+static __host__ __forceinline__ bool gk_cuda_fam_vec(const struct gk_tensor * t) {
+    if ((size_t) t->nb[0] != gk_type_size(t->type)) {
+        return false;
+    }
+    const uintptr_t bits = (uintptr_t) t->data | (uintptr_t) t->nb[1]
+                         | (uintptr_t) t->nb[2] | (uintptr_t) t->nb[3];
+    return bits % 16 == 0;
+}
+
+static __host__ __forceinline__ int gk_cuda_fam_bucket(int64_t dk, int64_t dv) {
+#if defined(GK_USE_HIP)
+    GK_UNUSED(dk);
+    GK_UNUSED(dv);
+    return 0;   // `mma.sync` is PTX; there is no HIP spelling of it here
+#else
+    const int64_t w = dk > dv ? dk : dv;
+
+    if (w <=  40) { return  40; }
+    if (w <=  64) { return  64; }
+    if (w <=  80) { return  80; }
+    if (w <= 128) { return 128; }
+    if (w <= 160) { return 160; }
+
+    return 0;
+#endif
+}
+
 // `part_vkq` and `part_ms`, when given, are where a slice leaves its partial
 // result instead of writing an answer: n_split accumulators of DV floats, and
 // n_split (M, S) pairs, indexed by row then slice. When they are NULL this is
@@ -2171,6 +2612,48 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
     const int64_t DK   = k->ne[0];
     const int64_t DV   = v->ne[0];
     const int64_t n_kv = k->ne[1];
+
+    // The tensor-core path, when the head fits one of the widths its
+    // accumulator is compiled for and the cache is already f16. A cache that
+    // is not gets the float kernel rather than a conversion: reaching the
+    // tensor core by rounding an operand the caller chose to keep in f32
+    // would be trading their precision for our speed.
+    //
+    // Query rows are the other condition. A block owns 64 of them and does
+    // not split the cache, so a handful of rows against a long cache - which
+    // is generation - would leave the card idle. That shape is what the split
+    // path below is for.
+    const int fam_d = gk_cuda_fam_bucket(DK, DV);
+
+    if (fam_d != 0 && q->ne[1] >= 16 &&
+        (int) k->type == GK_TYPE_F16 && (int) v->type == GK_TYPE_F16 &&
+        scratch != NULL && scratch->cc >= 80) {
+
+        dim3 mgrid;
+        mgrid.x = (unsigned) ((q->ne[1] + GK_CU_FAM_BR - 1) / GK_CU_FAM_BR);
+        mgrid.y = (unsigned) q->ne[2];
+        mgrid.z = (unsigned) q->ne[3];
+
+#define GK_CU_FAM_LAUNCH(D)                                                        \
+        gk_cu_k_flash_attn_mma<D><<<mgrid, GK_CU_FAM_THREADS, 0, stream>>>(         \
+            gk_cu_view(q), gk_cu_view(k), gk_cu_view(v),                            \
+            mask ? gk_cu_view(mask) : gk_cu_view(q), mask != NULL,                  \
+            sinks ? (const float *) sinks->data : NULL,                             \
+            gk_cu_view_mut(dst), scale, max_bias, logit_softcap, n_head_log2,       \
+            q->ne[2] / k->ne[2], q->ne[3] / k->ne[3],                               \
+            q->ne[2] / v->ne[2], q->ne[3] / v->ne[3],                               \
+            gk_cuda_fam_vec(k), gk_cuda_fam_vec(v))
+
+        switch (fam_d) {
+            case  40: GK_CU_FAM_LAUNCH( 40); return;
+            case  64: GK_CU_FAM_LAUNCH( 64); return;
+            case  80: GK_CU_FAM_LAUNCH( 80); return;
+            case 128: GK_CU_FAM_LAUNCH(128); return;
+            default:  GK_CU_FAM_LAUNCH(160); return;
+        }
+
+#undef GK_CU_FAM_LAUNCH
+    }
 
     // The tiled path, when there are enough query rows to fill a block's warps
     // and the head is narrow enough for two tiles of it to sit in shared

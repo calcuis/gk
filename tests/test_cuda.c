@@ -1757,10 +1757,65 @@ int main(void) {
 
         // Past what a lane's accumulator array covers, so this has to fall
         // back rather than drop the dimensions it cannot hold.
-        failures += run_flash_attn(gpu, "wide dv falls back",
-            (struct fa_shape) { 64, 4, 4, 256, 160, 160, FA_MASK_NONE, false }, 2e-3f);
         failures += run_flash_attn(gpu, "very wide dv",
             (struct fa_shape) { 32, 4, 4, 128, 256, 256, FA_MASK_CAUSAL, false }, 2e-3f);
+
+        // The head widths a UNet runs, which are not the ones a language
+        // model does and were not covered until the tiled path was rewritten
+        // on mma. Three things about them break kernels written for 64 and
+        // 128: d_head 40 is not a multiple of the 16 a tensor-core window
+        // reduces over, so the operands have to be zero-padded rather than
+        // assumed whole; d_head 160 is past every accumulator that was sized
+        // for 128, and used to fall off the tiled path onto the split kernel
+        // at a twentieth of the speed; and cross-attention's cache is 77
+        // deep, so the last tile is a ragged 13 whose padding must score as
+        // -inf and not as a zero logit that the softmax then counts.
+        //
+        // The mma path multiplies in f16 - the accumulator stays f32, and K
+        // and V were already f16 on both sides, so what is new is Q and the
+        // probabilities being rounded before the product, where the CPU
+        // reference keeps both in f32. That measures at just over 1e-4 across
+        // every case here; 1e-3 leaves an order of magnitude for a different
+        // card's rounding and is still two orders below what dropping a tile
+        // or mis-scaling a row would produce.
+        const float sd_tol = 1e-3f;
+
+        failures += run_flash_attn(gpu, "sd d40 self",
+            (struct fa_shape) { 1024, 2, 2, 1024, 40, 40, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "sd d40 cross",
+            (struct fa_shape) { 1024, 2, 2,   77, 40, 40, FA_MASK_NONE, false }, sd_tol);
+
+        // the real 64x64 layer, one head of it: the shape that was 42% of a
+        // sampling step
+        failures += run_flash_attn(gpu, "sd d40 4096",
+            (struct fa_shape) { 4096, 1, 1, 4096, 40, 40, FA_MASK_NONE, false }, sd_tol);
+
+        failures += run_flash_attn(gpu, "sd d80 self",
+            (struct fa_shape) { 1024, 2, 2, 1024, 80, 80, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "sd d80 cross",
+            (struct fa_shape) { 1024, 2, 2,   77, 80, 80, FA_MASK_NONE, false }, sd_tol);
+
+        failures += run_flash_attn(gpu, "sd d160 self",
+            (struct fa_shape) {  256, 2, 2,  256, 160, 160, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "sd d160 cross",
+            (struct fa_shape) {  256, 2, 2,   77, 160, 160, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "sd d160 8x8",
+            (struct fa_shape) {   64, 2, 2,   64, 160, 160, FA_MASK_NONE, false }, sd_tol);
+
+        // Neither the query count nor the cache is a whole number of tiles,
+        // so both tails are ragged at once.
+        failures += run_flash_attn(gpu, "sd d40 ragged",
+            (struct fa_shape) {  300, 2, 2,  205, 40, 40, FA_MASK_NONE, false }, sd_tol);
+
+        // The features that are easy to keep working at 64 and easy to lose
+        // at 40 and 160: a mask, grouped-query broadcast, sinks, and a tile
+        // that the mask empties completely.
+        failures += run_flash_attn(gpu, "sd d40 gqa mask",
+            (struct fa_shape) {  300, 4, 2,  205, 40, 40, FA_MASK_CAUSAL, false }, sd_tol);
+        failures += run_flash_attn(gpu, "sd d160 sinks",
+            (struct fa_shape) {  128, 2, 2,  192, 160, 160, FA_MASK_SUFFIX, true }, sd_tol);
+        failures += run_flash_attn(gpu, "sd d80 causal",
+            (struct fa_shape) {  192, 4, 4,  192, 80, 80, FA_MASK_CAUSAL, false }, sd_tol);
     }
 
     // top_k on both sides of the width where one network stops fitting: 4096
