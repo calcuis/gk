@@ -616,6 +616,24 @@ HIP is not a second implementation: `src/cuda/gk_cuda_vendor.h` is a header of
 aliases, and the same `.cu` files compile for both vendors. The warp width is
 the one place the two really differ, and it is read rather than assumed.
 
+Discovery prints one line per device to stderr the first time anything asks
+for the list:
+
+```
+gk: found 2 devices
+  CUDA0: NVIDIA GeForce RTX 4050 Laptop GPU, 6140 MiB | compute capability = 8.9 | SMs = 20 | shared memory = 99 KiB | built for = 89
+  CPU: gk CPU backend, 32014 MiB | SIMD = AVX2 | AVX2 = 1 | FMA = 1 | F16C = 1 | F16_VEC = 1
+```
+
+The trailing pairs are `gk_device_features`, which reports what the *build*
+chose - the vector path the CPU kernels were compiled for, the architectures a
+CUDA build carries code for - because those are the questions behind a run that
+is unexpectedly slow, and none of them can be seen from the outside. A GPU
+missing from this list is a driver that was not found or a device skipped for
+having no kernel image; that used to be indistinguishable from a run that was
+simply slow. `GK_QUIET=1` turns the banner off for callers that own their
+output.
+
 Each backend answers `supports_op` for itself, and anything it says no to runs
 on the CPU instead - so an op with no kernel yet, or a weight in a format a
 backend does not decode, is a fallback rather than a failure. What that costs

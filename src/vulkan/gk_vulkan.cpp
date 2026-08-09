@@ -1411,6 +1411,8 @@ static const struct gk_device_i g_vk_device_iface = {
     /* .supports_op          = */ gk_vk_device_supports_op,
     /* .supports_buft        = */ gk_vk_device_supports_buft,
     /* .offload_op           = */ gk_vk_device_offload_op,
+    /* .get_features         = */ NULL, // nothing build-time to report: the
+                                        // shaders are the same for every device
 };
 
 // --------------------------------------------------------------------------

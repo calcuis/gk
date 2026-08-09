@@ -55,6 +55,14 @@ struct gk_cuda_device_ctx {
     int    cc;           // compute capability; the tensor-core path needs 8.0
     int    smem_max;     // shared memory a block may opt in to, past the 48 KB default
 
+    // What gk_device_features hands back. Built once at registration and kept
+    // here rather than formatted on demand, because the caller is promised
+    // pointers that outlive the call.
+    struct gk_feature features[6];
+    char              cc_str[16];
+    char              n_sm_str[16];
+    char              smem_str[16];
+
     struct gk_backend_buffer_type buft;
     struct gk_backend_buffer_type host_buft;
     struct gk_device              device;
@@ -749,6 +757,45 @@ static bool gk_cuda_device_offload_op(gk_device_t dev, const struct gk_tensor * 
     return gk_cuda_backend_offload_op(NULL, op);
 }
 
+// What this binary was compiled for, filled in by the build.
+#ifndef GK_CUDA_ARCH_LIST
+#define GK_CUDA_ARCH_LIST "unknown"
+#endif
+
+static const struct gk_feature * gk_cuda_device_features(gk_device_t dev) {
+    return ((struct gk_cuda_device_ctx *) dev->context)->features;
+}
+
+// Filled at registration, once the properties are known. "built for" is the
+// build's list rather than this device's own capability on purpose: a device
+// running on a nearer arch than it was compiled for is the usual reason a GPU
+// is slower than it should be, and the two numbers side by side say so.
+static void gk_cuda_device_fill_features(struct gk_cuda_device_ctx * d) {
+    snprintf(d->cc_str,   sizeof(d->cc_str),   "%d.%d", d->cc / 10, d->cc % 10);
+    snprintf(d->n_sm_str, sizeof(d->n_sm_str), "%d",    d->n_sm);
+    snprintf(d->smem_str, sizeof(d->smem_str), "%d KiB", d->smem_max / 1024);
+
+    int n = 0;
+    #define GK_CUDA_FEATURE(nm, val)                                             \
+        do {                                                                     \
+            GK_ASSERT(n < (int) (sizeof(d->features) / sizeof(d->features[0]))); \
+            d->features[n].name  = (nm);                                         \
+            d->features[n].value = (val);                                        \
+            n++;                                                                 \
+        } while (0)
+
+    GK_CUDA_FEATURE("compute capability", d->cc_str);
+    GK_CUDA_FEATURE("SMs",                d->n_sm_str);
+    GK_CUDA_FEATURE("shared memory",      d->smem_str);
+    GK_CUDA_FEATURE("built for",          GK_CUDA_ARCH_LIST);
+    if (d->integrated) {
+        GK_CUDA_FEATURE("integrated", "1");
+    }
+    GK_CUDA_FEATURE(NULL, NULL);
+
+    #undef GK_CUDA_FEATURE
+}
+
 static const struct gk_device_i g_cuda_device_iface = {
     /* .get_name             = */ gk_cuda_device_name,
     /* .get_description      = */ gk_cuda_device_description,
@@ -763,17 +810,12 @@ static const struct gk_device_i g_cuda_device_iface = {
     /* .supports_op          = */ gk_cuda_device_supports_op,
     /* .supports_buft        = */ gk_cuda_device_supports_buft,
     /* .offload_op           = */ gk_cuda_device_offload_op,
+    /* .get_features         = */ gk_cuda_device_features,
 };
 
 // --------------------------------------------------------------------------
 // discovery
 // --------------------------------------------------------------------------
-
-// What this binary was compiled for, filled in by the build. Only ever used to
-// say so in an error message.
-#ifndef GK_CUDA_ARCH_LIST
-#define GK_CUDA_ARCH_LIST "unknown"
-#endif
 
 // Launched at discovery to find out whether the binary actually contains code
 // this device can run. It does nothing; the launch itself is the question.
@@ -875,6 +917,8 @@ extern "C" void gk_cuda_register_devices(void) {
 
         snprintf(d->name, sizeof(d->name), "%s%d", GK_CUDA_BACKEND_NAME, i);
         snprintf(d->description, sizeof(d->description), "%s", prop.name);
+
+        gk_cuda_device_fill_features(d);
 
         d->buft.iface   = g_cuda_buft_iface;
         d->buft.context = d;

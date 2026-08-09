@@ -18,6 +18,7 @@
 // "prefer the GPU", which is the placement rule the scheduler leans on.
 
 #include "gk_impl.h"
+#include "gk_simd.h"
 
 #include <stdlib.h>
 
@@ -114,6 +115,48 @@ static bool gk_cpu_device_supports_buft(gk_device_t dev, gk_backend_buffer_type_
     return gk_backend_buft_is_host(buft);
 }
 
+// Compile-time, not detected at runtime, because gk selects its kernels at
+// compile time: one build has exactly one vector path, chosen by what the
+// compiler was told it may use. So this reports what the binary in front of
+// you actually contains, which is the question anyone reading a banner is
+// asking - "is this the fast build?" - and it cannot drift from the kernels,
+// because it is the same macros gk_simd.h and gk_vecdot.c switch on.
+//
+// Only macros that select a gk code path are listed. A build flag gk has no
+// kernel behind - SSE3, ARM dot-product - would read as a capability gk uses
+// and is not, and under MSVC it would go missing anyway: MSVC defines almost
+// none of these, which is why FMA and F16C are forced on by the build.
+static const struct gk_feature * gk_cpu_device_features(gk_device_t dev) {
+    GK_UNUSED(dev);
+
+    static const struct gk_feature features[] = {
+        { "SIMD", GK_SIMD_NAME },
+#if defined(__AVX512F__)
+        { "AVX512F", "1" },
+#endif
+#if defined(__AVX2__)
+        { "AVX2", "1" },
+#endif
+#if defined(__FMA__)
+        { "FMA", "1" },
+#endif
+#if defined(__F16C__)
+        { "F16C", "1" },
+#endif
+#if defined(__ARM_NEON)
+        { "NEON", "1" },
+#endif
+        // Whether f16 weights are converted a vector at a time or one at a
+        // time. It is the difference between f16 being free to read and being
+        // the bottleneck, and no instruction-set flag above implies it on its
+        // own - it needs the converter *and* the vector width.
+        { "F16_VEC", GK_SIMD_HAVE_F16 ? "1" : "0" },
+        { NULL, NULL },
+    };
+
+    return features;
+}
+
 static struct gk_device g_cpu_device = {
     /* .iface = */ {
         /* .get_name             = */ gk_cpu_device_name,
@@ -127,6 +170,7 @@ static struct gk_device g_cpu_device = {
         /* .supports_op          = */ gk_cpu_device_supports_op,
         /* .supports_buft        = */ gk_cpu_device_supports_buft,
         /* .offload_op           = */ NULL,
+        /* .get_features         = */ gk_cpu_device_features,
     },
     /* .backend = */ "CPU",
     /* .index   = */ 0,
@@ -153,6 +197,8 @@ void gk_device_register(gk_device_t dev) {
 
     g_devices[g_n_devices++] = dev;
 }
+
+static void gk_device_report(void);
 
 static void gk_device_discover(void) {
     if (g_discovered) {
@@ -182,6 +228,49 @@ static void gk_device_discover(void) {
     // types are how the scheduler works out which device a tensor already
     // lives on, so this link is not decoration.
     gk_backend_cpu_buffer_type()->device = &g_cpu_device;
+
+    gk_device_report();
+}
+
+// --------------------------------------------------------------------------
+// the discovery banner
+//
+// Printed once, from discovery, because by the time anything else could report
+// it the interesting failure has already happened silently: a CUDA build that
+// found no driver, a device skipped for having no kernel image, or a CPU-only
+// binary where a GPU was expected all look identical from the outside - the
+// run is simply slow. One line per device makes "which hardware did this
+// actually use" answerable without a debugger.
+//
+// It goes to stderr rather than through the host's logger because gk has no
+// logger of its own to hook and the frontends install theirs after the first
+// device query has already happened. GK_QUIET=1 turns it off for callers that
+// own their output.
+// --------------------------------------------------------------------------
+
+static void gk_device_report(void) {
+    const char * quiet = getenv("GK_QUIET");
+    if (quiet != NULL && quiet[0] != '0') {
+        return;
+    }
+
+    gk_logf("gk: found %d device%s\n", g_n_devices, g_n_devices == 1 ? "" : "s");
+
+    for (int i = 0; i < g_n_devices; ++i) {
+        const gk_device_t dev = g_devices[i];
+
+        size_t total = 0;
+        gk_device_memory(dev, NULL, &total);
+
+        gk_logf("  %s: %s, %zu MiB", gk_device_name(dev), gk_device_description(dev),
+                total / (1024 * 1024));
+
+        for (const struct gk_feature * f = gk_device_features(dev); f->name != NULL; ++f) {
+            gk_logf(" | %s = %s", f->name, f->value);
+        }
+
+        gk_logf("\n");
+    }
 }
 
 // A build without a given device backend still has to define its entry point:
@@ -264,6 +353,17 @@ enum gk_device_type gk_device_type_of(gk_device_t dev) {
 
 void gk_device_memory(gk_device_t dev, size_t * free_out, size_t * total_out) {
     dev->iface.get_memory(dev, free_out, total_out);
+}
+
+const struct gk_feature * gk_device_features(gk_device_t dev) {
+    // An empty list rather than NULL, so every caller is a plain loop and
+    // "this backend reports nothing" needs no branch of its own.
+    static const struct gk_feature none[] = { { NULL, NULL } };
+
+    if (dev->iface.get_features != NULL) {
+        return dev->iface.get_features(dev);
+    }
+    return none;
 }
 
 gk_backend_t gk_device_init_backend(gk_device_t dev) {

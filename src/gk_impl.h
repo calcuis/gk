@@ -355,6 +355,8 @@ struct gk_device_i {
     bool                     (*supports_op)    (gk_device_t dev, const struct gk_tensor * op);
     bool                     (*supports_buft)  (gk_device_t dev, gk_backend_buffer_type_t buft);
     bool                     (*offload_op)     (gk_device_t dev, const struct gk_tensor * op);
+    // optional: what this build compiled for this device, for the banner
+    const struct gk_feature * (*get_features)  (gk_device_t dev);
 };
 
 struct gk_device {

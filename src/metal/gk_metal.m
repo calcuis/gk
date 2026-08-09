@@ -985,6 +985,8 @@ static const struct gk_device_i g_metal_device_iface = {
     /* .supports_op          = */ gk_metal_device_supports_op,
     /* .supports_buft        = */ gk_metal_device_supports_buft,
     /* .offload_op           = */ gk_metal_device_offload_op,
+    /* .get_features         = */ NULL, // one library, compiled at load; there
+                                        // is no build variant to report
 };
 
 // --------------------------------------------------------------------------
