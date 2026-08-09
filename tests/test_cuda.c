@@ -612,6 +612,50 @@ static struct gk_tensor * build_im2col_f16(struct gk_ctx * ctx, struct gk_tensor
     return gk_im2col(ctx, in[0], in[1], 1, 1, 1, 1, 1, 1, true, GK_TYPE_F16);
 }
 
+// im2col decomposes a flat index into (input channel, kernel row, kernel
+// column) and (batch, output row, output column), and the case above has every
+// one of stride, padding and dilation set to one and a square kernel - so it
+// passes whether or not those six are told apart correctly. These do not.
+//
+// A non-square kernel separates KW from KH, unequal strides separate the two
+// spatial axes, and a dilation that differs per axis separates those again.
+static struct gk_tensor * build_im2col_asym(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 5, 3, 6, 2);   // KW=5, KH=3, IC=6
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 23, 17, 6, 3); // IW=23, IH=17, N=3
+    *n_in = 2;
+    return gk_im2col(ctx, in[0], in[1], 2, 3, 2, 1, 2, 1, true, GK_TYPE_F32);
+}
+
+// The one-dimensional form, where the kernel height, the output height and the
+// batch are all one. Three of the five divisors are then 1, which the
+// multiply-shift has no magic number for and carries as a separate case.
+static struct gk_tensor * build_im2col_1d(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F16, 4, 7, 2);      // KW=4, IC=7
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 31, 7, 1);     // IW=31, IC=7, N=1
+    *n_in = 2;
+    return gk_im2col(ctx, in[0], in[1], 3, 1, 1, 0, 2, 1, false, GK_TYPE_F16);
+}
+
+// A single input channel and a single batch, so the patch dimension is only
+// the kernel area - the shape where an off-by-one between the patch stride and
+// the kernel stride still divides evenly and so still looks right.
+static struct gk_tensor * build_im2col_ic1(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 3, 1, 1);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 9, 9, 1, 1);
+    *n_in = 2;
+    return gk_im2col(ctx, in[0], in[1], 1, 1, 0, 0, 1, 1, true, GK_TYPE_F16);
+}
+
+// The volume form with all three axes told apart: different kernel extents,
+// strides and dilations per axis.
+static struct gk_tensor * build_im2col_3d_asym(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t IC = 2;
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F16, 3, 2, 4, IC);  // KW=3, KH=2, KD=4
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 11, 9, 7, IC * 2);
+    *n_in = 2;
+    return gk_im2col_3d(ctx, in[0], in[1], IC, 2, 1, 2, 1, 1, 0, 1, 2, 1, GK_TYPE_F32);
+}
+
 static struct gk_tensor * build_soft_max(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 37, 37, 5);
     *n_in = 1;
@@ -1619,6 +1663,10 @@ int main(void) {
     failures += run_op(gpu, "concat",         build_concat);
     failures += run_op(gpu, "timestep_emb",   build_timestep_embedding);
     failures += run_op(gpu, "im2col f16",     build_im2col_f16);
+    failures += run_op(gpu, "im2col asym",    build_im2col_asym);
+    failures += run_op(gpu, "im2col 1d",      build_im2col_1d);
+    failures += run_op(gpu, "im2col ic1",     build_im2col_ic1);
+    failures += run_op(gpu, "im2col_3d asym", build_im2col_3d_asym);
     failures += run_op(gpu, "soft_max",       build_soft_max);
     failures += run_op(gpu, "silu",           build_silu);
     failures += run_op(gpu, "gelu",           build_gelu);

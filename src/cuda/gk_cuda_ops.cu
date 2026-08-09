@@ -1577,6 +1577,93 @@ static __global__ void gk_cu_k_arange(float * dst, float start, float step, int6
 
 // im2col: unroll each input patch into a row so a convolution becomes a
 // matmul. One thread per output cell.
+// The same decomposition with the divisions replaced by the multiply-shifts
+// the host worked out for these extents.
+//
+// This kernel is most of a convolution. Every conv in a UNet or a VAE lowers to
+// im2col plus a matmul, the buffer it writes is the kernel area larger than the
+// image it reads - nine times, for the 3x3 that both are built from - and the
+// destination is contiguous, so the stores are already coalesced and the whole
+// thing should run at the speed of writing that buffer. It did not: five 64-bit
+// divisions per output element put several hundred instructions between one
+// store and the next, and measured against the bandwidth it moves, a VAE-sized
+// im2col was four times slower than its own memory traffic.
+//
+// Nothing else changes. The traversal order is the one below, for the same
+// reason: `at` varies fastest, so a warp writes 32 consecutive elements of the
+// patch dimension, and the reads it scatters across the image are the ones a
+// neighbouring warp is reading too.
+// One output element: where it comes from, and whether it comes from anywhere.
+struct gk_cu_im2col_geom {
+    struct gk_cu_fastdiv patch, ow, oh, kw, kh;
+    int64_t IH, IW, ofs_n, ofs_c, ofs_h;
+    int     s0, s1, p0, p1, d0, d1;
+};
+
+static __device__ __forceinline__ float gk_cu_im2col_gather(const gk_tview & img,
+                                                            const struct gk_cu_im2col_geom & g,
+                                                            uint32_t k) {
+    uint32_t at, iow, ioh, ikw, ikh;
+
+    const uint32_t cell = gk_cu_fastdiv_qr(g.patch, k,    &at);
+    const uint32_t ohn  = gk_cu_fastdiv_qr(g.ow,    cell, &iow);
+    const uint32_t in   = gk_cu_fastdiv_qr(g.oh,    ohn,  &ioh);
+
+    const uint32_t khc  = gk_cu_fastdiv_qr(g.kw,    at,   &ikw);
+    const uint32_t iic  = gk_cu_fastdiv_qr(g.kh,    khc,  &ikh);
+
+    const int64_t iiw = (int64_t) iow * g.s0 + (int64_t) ikw * g.d0 - g.p0;
+    const int64_t iih = (int64_t) ioh * g.s1 + (int64_t) ikh * g.d1 - g.p1;
+
+    if (iih < 0 || iih >= g.IH || iiw < 0 || iiw >= g.IW) {
+        return 0.0f;
+    }
+
+    // __ldg because this is a gather the compiler cannot prove disjoint from
+    // the destination, and the read-only path is the one that suits a load
+    // every lane of a warp takes from a different row.
+    return __ldg((const float *) (img.data + in * g.ofs_n + iic * g.ofs_c
+                                  + iih * g.ofs_h + iiw * img.nb[0]));
+}
+
+static __device__ __forceinline__ void gk_cu_im2col_store(const gk_tview_mut & d,
+                                                          uint32_t k, float v) {
+    if (d.type == GKT_F16) {
+        ((__half *) d.data)[k] = __float2half(v);
+    } else {
+        ((float *) d.data)[k] = v;
+    }
+}
+
+// What is left, once the arithmetic is gone, is a gather.
+//
+// A warp writes 32 consecutive elements of the patch dimension, and those 32
+// come from about eleven different image rows a channel plane apart - eleven
+// memory transactions where a coalesced read would take four. That is now what
+// the kernel costs: it lands around 70 GB/s of useful traffic on a part that
+// does 192, with the arithmetic at an eighth of issue and the loads not
+// latency-starved either (batching four independent gathers per thread before
+// storing any of them measured as exactly no change).
+//
+// Closing it means staging the rows in shared memory: a block reads the
+// (channel, kernel row) segments it needs coalesced, and every thread then
+// takes its element from shared. That reverses the ratio - reads become about
+// seven tenths of the writes instead of five times them - and is what would
+// take this to its roofline. It is a much larger kernel than this one, and at
+// SD's shapes it is worth about three percent of a generation, so it has not
+// been written.
+static __global__ void gk_cu_k_im2col_fast(gk_tview img, gk_tview_mut d,
+                                           struct gk_cu_im2col_geom g,
+                                           uint32_t n) {
+    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n;
+         k += gridDim.x * blockDim.x) {
+        gk_cu_im2col_store(d, k, gk_cu_im2col_gather(img, g, k));
+    }
+}
+
+// The general form, for a buffer with more elements than a 32-bit index holds.
+// Unreachable on any card that cannot hold a four-gigabyte im2col buffer, and
+// kept because "unreachable here" is not "unreachable".
 static __global__ void gk_cu_k_im2col(gk_tview img, gk_tview_mut d,
                                       int64_t IC, int64_t IH, int64_t IW,
                                       int64_t KH, int64_t KW, int64_t OH, int64_t OW,
@@ -1745,6 +1832,49 @@ static __global__ void gk_cu_k_conv_2d(gk_tview a, gk_tview b, gk_tview_mut d,
 // belongs to, and once to find which of the cell's (channel, kernel position)
 // slots it is. The destination is contiguous - the op asserts it - so the two
 // decompositions are plain divisions rather than stride arithmetic.
+// The volume form of the same thing, and the same fix: seven divisions per
+// output element rather than five.
+static __global__ void gk_cu_k_im2col_3d_fast(gk_tview b, gk_tview_mut d,
+                                              struct gk_cu_fastdiv fd_cell,
+                                              struct gk_cu_fastdiv fd_ow,
+                                              struct gk_cu_fastdiv fd_oh,
+                                              struct gk_cu_fastdiv fd_od,
+                                              struct gk_cu_fastdiv fd_kw,
+                                              struct gk_cu_fastdiv fd_kh,
+                                              struct gk_cu_fastdiv fd_kd,
+                                              int s0, int s1, int s2,
+                                              int p0, int p1, int p2,
+                                              int d0, int d1, int d2,
+                                              int64_t IC, int64_t IW, int64_t IH, int64_t ID,
+                                              uint32_t total) {
+    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < total;
+         k += gridDim.x * blockDim.x) {
+        uint32_t at, iow, ioh, iod, ikw, ikh, ikd;
+
+        const uint32_t cell = gk_cu_fastdiv_qr(fd_cell, k,    &at);
+        const uint32_t ohn  = gk_cu_fastdiv_qr(fd_ow,   cell, &iow);
+        const uint32_t iodn = gk_cu_fastdiv_qr(fd_oh,   ohn,  &ioh);
+        const uint32_t in   = gk_cu_fastdiv_qr(fd_od,   iodn, &iod);
+
+        const uint32_t khc  = gk_cu_fastdiv_qr(fd_kw,   at,   &ikw);
+        const uint32_t kdc  = gk_cu_fastdiv_qr(fd_kh,   khc,  &ikh);
+        const uint32_t iic  = gk_cu_fastdiv_qr(fd_kd,   kdc,  &ikd);
+
+        const int64_t iid = (int64_t) iod * s2 + (int64_t) ikd * d2 - p2;
+        const int64_t iih = (int64_t) ioh * s1 + (int64_t) ikh * d1 - p1;
+        const int64_t iiw = (int64_t) iow * s0 + (int64_t) ikw * d0 - p0;
+
+        float v = 0.0f;
+        if (iid >= 0 && iid < ID && iih >= 0 && iih < IH && iiw >= 0 && iiw < IW) {
+            // the volume's outermost axis carries the image and the channel
+            // together, image-major
+            v = gk_cu_get(b, iiw, iih, iid, (int64_t) in * IC + iic);
+        }
+
+        gk_cu_set(d, at, iow, ioh, iodn, v);
+    }
+}
+
 static __global__ void gk_cu_k_im2col_3d(gk_tview b, gk_tview_mut d,
                                          int s0, int s1, int s2,
                                          int p0, int p1, int p2,
@@ -2727,6 +2857,32 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
             const int64_t ofs_c = (int64_t) (is_2D ? src1->nb[2] : src1->nb[1]);
             const int64_t ofs_h = (int64_t) (is_2D ? src1->nb[1] : 0);
 
+            // Every divisor divides the element count, so one bound covers
+            // all of them.
+            if (ne <= (int64_t) GK_CU_FASTDIV_MAX) {
+                struct gk_cu_im2col_geom g;
+
+                g.patch = gk_cu_fastdiv_make((uint32_t) (IC * KH * KW));
+                g.ow    = gk_cu_fastdiv_make((uint32_t) OW);
+                g.oh    = gk_cu_fastdiv_make((uint32_t) OH);
+                g.kw    = gk_cu_fastdiv_make((uint32_t) KW);
+                g.kh    = gk_cu_fastdiv_make((uint32_t) KH);
+
+                g.IH    = IH;
+                g.IW    = IW;
+                g.ofs_n = ofs_n;
+                g.ofs_c = ofs_c;
+                g.ofs_h = ofs_h;
+
+                g.s0 = s0; g.s1 = s1;
+                g.p0 = p0; g.p1 = p1;
+                g.d0 = d0; g.d1 = d1;
+
+                gk_cu_k_im2col_fast<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                    gk_cu_view(src1), gk_cu_view_mut(node), g, (uint32_t) ne);
+                return true;
+            }
+
             gk_cu_k_im2col<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
                 gk_cu_view(src1), gk_cu_view_mut(node),
                 IC, IH, IW, KH, KW, OH, OW, ofs_n, ofs_c, ofs_h,
@@ -2805,6 +2961,29 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
         case GK_OP_IM2COL_3D: {
             const int64_t IC = gk_get_op_params_i32(node, 9);
             const int64_t N  = src1->ne[3] / IC;
+
+            if (ne <= (int64_t) GK_CU_FASTDIV_MAX) {
+                const int64_t KW = src0->ne[0];
+                const int64_t KH = src0->ne[1];
+                const int64_t KD = src0->ne[2];
+
+                gk_cu_k_im2col_3d_fast<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                    gk_cu_view(src1), gk_cu_view_mut(node),
+                    gk_cu_fastdiv_make((uint32_t) (IC * KD * KH * KW)),
+                    gk_cu_fastdiv_make((uint32_t) node->ne[1]),
+                    gk_cu_fastdiv_make((uint32_t) node->ne[2]),
+                    gk_cu_fastdiv_make((uint32_t) (node->ne[3] / N)),
+                    gk_cu_fastdiv_make((uint32_t) KW),
+                    gk_cu_fastdiv_make((uint32_t) KH),
+                    gk_cu_fastdiv_make((uint32_t) KD),
+                    gk_get_op_params_i32(node, 0), gk_get_op_params_i32(node, 1),
+                    gk_get_op_params_i32(node, 2), gk_get_op_params_i32(node, 3),
+                    gk_get_op_params_i32(node, 4), gk_get_op_params_i32(node, 5),
+                    gk_get_op_params_i32(node, 6), gk_get_op_params_i32(node, 7),
+                    gk_get_op_params_i32(node, 8),
+                    IC, src1->ne[0], src1->ne[1], src1->ne[2], (uint32_t) ne);
+                return true;
+            }
 
             gk_cu_k_im2col_3d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
                 gk_cu_view(src1), gk_cu_view_mut(node),

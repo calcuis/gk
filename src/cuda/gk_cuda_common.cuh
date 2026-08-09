@@ -243,6 +243,81 @@ static __device__ __forceinline__ float gk_cu_alibi_slope(float max_bias, int64_
 }
 
 // --------------------------------------------------------------------------
+// division by a divisor the launch already knows
+//
+// Index arithmetic is where a kernel that moves one element per thread spends
+// itself. Decomposing a flat index into the dimensions it stands for is a
+// division per dimension, and a 64-bit integer division has no hardware behind
+// it - it is tens of instructions each. A kernel doing five of them per output
+// element is doing several hundred instructions of arithmetic to move four
+// bytes, and its cost stops having anything to do with the memory it touches.
+//
+// Every divisor in that arithmetic is a tensor extent: fixed for the whole
+// launch and known on the host. That is exactly the case a multiply-and-shift
+// replaces. The magic number below is Hacker's Delight's unsigned form, in the
+// variant that folds the correction into two shifts so nothing overflows 32
+// bits and no wider intermediate is needed.
+// --------------------------------------------------------------------------
+
+// The largest dividend the form below is exact for. Callers divide element
+// indices, so they check their extents against this and take the slower path
+// rather than a wrong answer if a tensor is somehow past it.
+#define GK_CU_FASTDIV_MAX 0x7fffffffu
+
+struct gk_cu_fastdiv {
+    uint32_t m;   // multiplier; zero when the divisor is one
+    uint32_t l;   // shift
+    uint32_t d;   // the divisor itself, for recovering the remainder
+};
+
+// Requires 1 <= d <= GK_CU_FASTDIV_MAX. A divisor past that would need a shift
+// of 32 and an intermediate of 2^64, which is the check the callers make.
+static __host__ __forceinline__ struct gk_cu_fastdiv gk_cu_fastdiv_make(uint32_t d) {
+    struct gk_cu_fastdiv f;
+
+    f.d = d;
+
+    if (d <= 1) {
+        f.m = 0;
+        f.l = 0;
+        return f;
+    }
+
+    uint32_t l = 0;
+    while (((uint32_t) 1 << l) < d) {
+        ++l;
+    }
+
+    f.m = (uint32_t) ((((uint64_t) 1 << (32 + l)) / d) - ((uint64_t) 1 << 32) + 1);
+    f.l = l;
+
+    return f;
+}
+
+static __device__ __forceinline__ uint32_t gk_cu_fastdiv_q(const struct gk_cu_fastdiv & f,
+                                                           uint32_t n) {
+    // A divisor of one is the common shape of a degenerate dimension, and the
+    // multiply-shift form has no magic number that reproduces it. The compare
+    // is uniform across the warp and costs nothing next to what it stands in
+    // for.
+    if (f.m == 0) {
+        return n;
+    }
+
+    const uint32_t t = __umulhi(f.m, n);
+
+    return (((n - t) >> 1) + t) >> (f.l - 1);
+}
+
+// Quotient and remainder together, which is what decomposing an index wants.
+static __device__ __forceinline__ uint32_t gk_cu_fastdiv_qr(const struct gk_cu_fastdiv & f,
+                                                            uint32_t n, uint32_t * rem) {
+    const uint32_t q = gk_cu_fastdiv_q(f, n);
+    *rem = n - q * f.d;
+    return q;
+}
+
+// --------------------------------------------------------------------------
 // scratch
 //
 // Device memory a kernel needs while it runs and not afterwards. Only the
