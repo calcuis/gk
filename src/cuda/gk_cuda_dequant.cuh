@@ -124,9 +124,25 @@ static __device__ __constant__ int8_t gk_cu_iq4_values[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 
-static __device__ __constant__ int8_t gk_cu_e2m1_values[16] = {
-    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
-};
+// The e2m1 codebook, as an immediate rather than a lookup.
+//
+// It was `__constant__`, and constant memory answers one address per cycle for
+// a warp: lanes asking for the same entry are broadcast together, lanes asking
+// for different ones are replayed one after another. A codebook index here is
+// the weight itself, so a warp asks for as many entries as it has distinct
+// codes - up to sixteen replays per lookup, in kernels that do tens of lookups
+// per thread per step. Measured on the nvfp4 tensor-core tile, removing it was
+// worth 1.6x.
+//
+// The eight magnitudes - 0, 1, 2, 3, 4, 6, 8, 12 - each fit in a nibble, so
+// the table is one 32-bit immediate and an entry is a shift and a mask. The
+// high bit of the code is the sign.
+#define GK_CU_E2M1_NIBBLES 0xC8643210u
+
+static __device__ __forceinline__ int gk_cu_e2m1_value(int code) {
+    const int mag = (int) ((GK_CU_E2M1_NIBBLES >> (4 * (code & 7))) & 0xf);
+    return (code & 8) ? -mag : mag;
+}
 
 static __device__ __constant__ uint8_t gk_cu_pow3[5] = { 1, 3, 9, 27, 81 };
 
@@ -317,7 +333,7 @@ static __device__ __forceinline__ float gk_cu_dq_mxfp4(const uint8_t * b, int j)
     const float d = gk_cu_e8m0_half(b[0]);
     const uint8_t * qs = b + 1;
     const int code = j < 16 ? (qs[j] & 0xf) : (qs[j - 16] >> 4);
-    return d * (float) gk_cu_e2m1_values[code];
+    return d * (float) gk_cu_e2m1_value(code);
 }
 
 static __device__ __forceinline__ float gk_cu_dq_nvfp4(const uint8_t * b, int j) {
@@ -327,7 +343,7 @@ static __device__ __forceinline__ float gk_cu_dq_nvfp4(const uint8_t * b, int j)
     const float d = gk_cu_ue4m3(b[sub]);
     const uint8_t * qs = b + 4 + sub * 8;
     const int code = jj < 8 ? (qs[jj] & 0xf) : (qs[jj - 8] >> 4);
-    return d * (float) gk_cu_e2m1_values[code];
+    return d * (float) gk_cu_e2m1_value(code);
 }
 
 static __device__ __forceinline__ float gk_cu_dq_q2_k(const uint8_t * b, int j) {

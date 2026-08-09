@@ -427,19 +427,42 @@ static __device__ __forceinline__ void gk_cu_mma_s8(int (&d)[4], const int (&a)[
 
 // Four consecutive codes of a packed nibble word, through the e2m1 codebook
 // and into four int8 lanes. `shift` picks the low or high nibble of each byte.
+// Four codes to four packed int8 values. `gk_cu_e2m1_value` is arithmetic
+// rather than a codebook read, which is what makes this affordable at the rate
+// the tile below calls it - thirty-two times per thread per k-step.
 static __device__ __forceinline__ int gk_cu_e2m1_quad(int w, int shift) {
     int out = 0;
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
         const int code = (w >> (8 * e + shift)) & 0xf;
-        out |= ((int) gk_cu_e2m1_values[code] & 0xff) << (8 * e);
+
+        out |= (gk_cu_e2m1_value(code) & 0xff) << (8 * e);
     }
     return out;
 }
 
-#define GK_CU_MMA_TILE_M 64   // four warps of sixteen rows
-#define GK_CU_MMA_TILE_N 64   // mma column tiles of eight
-#define GK_CU_MMA_NCT    (GK_CU_MMA_TILE_N / 8)
+// The block's four warps, as two by two rather than four by one.
+//
+// What that changes is how much shared memory the arithmetic reads per
+// instruction, which is what this kernel turned out to be spending itself on.
+// A warp that owns a single sixteen-row tile has to fetch a B fragment for
+// every mma it issues: the A fragment is reused across the column tiles, but
+// nothing reuses B. Measured against the f16 tile at the same shapes - which
+// gives a warp two row tiles - nvfp4 was reading 3.5 shared words per mma
+// where f16 read 1.5, and was 1.2x to 2.4x slower for it.
+//
+// Two row tiles per warp make each B fragment feed two instructions and each A
+// fragment four, without changing the block's 64x64 tile or how many blocks a
+// shape gets - which matters here, because these shapes are wide and short and
+// several of them only just fill the device as it is.
+#define GK_CU_MMA_TILE_M 64   // rows a block owns
+#define GK_CU_MMA_TILE_N 64   // columns a block owns
+#define GK_CU_MMA_WARPS_M 2
+#define GK_CU_MMA_WARPS_N 2
+#define GK_CU_MMA_WM     (GK_CU_MMA_TILE_M / GK_CU_MMA_WARPS_M)  // 32 rows a warp owns
+#define GK_CU_MMA_WN     (GK_CU_MMA_TILE_N / GK_CU_MMA_WARPS_N)  // 32 columns
+#define GK_CU_MMA_WMT    (GK_CU_MMA_WM / 16)                     // 2 mma row tiles
+#define GK_CU_MMA_WNT    (GK_CU_MMA_WN /  8)                     // 4 mma column tiles
 #define GK_CU_MMA_K      32   // one activation block; two mma windows of 16
 
 static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
@@ -458,6 +481,9 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
     const int group = lane / 4;
     const int tig   = lane % 4;
 
+    const int warp_m = warp / GK_CU_MMA_WARPS_N;
+    const int warp_n = warp % GK_CU_MMA_WARPS_N;
+
     const int64_t m0  = (int64_t) blockIdx.x * GK_CU_MMA_TILE_M;
     const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMA_TILE_N;
     const int64_t i23 = blockIdx.z;
@@ -473,22 +499,25 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
 
     const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
 
-    float acc[GK_CU_MMA_NCT][4];
+    float acc[GK_CU_MMA_WMT][GK_CU_MMA_WNT][4];
 #pragma unroll
-    for (int ct = 0; ct < GK_CU_MMA_NCT; ++ct) {
+    for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            acc[ct][i] = 0.0f;
+        for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
         }
     }
 
     for (int64_t g = 0; g < n_grp; ++g) {
         const int64_t kk0 = g * GK_CU_MMA_K;
 
-        // Staging: sixty-four threads take a weight row each, thirty-two take
-        // an activation column each.
+        // Staging: sixty-four threads take a weight row each, the other
+        // sixty-four an activation column each.
         if (threadIdx.x < GK_CU_MMA_TILE_M) {
-            const int     r = threadIdx.x;
+            const int     r = (int) threadIdx.x;
             const int64_t m = m0 + r;
 
             if (m < n_rows) {
@@ -542,31 +571,53 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
 
         __syncthreads();
 
+        // The activation scale belongs to the whole 32-element block, so it is
+        // the same for both mma windows below - read once per k-step rather
+        // than once per window, which is eight of the shared loads this loop
+        // used to make per window.
+        float adv[GK_CU_MMA_WNT][2];
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
+            const int c = warp_n * GK_CU_MMA_WN + ct * 8 + tig * 2;
+            adv[ct][0] = Ad[c + 0];
+            adv[ct][1] = Ad[c + 1];
+        }
+
         // Two mma windows, one per sub-scale. The accumulator is drained to
         // float between them because the scale it would be multiplied by
         // changes - which is the whole cost of this format on tensor cores.
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            int af[2];
-            af[0] = As[warp * 16 + group    ][h * 4 + tig];
-            af[1] = As[warp * 16 + group + 8][h * 4 + tig];
-
-            const float ws_lo = Ws[warp * 16 + group    ][h];
-            const float ws_hi = Ws[warp * 16 + group + 8][h];
+            int   af[GK_CU_MMA_WMT][2];
+            float ws[GK_CU_MMA_WMT][2];
 
 #pragma unroll
-            for (int ct = 0; ct < GK_CU_MMA_NCT; ++ct) {
-                int df[4] = { 0, 0, 0, 0 };
+            for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+                const int r_lo = warp_m * GK_CU_MMA_WM + wt * 16 + group;
 
-                gk_cu_mma_s8(df, af, Bs[ct * 8 + group][h * 4 + tig]);
+                af[wt][0] = As[r_lo    ][h * 4 + tig];
+                af[wt][1] = As[r_lo + 8][h * 4 + tig];
+                ws[wt][0] = Ws[r_lo    ][h];
+                ws[wt][1] = Ws[r_lo + 8][h];
+            }
 
-                const float ad0 = Ad[ct * 8 + tig * 2 + 0];
-                const float ad1 = Ad[ct * 8 + tig * 2 + 1];
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
+                // One B fragment, both row tiles - which is what giving a warp
+                // two of them buys.
+                const int bf = Bs[warp_n * GK_CU_MMA_WN + ct * 8 + group][h * 4 + tig];
 
-                acc[ct][0] += ws_lo * ad0 * (float) df[0];
-                acc[ct][1] += ws_lo * ad1 * (float) df[1];
-                acc[ct][2] += ws_hi * ad0 * (float) df[2];
-                acc[ct][3] += ws_hi * ad1 * (float) df[3];
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+                    int df[4] = { 0, 0, 0, 0 };
+
+                    gk_cu_mma_s8(df, af[wt], bf);
+
+                    acc[wt][ct][0] += ws[wt][0] * adv[ct][0] * (float) df[0];
+                    acc[wt][ct][1] += ws[wt][0] * adv[ct][1] * (float) df[1];
+                    acc[wt][ct][2] += ws[wt][1] * adv[ct][0] * (float) df[2];
+                    acc[wt][ct][3] += ws[wt][1] * adv[ct][1] * (float) df[3];
+                }
             }
         }
 
@@ -574,14 +625,19 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
     }
 
 #pragma unroll
-    for (int ct = 0; ct < GK_CU_MMA_NCT; ++ct) {
+    for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int64_t m = m0 + warp * 16 + group + (i >= 2 ? 8 : 0);
-            const int64_t n = n0 + ct * 8 + tig * 2 + (i & 1);
+        for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_MMA_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_MMA_WN + ct * 8
+                                + tig * 2 + (i & 1);
 
-            if (m < n_rows && n < n_cols) {
-                gk_cu_set(d, m, n, i2, i3, acc[ct][i]);
+                if (m < n_rows && n < n_cols) {
+                    gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                }
             }
         }
     }

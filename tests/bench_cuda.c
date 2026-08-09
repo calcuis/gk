@@ -301,6 +301,31 @@ static struct gk_tensor * b_pre_q4_K (struct gk_ctx * c) { return mul_mat_case(c
 static struct gk_tensor * b_pre_mxfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_MXFP4, N_EMBD, N_FF, N_PREFILL); }
 static struct gk_tensor * b_pre_nvfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, N_EMBD, N_FF, N_PREFILL); }
 
+// The six matmuls a SD 1.x UNet actually spends its time in, taken from a
+// profile of a generation rather than invented. They are not the shapes above:
+// a language model's are tall and narrow with a handful of columns, and these
+// are short and very wide - 4096 columns is one 64x64 latent's worth of pixels,
+// and k runs from 320 to 5120 as the UNet goes down its levels.
+//
+// Each is given twice, in nvfp4 and in f16. The f16 row is not a competitor, it
+// is the ceiling: same shape, same tile machinery, no weight decode, so the
+// difference between the pair is what the format costs and nothing else.
+#define SD_MM(name, k, rows, cols)                                                       \
+    static struct gk_tensor * b_sd_##name##_nv(struct gk_ctx * c) {                      \
+        return mul_mat_case(c, GK_TYPE_NVFP4, (k), (rows), (cols));                      \
+    }                                                                                    \
+    static struct gk_tensor * b_sd_##name##_f16(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_F16, (k), (rows), (cols));                        \
+    }
+
+SD_MM(l1_attn,  320, 320,  4096)   // 64x64 level, attention projection
+SD_MM(l1_ff,    320, 2560, 4096)   // 64x64 level, feed-forward in
+SD_MM(l1_out,  1280, 320,  4096)   // 64x64 level, feed-forward out
+SD_MM(l2_attn,  640, 640,  1024)   // 32x32 level
+SD_MM(l2_ff,    640, 5120, 1024)
+SD_MM(l3_ff,   1280, 10240, 256)   // 16x16 level, the widest rows
+SD_MM(l3_out,  5120, 1280,  256)
+
 static struct gk_tensor * b_mm_gate_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0, N_EMBD, N_FF,    N_PREFILL); }
 static struct gk_tensor * b_mm_down_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_1, N_FF,   N_EMBD,  N_PREFILL); }
 static struct gk_tensor * b_mm_f16_pre (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,  N_EMBD, N_FF,    N_PREFILL); }
@@ -632,6 +657,22 @@ static const struct bench_case g_cases[] = {
     { NULL,            "q4_K",              " 5.3 MB",       b_pre_q4_K,  ARENA_MID },
     { NULL,            "mxfp4",             " 5.0 MB",       b_pre_mxfp4, ARENA_MID },
     { NULL,            "nvfp4",             " 5.0 MB",       b_pre_nvfp4, ARENA_MID },
+
+    { "SD UNet matmuls (nvfp4 against its f16 ceiling)",
+                       "l1 attn  nvfp4", "320x320 n=4096",    b_sd_l1_attn_nv,  ARENA_MID },
+    { NULL,            "l1 attn  f16",   "320x320 n=4096",    b_sd_l1_attn_f16, ARENA_MID },
+    { NULL,            "l1 ff    nvfp4", "320x2560 n=4096",   b_sd_l1_ff_nv,    ARENA_BIG },
+    { NULL,            "l1 ff    f16",   "320x2560 n=4096",   b_sd_l1_ff_f16,   ARENA_BIG },
+    { NULL,            "l1 out   nvfp4", "1280x320 n=4096",   b_sd_l1_out_nv,   ARENA_MID },
+    { NULL,            "l1 out   f16",   "1280x320 n=4096",   b_sd_l1_out_f16,  ARENA_MID },
+    { NULL,            "l2 attn  nvfp4", "640x640 n=1024",    b_sd_l2_attn_nv,  ARENA_MID },
+    { NULL,            "l2 attn  f16",   "640x640 n=1024",    b_sd_l2_attn_f16, ARENA_MID },
+    { NULL,            "l2 ff    nvfp4", "640x5120 n=1024",   b_sd_l2_ff_nv,    ARENA_BIG },
+    { NULL,            "l2 ff    f16",   "640x5120 n=1024",   b_sd_l2_ff_f16,   ARENA_BIG },
+    { NULL,            "l3 ff    nvfp4", "1280x10240 n=256",  b_sd_l3_ff_nv,    ARENA_BIG },
+    { NULL,            "l3 ff    f16",   "1280x10240 n=256",  b_sd_l3_ff_f16,   ARENA_BIG },
+    { NULL,            "l3 out   nvfp4", "5120x1280 n=256",   b_sd_l3_out_nv,   ARENA_BIG },
+    { NULL,            "l3 out   f16",   "5120x1280 n=256",   b_sd_l3_out_f16,  ARENA_BIG },
 
     { "matmul (prefill, 512 columns)", "ffn_gate/up q4_0", "1536x6144",   b_mm_gate_pre,  ARENA_MID   },
     { NULL,                            "ffn_down    q4_1", "6144x1536",   b_mm_down_pre,  ARENA_MID   },
