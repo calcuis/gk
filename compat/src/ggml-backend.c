@@ -460,12 +460,22 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
 // because the engine enumerates through one.
 // ---------------------------------------------------------------------------
 
-#define GGML_COMPAT_MAX_REGS 8
+#define GGML_COMPAT_MAX_REGS     8
+#define GGML_COMPAT_MAX_FEATURES 32
 
 struct ggml_compat_reg {
     const char * name;
     int          devices[64];
     int          n_devices;
+
+    // ggml asks a *registry* for features while gk answers per device, so this
+    // is the first device of the backend speaking for all of them. For CPU -
+    // the only reg anything actually asks - there is exactly one device, and
+    // for a multi-GPU reg the entries that differ per card (compute
+    // capability) are the ones a caller should be reading off the device
+    // instead.
+    struct ggml_backend_feature features[GGML_COMPAT_MAX_FEATURES + 1];
+    bool                        features_built;
 };
 
 static struct ggml_compat_reg g_regs[GGML_COMPAT_MAX_REGS];
@@ -534,6 +544,30 @@ ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
 
 static void ggml_compat_set_n_threads(ggml_backend_t backend, int n_threads);
 
+// The two structs have the same shape, but they are copied rather than cast:
+// the array is what the caller walks, and a cast would tie the layout of a
+// public gk type to the layout of a public ggml one for no gain.
+static struct ggml_backend_feature * ggml_compat_get_features(ggml_backend_reg_t reg) {
+    struct ggml_compat_reg * r = (struct ggml_compat_reg *) reg;
+
+    if (!r->features_built) {
+        r->features_built = true;
+
+        int n = 0;
+        if (r->n_devices > 0) {
+            const struct gk_feature * src = gk_device_features(gk_device_get(r->devices[0]));
+            for (; src->name != NULL && n < GGML_COMPAT_MAX_FEATURES; ++src, ++n) {
+                r->features[n].name  = src->name;
+                r->features[n].value = src->value;
+            }
+        }
+        r->features[n].name  = NULL;
+        r->features[n].value = NULL;
+    }
+
+    return r->features;
+}
+
 void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     // The thread count is the CPU backend's alone; a device backend has no
     // pool to resize, and returning the setter for one would have the engine
@@ -543,8 +577,12 @@ void * ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * na
         return (void *) ggml_compat_set_n_threads;
     }
 
-    // Split buffers, extra buffer types and feature lists have no gk
-    // equivalent yet; every caller handles NULL.
+    if (strcmp(name, "ggml_backend_get_features") == 0) {
+        return (void *) ggml_compat_get_features;
+    }
+
+    // Split buffers and extra buffer types have no gk equivalent yet; every
+    // caller handles NULL.
     return NULL;
 }
 

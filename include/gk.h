@@ -1166,6 +1166,23 @@ GK_API const char *        gk_device_backend    (gk_device_t dev); // "CUDA", "R
 GK_API enum gk_device_type gk_device_type_of    (gk_device_t dev);
 GK_API void                gk_device_memory     (gk_device_t dev, size_t * free, size_t * total);
 
+// What this build chose for this device, rather than what the caller asked
+// for: which vector instruction set the CPU kernels were compiled against,
+// which compute capabilities a CUDA build carries code for. The values are
+// strings because the set differs per backend and the consumer is a human
+// reading a startup banner - a caller that needs a number should ask the
+// specific question instead of parsing these.
+//
+// The list is terminated by an entry whose name is NULL, and the function
+// never returns NULL: a device with nothing to report returns an empty list.
+// Both the array and the strings in it are static and outlive any caller.
+struct gk_feature {
+    const char * name;
+    const char * value;
+};
+
+GK_API const struct gk_feature * gk_device_features(gk_device_t dev);
+
 GK_API gk_backend_t             gk_device_init_backend    (gk_device_t dev);
 GK_API gk_backend_buffer_type_t gk_device_buffer_type     (gk_device_t dev);
 
