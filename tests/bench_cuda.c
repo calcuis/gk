@@ -326,6 +326,32 @@ SD_MM(l2_ff,    640, 5120, 1024)
 SD_MM(l3_ff,   1280, 10240, 256)   // 16x16 level, the widest rows
 SD_MM(l3_out,  5120, 1280,  256)
 
+// The three matmuls a MageFlow DiT step is made of, read off a profile of an
+// actual generation rather than invented: 2048 tokens is a 512x512 latent, the
+// hidden width is 3072 and the feed-forward opens to 12288. Between them they
+// are 79% of a denoising step, so what these rows say about nvfp4 is very
+// nearly what the whole engine's diffusion speed is.
+//
+// Each shape is given three ways. nvfp4 is the one that runs; f16 is the same
+// shape with no weight decode at all, so it is the ceiling the format is being
+// measured against; q4_K is the control that matters most, because it is a
+// decoded format like nvfp4 but takes a different kernel - if q4_K is fast and
+// nvfp4 is slow at one shape, the shape is not the problem.
+#define DIT_MM(name, k, rows)                                                            \
+    static struct gk_tensor * b_dit_##name##_nv (struct gk_ctx * c) {                    \
+        return mul_mat_case(c, GK_TYPE_NVFP4, (k), (rows), 2048);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_dit_##name##_f16(struct gk_ctx * c) {                    \
+        return mul_mat_case(c, GK_TYPE_F16,   (k), (rows), 2048);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_dit_##name##_q4k(struct gk_ctx * c) {                    \
+        return mul_mat_case(c, GK_TYPE_Q4_K,  (k), (rows), 2048);                        \
+    }
+
+DIT_MM(proj,  3072,  3072)   // attention qkv / out projection - 48 per step
+DIT_MM(ffup,  3072, 12288)   // feed-forward in  - 12 per step
+DIT_MM(ffdn, 12288,  3072)   // feed-forward out - 12 per step
+
 static struct gk_tensor * b_mm_gate_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0, N_EMBD, N_FF,    N_PREFILL); }
 static struct gk_tensor * b_mm_down_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_1, N_FF,   N_EMBD,  N_PREFILL); }
 static struct gk_tensor * b_mm_f16_pre (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,  N_EMBD, N_FF,    N_PREFILL); }
@@ -674,6 +700,17 @@ static const struct bench_case g_cases[] = {
     { NULL,            "l3 out   nvfp4", "5120x1280 n=256",   b_sd_l3_out_nv,   ARENA_BIG },
     { NULL,            "l3 out   f16",   "5120x1280 n=256",   b_sd_l3_out_f16,  ARENA_BIG },
 
+    { "MageFlow DiT matmuls (nvfp4, against f16 and q4_K at the same shape)",
+                       "attn proj nvfp4", "3072x3072 n=2048",   b_dit_proj_nv,  ARENA_BIG },
+    { NULL,            "attn proj f16",   "3072x3072 n=2048",   b_dit_proj_f16, ARENA_BIG },
+    { NULL,            "attn proj q4_K",  "3072x3072 n=2048",   b_dit_proj_q4k, ARENA_BIG },
+    { NULL,            "ff up     nvfp4", "3072x12288 n=2048",  b_dit_ffup_nv,  ARENA_BIG },
+    { NULL,            "ff up     f16",   "3072x12288 n=2048",  b_dit_ffup_f16, ARENA_BIG },
+    { NULL,            "ff up     q4_K",  "3072x12288 n=2048",  b_dit_ffup_q4k, ARENA_BIG },
+    { NULL,            "ff down   nvfp4", "12288x3072 n=2048",  b_dit_ffdn_nv,  ARENA_BIG },
+    { NULL,            "ff down   f16",   "12288x3072 n=2048",  b_dit_ffdn_f16, ARENA_BIG },
+    { NULL,            "ff down   q4_K",  "12288x3072 n=2048",  b_dit_ffdn_q4k, ARENA_BIG },
+
     { "matmul (prefill, 512 columns)", "ffn_gate/up q4_0", "1536x6144",   b_mm_gate_pre,  ARENA_MID   },
     { NULL,                            "ffn_down    q4_1", "6144x1536",   b_mm_down_pre,  ARENA_MID   },
     { NULL,                            "ffn_gate    f16",  "1536x6144",   b_mm_f16_pre,   ARENA_MID   },
@@ -798,6 +835,47 @@ static struct run_result run_case(const struct bench_case * bc, gk_backend_t bac
     // and the CPU pass pays for its threads starting.
     if (gk_backend_graph_compute(backend, graph) != GK_STATUS_SUCCESS) {
         fprintf(stderr, "  %s: graph execution failed\n", bc->name);
+        gk_gallocr_free(alloc);
+        gk_free(ctx);
+        return res;
+    }
+
+    // GK_BENCH_COLD: time single passes with the cache evicted between them.
+    //
+    // The loop below queues a graph back to back and divides, which is the
+    // right way to time a kernel and the wrong way to predict one. A model
+    // runs each of its matmuls once against weights nothing has touched; this
+    // harness runs one matmul many times against weights that after the first
+    // pass are sitting in L2. Where a kernel's cost is its arithmetic the two
+    // agree. Where it is its memory traffic they can differ by more than an
+    // order of magnitude, and it is exactly then that the harness is most
+    // confidently wrong - so the eviction is available on demand.
+    if (is_gpu && getenv("GK_BENCH_COLD") != NULL) {
+        const size_t flush_bytes = (size_t) 128u << 20;   // comfortably past L2
+        void *       flush       = NULL;
+
+        gk_backend_buffer_t fb = gk_backend_buft_alloc_buffer(
+            gk_backend_get_default_buffer_type(backend), flush_bytes);
+
+        double total = 0.0;
+        const int cold_iters = 5;
+
+        for (int i = 0; i < cold_iters; ++i) {
+            if (fb != NULL) {
+                gk_backend_buffer_clear(fb, (uint8_t) (i + 1));
+                gk_backend_synchronize(backend);
+            }
+            const double c0 = now_sec();
+            gk_backend_graph_compute(backend, graph);
+            total += now_sec() - c0;
+        }
+
+        if (fb != NULL) {
+            gk_backend_buffer_free(fb);
+        }
+        (void) flush;
+
+        res.seconds = total / cold_iters;
         gk_gallocr_free(alloc);
         gk_free(ctx);
         return res;

@@ -62,6 +62,13 @@ bool gk_cuda_supports_op(const struct gk_tensor * op);
 // here with a performance story worth separating out.
 void gk_cuda_mul_mat   (gkStream_t stream, struct gk_cuda_scratch * scratch,
                         struct gk_tensor * dst);
+
+// Which of gk_cuda_mul_mat's kernels the last call picked. A shape and a rate
+// say a matmul was slow; they do not say whether the fast path declined it, and
+// every one of those paths can decline silently - a type it does not cover, a
+// scratch allocation that failed, a tile too wide for the output. The profile
+// keys on this so the two questions are answered by one row.
+const char * gk_cuda_mm_last_path(void);
 void gk_cuda_mul_mat_id(gkStream_t stream, struct gk_tensor * dst);
 void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         struct gk_tensor * dst);

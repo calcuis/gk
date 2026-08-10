@@ -429,22 +429,33 @@ static int gk_cu_prof_cmp(const void * a, const void * b) {
     return x < y ? 1 : (x > y ? -1 : 0);
 }
 
+struct gk_cu_scratch_stats g_gk_scratch_stats;
+
 static void gk_cu_prof_dump(void) {
     if (g_prof_n == 0) {
         return;
     }
 
+    extern double g_gk_mm_quant_ms;
+    extern double g_gk_mm_tile_ms;
+    gk_logf("\ngk cuda nvfp4 mma: %.1f ms quantizing activations, %.1f ms in the tile\n",
+            g_gk_mm_quant_ms, g_gk_mm_tile_ms);
+
+    gk_logf("\ngk cuda scratch: %lld calls, %lld grows (%lld failed), %.1f ms in the grow path\n",
+            (long long) g_gk_scratch_stats.calls, (long long) g_gk_scratch_stats.grows,
+            (long long) g_gk_scratch_stats.fails, g_gk_scratch_stats.grow_ms);
+
     qsort(g_prof, (size_t) g_prof_n, sizeof(g_prof[0]), gk_cu_prof_cmp);
 
     gk_logf("\ngk cuda profile: %.1f ms over %d distinct shapes\n", g_prof_total, g_prof_n);
-    gk_logf("  %-52s %10s %7s %8s %10s\n", "op / shape", "ms", "%", "calls", "GFLOP/s");
+    gk_logf("  %-62s %10s %7s %8s %10s\n", "op / shape", "ms", "%", "calls", "GFLOP/s");
 
     for (int i = 0; i < g_prof_n; ++i) {
         char rate[16] = "-";
         if (g_prof[i].flops > 0.0 && g_prof[i].ms > 0.0) {
             snprintf(rate, sizeof(rate), "%.0f", g_prof[i].flops * 2.0 / (g_prof[i].ms * 1e6));
         }
-        gk_logf("  %-52s %10.2f %6.1f%% %8lld %10s\n",
+        gk_logf("  %-62s %10.2f %6.1f%% %8lld %10s\n",
                 g_prof[i].key, g_prof[i].ms,
                 100.0 * g_prof[i].ms / g_prof_total,
                 (long long) g_prof[i].calls, rate);
@@ -488,9 +499,10 @@ static void gk_cu_prof_key(const struct gk_tensor * node, char * out, size_t out
             const int64_t k = a->ne[0];
             const int64_t m = node->ne[0];
             const int64_t n = node->ne[1] * node->ne[2] * node->ne[3];
-            snprintf(out, out_size, "%s %-6s %lldx%lldx%lld",
+            snprintf(out, out_size, "%s %-6s %lldx%lldx%lld [%s]",
                      gk_op_name(node->op), gk_type_name(a->type),
-                     (long long) m, (long long) n, (long long) k);
+                     (long long) m, (long long) n, (long long) k,
+                     node->op == GK_OP_MUL_MAT ? gk_cuda_mm_last_path() : "-");
             *flops = (double) m * (double) n * (double) k;
             GK_UNUSED(b);
             break;

@@ -17,6 +17,8 @@
 
 #include <stdio.h>
 
+#include <chrono>
+
 // --------------------------------------------------------------------------
 // error handling
 //
@@ -348,11 +350,31 @@ struct gk_cuda_scratch {
 // Returns a buffer of at least `bytes`, or NULL if the device has no room.
 // The stream is needed because a grow frees the old buffer, and work already
 // queued may still be reading it.
+// What the grow path has cost so far. The comment above claims growth is rare;
+// these are here so that claim is checked rather than assumed, because the two
+// ways it can be wrong - a size that oscillates, or an allocation that fails and
+// leaves the buffer empty for the next caller to allocate again - both turn a
+// once-per-model cost into a per-node one, and neither is visible in a profile
+// that attributes the time to whichever kernel happened to ask.
+struct gk_cu_scratch_stats {
+    int64_t calls;
+    int64_t grows;
+    int64_t fails;
+    double  grow_ms;
+};
+
+extern struct gk_cu_scratch_stats g_gk_scratch_stats;
+
 static __host__ __forceinline__ void * gk_cu_scratch_get(struct gk_cuda_scratch * s,
                                                          size_t bytes, gkStream_t stream) {
+    g_gk_scratch_stats.calls++;
+
     if (s->ptr != NULL && s->size >= bytes) {
         return s->ptr;
     }
+
+    g_gk_scratch_stats.grows++;
+    const std::chrono::steady_clock::time_point t_grow0 = std::chrono::steady_clock::now();
 
     if (s->ptr != NULL) {
         // The queued work that was using the old buffer has to finish before
@@ -366,11 +388,17 @@ static __host__ __forceinline__ void * gk_cu_scratch_get(struct gk_cuda_scratch 
 
     void * p = NULL;
     if (gkMalloc(&p, bytes) != gkSuccess) {
+        g_gk_scratch_stats.fails++;
+        g_gk_scratch_stats.grow_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_grow0).count();
         return NULL;
     }
 
     s->ptr  = p;
     s->size = bytes;
+
+    g_gk_scratch_stats.grow_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_grow0).count();
     return p;
 }
 

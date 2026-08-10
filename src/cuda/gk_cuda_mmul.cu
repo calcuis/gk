@@ -22,6 +22,8 @@
 
 #include "gk_cuda_ops.cuh"
 
+#include <chrono>
+
 #include <float.h>
 
 #define GK_CU_MM_BLOCK 128
@@ -1336,6 +1338,36 @@ static __global__ void gk_cu_k_mul_mat_tiled(gk_tview a, gk_tview b, gk_tview_mu
     }
 }
 
+// The kernel the last gk_cuda_mul_mat picked. Set on the way into each launch
+// rather than derived afterwards from the shape, because the conditions that
+// send a shape down a slower path - a failed scratch allocation, a tile that
+// would leave the device half idle - are not visible in the shape at all.
+static const char * g_gk_mm_path = "-";
+
+double g_gk_mm_quant_ms = 0.0;
+double g_gk_mm_tile_ms  = 0.0;
+
+// Both diagnostics below are off in every run that is not being investigated,
+// so the environment is read once rather than once per matmul.
+static bool gk_cu_env_on(const char * name) {
+    const char * e = getenv(name);
+    return e != NULL && e[0] != '0';
+}
+
+static bool gk_cu_mm_dump_on(void) {
+    static const bool on = gk_cu_env_on("GK_MM_DUMP");
+    return on;
+}
+
+static bool gk_cu_mm_split_on(void) {
+    static const bool on = gk_cu_env_on("GK_MM_SPLIT");
+    return on;
+}
+
+const char * gk_cuda_mm_last_path(void) {
+    return g_gk_mm_path;
+}
+
 void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                      struct gk_tensor * dst) {
     const struct gk_tensor * src0 = dst->src[0];
@@ -1346,6 +1378,41 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
     const int64_t r3    = src1->ne[3] / src0->ne[3];
 
     const int n_warps = GK_CU_MM_BLOCK / GK_WARP_SIZE;
+
+    // GK_MM_DUMP: the operand geometry behind each distinct matmul shape, once
+    // per shape. A shape alone does not say whether an operand is contiguous,
+    // how it is strided, or how it broadcasts, and those are exactly the things
+    // that separate a matmul that runs at the rate a microbenchmark says it
+    // should from the same shape in a real graph.
+    if (gk_cu_mm_dump_on()) {
+        static char seen[64][128];
+        static int  n_seen = 0;
+
+        char key[128];
+        snprintf(key, sizeof(key), "%s %lldx%lldx%lld",
+                 gk_type_name(src0->type), (long long) dst->ne[0],
+                 (long long) dst->ne[1], (long long) k_len);
+
+        bool dup = false;
+        for (int i = 0; i < n_seen; ++i) {
+            if (strcmp(seen[i], key) == 0) { dup = true; break; }
+        }
+
+        if (!dup && n_seen < 64) {
+            snprintf(seen[n_seen++], sizeof(seen[0]), "%s", key);
+            gk_logf("mm %-28s\n", key);
+            const struct gk_tensor * ts[3] = { src0, src1, dst };
+            const char * nm[3] = { "src0", "src1", "dst " };
+            for (int t = 0; t < 3; ++t) {
+                gk_logf("   %s %-6s ne=[%lld %lld %lld %lld] nb=[%zu %zu %zu %zu] cont=%d\n",
+                        nm[t], gk_type_name(ts[t]->type),
+                        (long long) ts[t]->ne[0], (long long) ts[t]->ne[1],
+                        (long long) ts[t]->ne[2], (long long) ts[t]->ne[3],
+                        ts[t]->nb[0], ts[t]->nb[1], ts[t]->nb[2], ts[t]->nb[3],
+                        (int) gk_is_contiguous(ts[t]));
+            }
+        }
+    }
 
     // Enough columns for a tile to be mostly real work: reuse across the tile
     // beats splitting k across the block, by a wide margin on a batch.
@@ -1365,17 +1432,42 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 scratch, (size_t) n_blk * sizeof(gk_cu_q8blk), stream);
 
             if (aq != NULL) {
+                // GK_MM_SPLIT: the quantize pass and the tile timed apart.
+                // A profile attributes both launches to the node, and the two
+                // have entirely different cures, so a number that mixes them
+                // cannot be acted on.
+                const bool split = gk_cu_mm_split_on();
+                if (split) { GK_CUDA_CHECK(gkStreamSynchronize(stream)); }
+                const std::chrono::steady_clock::time_point q0 =
+                    std::chrono::steady_clock::now();
+
                 gk_cu_k_quantize_act<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
                                        GK_CUDA_BLOCK, 0, stream>>>(
                     gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
+
+                if (split) {
+                    GK_CUDA_CHECK(gkStreamSynchronize(stream));
+                    g_gk_mm_quant_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - q0).count();
+                }
 
                 dim3 mgrid;
                 mgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMA_TILE_M - 1) / GK_CU_MMA_TILE_M);
                 mgrid.y = (unsigned) ((n_cols     + GK_CU_MMA_TILE_N - 1) / GK_CU_MMA_TILE_N);
                 mgrid.z = (unsigned) n_23;
 
+                g_gk_mm_path = "mma-nvfp4";
+                const std::chrono::steady_clock::time_point m0 =
+                    std::chrono::steady_clock::now();
+
                 gk_cu_k_mul_mat_mma_nvfp4<<<mgrid, 128, 0, stream>>>(
                     gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+
+                if (split) {
+                    GK_CUDA_CHECK(gkStreamSynchronize(stream));
+                    g_gk_mm_tile_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - m0).count();
+                }
                 return;
             }
         }
@@ -1462,6 +1554,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 fgrid.y = (unsigned) grid_n;
                 fgrid.z = (unsigned) (n_23 * n_splits);
 
+                g_gk_mm_path = "mma-f16";
                 if (warps_m == 4) {
                     gk_cu_k_mul_mat_mma_f16<4><<<fgrid, 4 * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE, 0, stream>>>(
                         gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst),
@@ -1511,6 +1604,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_cu_k_mul_mat_tiled_q8<T><<<qgrid, dim3(16, 16), 0, stream>>>( \
                     gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
 
+                g_gk_mm_path = "tile-q8";
                 GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_TILED_Q8);
 #undef GK_CU_LAUNCH_TILED_Q8
                 return;
@@ -1526,6 +1620,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         gk_cu_k_mul_mat_tiled<T><<<tgrid, dim3(16, 16), 0, stream>>>(      \
             gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
 
+        g_gk_mm_path = "tile-f32";
         GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_TILED);
 #undef GK_CU_LAUNCH_TILED
         return;
@@ -1562,6 +1657,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_cu_k_mul_mat_q8<1, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
                     gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
 
+                g_gk_mm_path = "mv-q8";
                 GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8_1);
 #undef GK_CU_LAUNCH_Q8_1
             } else {
@@ -1571,6 +1667,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_cu_k_mul_mat_q8<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
                     gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
 
+                g_gk_mm_path = "mv-q8";
                 GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8_N);
 #undef GK_CU_LAUNCH_Q8_N
             }
@@ -1588,6 +1685,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         gk_cu_k_mul_mat<1, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>(            \
             gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
 
+        g_gk_mm_path = "mv-f32";
         GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MV1);
 #undef GK_CU_LAUNCH_MV1
     } else {
@@ -1597,6 +1695,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         gk_cu_k_mul_mat<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>(  \
             gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst), k_len, r2, r3)
 
+        g_gk_mm_path = "mv-f32";
         GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MVN);
 #undef GK_CU_LAUNCH_MVN
     }
