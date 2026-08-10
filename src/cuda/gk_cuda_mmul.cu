@@ -427,6 +427,53 @@ static __device__ __forceinline__ void gk_cu_mma_s8(int (&d)[4], const int (&a)[
 #endif
 }
 
+// D += A*B, for a 16x8 tile of s32 over *thirty-two* of k, warp-wide.
+//
+// The wider window costs nothing to reach from the narrow one: its fragments
+// are exactly two of the k16 fragments side by side. With the same `group` and
+// `tig`, a thread holds A rows `group`/`group+8` at columns `4*tig..+3` and at
+// those columns again sixteen further along, and B column `group` at the
+// matching pairs of rows. D is unchanged - still rows `group`/`group+8`,
+// columns `2*tig` and `2*tig+1`.
+//
+// What it is for is the drain. An integer accumulator has to be emptied to
+// float whenever the scale it would be multiplied by changes, and that is the
+// dominant cost of a quantized tensor-core tile - so a format whose scale
+// covers thirty-two elements should pay it once over thirty-two, not twice
+// over sixteen. nvfp4 cannot: its sub-scale changes every sixteen. Every
+// format in `gk_cu_has_dp4a` can.
+static __device__ __forceinline__ void gk_cu_mma_s8_k32(int (&d)[4], const int (&a)[4],
+                                                        const int (&b)[2]) {
+#if defined(GK_CU_HAVE_MMA)
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    (void) a; (void) b; (void) d;
+#endif
+}
+
+// Whether the integer tile above can run on tensor cores on this device.
+//
+// Keyed on `GK_CU_HAVE_MMA` rather than on the compute capability alone,
+// because that macro is also what decides whether `gk_cu_mma_s8_k32` compiles
+// to an instruction or to nothing: on a target without it the kernel would
+// still launch and would still write, but it would write zeros. Host and
+// device have to agree, so they read the same macro. (During host compilation
+// `__CUDA_ARCH__` is undefined, so this is exactly "not HIP"; the runtime
+// check below is what covers a pre-Ampere part in a build that has the
+// instruction.)
+static __host__ __forceinline__ bool gk_cuda_mm_mma_q8_available(
+        const struct gk_cuda_scratch * scratch) {
+#if defined(GK_CU_HAVE_MMA)
+    return scratch != NULL && scratch->cc >= 80;
+#else
+    (void) scratch;
+    return false;
+#endif
+}
+
 // Four consecutive codes of a packed nibble word, through the e2m1 codebook
 // and into four int8 lanes. `shift` picks the low or high nibble of each byte.
 // Four codes to four packed int8 values. `gk_cu_e2m1_value` is arithmetic
@@ -1234,6 +1281,250 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The same integer dot, on tensor cores.
+//
+// This is the kernel above with `__dp4a` replaced by `mma.sync`, and it is the
+// path every k-quant matmul in a diffusion model takes. The one above stays
+// for the parts and shapes this declines.
+//
+// The two kernels agree on everything that is not the multiply, which is what
+// made this cheap to write and is worth stating because it is also what makes
+// it cheap to verify:
+//
+//   * the activation side is byte-identical - the same `gk_cu_k_quantize_act`
+//     pass into the same `gk_cu_q8blk` scratch, the same `n_grp = k/32`.
+//   * `gk_cu_wblk32<ATYPE>` already hands back exactly the fragment a tensor
+//     core wants. Its contract is that `codes[i]` holds elements `4i..4i+3` in
+//     natural order, and the `m16n8k32` A fragment wants columns
+//     `4*tig..+3` and those columns again sixteen on - which is `codes[tig]`
+//     and `codes[4 + tig]`. No repacking, no transpose, no swizzle.
+//   * the epilogue is the same identity the float path documents: a value is
+//     `scale*code + offset`, so a group contributes
+//     `a.d * (scale * sum_j code_j*c_j + offset * sum_j c_j)`.
+//
+// That last term is the whole difference from the nvfp4 pilot, which had no
+// zero point and so needed nothing from the activation block but its codes and
+// scale. Here `offset * sum_j c_j` is the q4_1/q4_K minimum, and both halves of
+// it are already computed and already staged: `Woff` from `gk_cu_wblk32`, and
+// the code sum in `gk_cu_q8blk::s`.
+//
+// The other difference from the pilot is the drain. nvfp4's sub-scale changes
+// every sixteen elements, so it runs two `m16n8k16` windows and converts the
+// accumulator to float between them. A k-quant's scale covers the whole
+// thirty-two, so one `m16n8k32` spans a group and the accumulator is drained
+// once per group instead of twice - halving what the pilot's own notes call
+// the whole cost of the format on tensor cores.
+//
+// ## The tile is 128x128, and that matters more than the instruction
+//
+// Swapping `__dp4a` for `mma.sync` at the dp4a tile's 64x64 was worth 16%.
+// That is the measurement that says what this kernel is actually bound by, so
+// it is worth writing down rather than rediscovering: at 64x64 and these
+// shapes the weight matrix is re-read `n/64` times per GEMM and the
+// activations `m/64` times, which for 28672x8742x5376 is 137 and 448 passes
+// respectively - 38 GB of traffic for a matmul whose operands are 140 MB. It
+// ran at 1.22 TB/s of a 1.79 TB/s part. **The tile was memory bound, and no
+// choice of multiply can help a kernel that is waiting for operands.**
+//
+// Doubling the tile in both directions halves both multipliers. It also
+// happens to keep the staging trivial: 128 rows and 128 columns against a
+// 256-thread block is still one thread per row and one per column, so this
+// needs no strided staging loop - the thing that made the same change look
+// expensive when it was contemplated for the nvfp4 pilot at 128 threads.
+// --------------------------------------------------------------------------
+
+#define GK_CU_MMAQ_TILE_M  128   // rows a block owns
+#define GK_CU_MMAQ_TILE_N  128   // columns a block owns
+#define GK_CU_MMAQ_WARPS_M 4
+#define GK_CU_MMAQ_WARPS_N 2
+#define GK_CU_MMAQ_WM      (GK_CU_MMAQ_TILE_M / GK_CU_MMAQ_WARPS_M)  // 32 rows a warp owns
+#define GK_CU_MMAQ_WN      (GK_CU_MMAQ_TILE_N / GK_CU_MMAQ_WARPS_N)  // 64 columns
+#define GK_CU_MMAQ_WMT     (GK_CU_MMAQ_WM / 16)                      // 2 mma row tiles
+#define GK_CU_MMAQ_WNT     (GK_CU_MMAQ_WN /  8)                      // 8 mma column tiles
+#define GK_CU_MMAQ_THREADS (GK_CU_MMAQ_WARPS_M * GK_CU_MMAQ_WARPS_N * GK_WARP_SIZE)
+
+template <int ATYPE>
+static __global__ __launch_bounds__(GK_CU_MMAQ_THREADS, 1)
+void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
+                            const gk_cu_q8blk * aq, int64_t n_grp,
+                            int64_t r2, int64_t r3) {
+    // Same staging as the nvfp4 tile: ints rather than bytes, so a fragment
+    // read is a plain aligned load of the word a lane already wants.
+    __shared__ int   As[GK_CU_MMAQ_TILE_M][8];
+    __shared__ int   Bs[GK_CU_MMAQ_TILE_N][8];
+    __shared__ float Wsc[GK_CU_MMAQ_TILE_M];
+    __shared__ float Wof[GK_CU_MMAQ_TILE_M];
+    __shared__ float Ad [GK_CU_MMAQ_TILE_N];
+    // The activation scale times its code sum. The offset term needs the two
+    // only as a product, and folding them here turns a multiply per output per
+    // group into one per column per group.
+    __shared__ float Ads[GK_CU_MMAQ_TILE_N];
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int warp_m = warp / GK_CU_MMAQ_WARPS_N;
+    const int warp_n = warp % GK_CU_MMAQ_WARPS_N;
+
+    const int64_t m0  = (int64_t) blockIdx.x * GK_CU_MMAQ_TILE_M;
+    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMAQ_TILE_N;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
+
+    float acc[GK_CU_MMAQ_WMT][GK_CU_MMAQ_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    for (int64_t g = 0; g < n_grp; ++g) {
+        // Sixty-four threads take a weight row each, the other sixty-four an
+        // activation column each. A row or column past the end stages zeros,
+        // so the arithmetic below needs no bounds test.
+        if (threadIdx.x < GK_CU_MMAQ_TILE_M) {
+            const int     r = (int) threadIdx.x;
+            const int64_t m = m0 + r;
+
+            int   codes[8];
+            float sc = 0.0f, off = 0.0f;
+
+            if (m < n_rows) {
+                gk_cu_wblk32<ATYPE>((const uint8_t *) gk_cu_row(a, m, a2, a3),
+                                    g, codes, sc, off);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    codes[i] = 0;
+                }
+            }
+
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                As[r][i] = codes[i];
+            }
+            Wsc[r] = sc;
+            Wof[r] = off;
+        } else if (threadIdx.x < GK_CU_MMAQ_TILE_M + GK_CU_MMAQ_TILE_N) {
+            const int     c = (int) threadIdx.x - GK_CU_MMAQ_TILE_M;
+            const int64_t n = n0 + c;
+
+            if (n < n_cols) {
+                const gk_cu_q8blk & ab = aq23[n * n_grp + g];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    Bs[c][i] = ab.q[i];
+                }
+                Ad [c] = ab.d;
+                Ads[c] = ab.d * ab.s;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    Bs[c][i] = 0;
+                }
+                Ad [c] = 0.0f;
+                Ads[c] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // Column constants first: both are the same for every row tile, so
+        // reading them once per k-step rather than once per mma is the same
+        // economy the nvfp4 tile makes for its activation scale.
+        float adv[GK_CU_MMAQ_WNT][2];
+        float asv[GK_CU_MMAQ_WNT][2];
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+            const int c = warp_n * GK_CU_MMAQ_WN + ct * 8 + tig * 2;
+            adv[ct][0] = Ad [c + 0];
+            adv[ct][1] = Ad [c + 1];
+            asv[ct][0] = Ads[c + 0];
+            asv[ct][1] = Ads[c + 1];
+        }
+
+        int   af[GK_CU_MMAQ_WMT][4];
+        float ws[GK_CU_MMAQ_WMT][2];
+        float wo[GK_CU_MMAQ_WMT][2];
+
+#pragma unroll
+        for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+            const int r_lo = warp_m * GK_CU_MMAQ_WM + wt * 16 + group;
+
+            af[wt][0] = As[r_lo    ][tig];
+            af[wt][1] = As[r_lo + 8][tig];
+            af[wt][2] = As[r_lo    ][4 + tig];
+            af[wt][3] = As[r_lo + 8][4 + tig];
+
+            ws[wt][0] = Wsc[r_lo    ];
+            ws[wt][1] = Wsc[r_lo + 8];
+            wo[wt][0] = Wof[r_lo    ];
+            wo[wt][1] = Wof[r_lo + 8];
+        }
+
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+            // One B fragment feeds both row tiles - which is what giving a
+            // warp two of them buys, exactly as in the nvfp4 tile.
+            const int c = warp_n * GK_CU_MMAQ_WN + ct * 8 + group;
+
+            int bf[2];
+            bf[0] = Bs[c][tig];
+            bf[1] = Bs[c][4 + tig];
+
+#pragma unroll
+            for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+                int df[4] = { 0, 0, 0, 0 };
+
+                gk_cu_mma_s8_k32(df, af[wt], bf);
+
+                acc[wt][ct][0] += ws[wt][0] * adv[ct][0] * (float) df[0] + wo[wt][0] * asv[ct][0];
+                acc[wt][ct][1] += ws[wt][0] * adv[ct][1] * (float) df[1] + wo[wt][0] * asv[ct][1];
+                acc[wt][ct][2] += ws[wt][1] * adv[ct][0] * (float) df[2] + wo[wt][1] * asv[ct][0];
+                acc[wt][ct][3] += ws[wt][1] * adv[ct][1] * (float) df[3] + wo[wt][1] * asv[ct][1];
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_MMAQ_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_MMAQ_WN + ct * 8
+                                + tig * 2 + (i & 1);
+
+                if (m < n_rows && n < n_cols) {
+                    gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                }
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // The tiled path: same result as gk_cu_k_mul_mat, arranged for reuse.
 //
 // Each block owns a TILE_M x TILE_N patch of `d` and walks the whole of k,
@@ -1580,6 +1871,11 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         // The integer tile, where the format has one. Same quantized
         // activations as the mat-vec path, so the same scratch and the same
         // one-off quantize pass; a batch amortizes it even better.
+        //
+        // Two kernels behind one gate: the tensor-core tile where the
+        // instruction exists, the dp4a tile everywhere else. They take the
+        // same arguments and compute the same thing, so the choice is purely
+        // which multiply the part has.
         if (gk_cuda_mm_q8_supported((int) src0->type, k_len, dst->ne[0]) &&
             scratch != NULL) {
             const int64_t n_grp  = k_len / 32;
@@ -1594,6 +1890,22 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_cu_k_quantize_act<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
                                        GK_CUDA_BLOCK, 0, stream>>>(
                     gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
+
+                if (gk_cuda_mm_mma_q8_available(scratch)) {
+                    dim3 mgrid;
+                    mgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMAQ_TILE_M - 1) / GK_CU_MMAQ_TILE_M);
+                    mgrid.y = (unsigned) ((n_cols     + GK_CU_MMAQ_TILE_N - 1) / GK_CU_MMAQ_TILE_N);
+                    mgrid.z = (unsigned) n_23;
+
+#define GK_CU_LAUNCH_MMA_Q8(T)                                                            \
+                    gk_cu_k_mul_mat_mma_q8<T><<<mgrid, GK_CU_MMAQ_THREADS, 0, stream>>>(   \
+                        gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
+
+                    g_gk_mm_path = "mma-q8";
+                    GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MMA_Q8);
+#undef GK_CU_LAUNCH_MMA_Q8
+                    return;
+                }
 
                 dim3 qgrid;
                 qgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMQ_TILE_M - 1) / GK_CU_MMQ_TILE_M);
