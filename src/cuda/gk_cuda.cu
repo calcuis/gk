@@ -874,6 +874,35 @@ static bool gk_cuda_device_has_kernel_image(int index) {
     return false;
 }
 
+// Whether this binary carries SASS a device of capability `cc` can run.
+//
+// A cubin runs on any part of the same major version with a minor at least as
+// high as its own: sm_80 code runs on an sm_89 card, sm_89 code does not run on
+// sm_86 and nothing crosses a major boundary. Anything else the device has to
+// JIT from PTX.
+static bool gk_cuda_arch_list_has_sass_for(int cc) {
+    const char * p = GK_CUDA_ARCH_LIST;
+
+    while (*p) {
+        if (*p < '0' || *p > '9') {
+            p++;
+            continue;
+        }
+
+        int arch = 0;
+        while (*p >= '0' && *p <= '9') {
+            arch = arch * 10 + (*p - '0');
+            p++;
+        }
+
+        if (arch / 10 == cc / 10 && arch % 10 <= cc % 10) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 extern "C" void gk_cuda_register_devices(void) {
     if (g_cuda_discovered) {
         return;
@@ -910,6 +939,25 @@ extern "C" void gk_cuda_register_devices(void) {
                     GK_CUDA_BACKEND_NAME, i, prop.name, prop.major, prop.minor,
                     GK_CUDA_ARCH_LIST, prop.major * 10 + prop.minor);
             continue;
+        }
+
+        if (!gk_cuda_arch_list_has_sass_for(prop.major * 10 + prop.minor)) {
+            // The probe launch succeeded, so the driver can JIT this build's
+            // PTX for the device - but it has to compile every kernel the run
+            // touches before running it, and for a graph the size of a
+            // diffusion model that is minutes of apparently frozen process
+            // with no output between "loading tensors completed" and the first
+            // step. It is cached afterwards (%APPDATA%\NVIDIA\ComputeCache,
+            // ~/.nv/ComputeCache), so the run after this one looks fine and
+            // nothing about it looks like a build problem. Say so once, here,
+            // where the cost is about to be paid.
+            gk_logf("gk %s: device %d (%s, compute capability %d.%d) has no native code in this "
+                    "build (built for: %s); it will run on JIT-compiled PTX. The first launch "
+                    "on it can take minutes before anything appears to happen - the driver "
+                    "caches the result, so later runs start normally. Rebuild with "
+                    "-DGK_CUDA_ARCHITECTURES=%d to avoid it.\n",
+                    GK_CUDA_BACKEND_NAME, i, prop.name, prop.major, prop.minor,
+                    GK_CUDA_ARCH_LIST, prop.major * 10 + prop.minor);
         }
 
         struct gk_cuda_device_ctx * d = &g_cuda_devices[g_cuda_n_devices];
