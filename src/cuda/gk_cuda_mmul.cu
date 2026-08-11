@@ -2403,7 +2403,22 @@ static __global__ void gk_cu_k_flash_attn_tiled(gk_tview q, gk_tview k, gk_tview
 // an f32 cache down to reach this path.
 // --------------------------------------------------------------------------
 
-#define GK_CU_FAM_WARPS   4                                  // warps per block
+// Warps per block, and with it the query rows a block owns.
+//
+// This is the one number that decides how many times the cache is read. A
+// block walks the whole of K and V whatever its height, so a head's cache is
+// re-read once per query block: at 64 rows a 8742-token layer re-reads it 137
+// times, which for d=128 h=56 is 34.6 GB of requests against 4.5 MB of actual
+// K and V. Measured there at 1.11 TB/s of a 1.79 TB/s part - the same disease
+// the quantized GEMM had, found the same way, by counting the re-reads rather
+// than the operands.
+//
+// Doubling it is close to free, which is why it is the first thing to try:
+// every warp owns its own 16 query rows with its own Q fragments, accumulator
+// and running softmax, all in registers, and the only thing warps share is the
+// staged K/V tile and the barrier protecting it. So twice the warps means
+// twice the arithmetic per staged tile, at identical per-warp cost.
+#define GK_CU_FAM_WARPS   8                                  // warps per block
 #define GK_CU_FAM_BR      (GK_CU_FAM_WARPS * 16)             // query rows a block owns
 #define GK_CU_FAM_THREADS (GK_CU_FAM_WARPS * GK_WARP_SIZE)
 
@@ -2483,8 +2498,12 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
     const int NT_K = GK_CU_FAM_NTK(D_PAD);
     const int NT_V = GK_CU_FAM_NTV(D_PAD);
 
-    __shared__ __half Ks[GK_CU_FAM_BC(D_PAD)]          [GK_CU_FAM_SK(D_PAD)];
-    __shared__ __half Vt[GK_CU_FAM_NTV(D_PAD)*8][GK_CU_FAM_SC(D_PAD)];
+    // Two of each: the tile being computed and the one being fetched. See the
+    // loop below for why. Shared memory is what pays for it, and shared memory
+    // is the one resource this kernel has to spare - it is registers that cap
+    // its occupancy.
+    __shared__ __half Ks[2][GK_CU_FAM_BC(D_PAD)]     [GK_CU_FAM_SK(D_PAD)];
+    __shared__ __half Vt[2][GK_CU_FAM_NTV(D_PAD)*8][GK_CU_FAM_SC(D_PAD)];
 
     const int64_t DK   = k.ne[0];
     const int64_t DV   = v.ne[0];
@@ -2546,24 +2565,26 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
     float M[2] = { -INFINITY, -INFINITY };
     float S[2] = { 0.0f, 0.0f };
 
-    for (int64_t c0 = 0; c0 < n_kv; c0 += GK_CU_FAM_BC(D_PAD)) {
-        // K as [key][k] and V transposed to [value dim][key], which is the
-        // layout `mma.row.col` wants for the B operand of each of the two
-        // products. V's transpose is paid here, on the staging store, rather
-        // than in the inner loop - the read side of it is what runs 64 times
-        // per tile in the arithmetic below, and the write side once.
-        //
-        // Both are staged eight elements to the instruction. The divisors are
-        // template constants, so the index arithmetic is shifts rather than
-        // the 64-bit division a runtime divisor would compile to.
+    // One key tile into one of the two buffers.
+    //
+    // K as [key][k] and V transposed to [value dim][key], which is the layout
+    // `mma.row.col` wants for the B operand of each of the two products. V's
+    // transpose is paid here, on the staging store, rather than in the inner
+    // loop - the read side of it is what runs 64 times per tile in the
+    // arithmetic below, and the write side once.
+    //
+    // Both are staged eight elements to the instruction. The divisors are
+    // template constants, so the index arithmetic is shifts rather than the
+    // 64-bit division a runtime divisor would compile to.
+    auto stage_tile = [&](int buf, int64_t c_base) {
 #pragma unroll
         for (int e = tid; e < GK_CU_FAM_BC(D_PAD) * GK_CU_FAM_NTK(D_PAD) * 2;
              e += GK_CU_FAM_THREADS) {
             const int     c  = e / (NT_K * 2);
             const int     i  = (e - c * (NT_K * 2)) * 8;
-            const int64_t ic = c0 + c;
+            const int64_t ic = c_base + c;
 
-            *(int4 *) &Ks[c][i] = ic < n_kv
+            *(int4 *) &Ks[buf][c][i] = ic < n_kv
                 ? gk_cu_fam_run8(k, k_vec, i, ic, ik2, ik3, DK)
                 : make_int4(0, 0, 0, 0);
         }
@@ -2573,7 +2594,7 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
              e += GK_CU_FAM_THREADS) {
             const int     c  = e / NT_V;
             const int     i  = (e - c * NT_V) * 8;
-            const int64_t ic = c0 + c;
+            const int64_t ic = c_base + c;
 
             const int4 w = ic < n_kv
                 ? gk_cu_fam_run8(v, v_vec, i, ic, iv2, iv3, DV)
@@ -2584,10 +2605,39 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
             const __half * h = (const __half *) &w;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                Vt[i + j][c] = h[j];
+                Vt[buf][i + j][c] = h[j];
             }
         }
-        __syncthreads();
+    };
+
+    // Software pipeline. The un-pipelined loop staged a tile, waited for it at
+    // a barrier, computed on it, and waited again before overwriting it: two
+    // barriers per tile, and - because every warp in the block waits at the
+    // same one - a full global-memory latency exposed at the top of each of
+    // the 274 iterations an 8742-key cache takes, with nothing to run in the
+    // meantime.
+    //
+    // Fetching into the other buffer removes both problems at once. The loads
+    // for the next tile are issued before the arithmetic on this one and land
+    // in memory nobody is reading, so they are in flight across the whole of
+    // it, and the only ordering left to enforce is the one at the end of the
+    // iteration - which covers the stores becoming visible and the reads
+    // having finished, so one barrier does both.
+    //
+    // This is bought with shared memory rather than registers on purpose. At
+    // d=128 the kernel already spends 238 registers a thread and gets 8 warps
+    // per multiprocessor for them; anything that spent more would take back
+    // more than the pipeline gives.
+    stage_tile(0, 0);
+    __syncthreads();
+
+    int buf = 0;
+
+    for (int64_t c0 = 0; c0 < n_kv; c0 += GK_CU_FAM_BC(D_PAD), buf ^= 1) {
+        const int64_t c_next = c0 + GK_CU_FAM_BC(D_PAD);
+        if (c_next < n_kv) {
+            stage_tile(buf ^ 1, c_next);
+        }
 
         // S = Q K^T, for this warp's 16 query rows against all 64 keys.
         float s[GK_CU_FAM_NTC(D_PAD)][4];
@@ -2603,8 +2653,8 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
 #pragma unroll
             for (int nt = 0; nt < GK_CU_FAM_NTC(D_PAD); ++nt) {
                 int bf[2];
-                bf[0] = *(const int *) &Ks[nt * 8 + group][kt * 16 + 2 * tig];
-                bf[1] = *(const int *) &Ks[nt * 8 + group][kt * 16 + 8 + 2 * tig];
+                bf[0] = *(const int *) &Ks[buf][nt * 8 + group][kt * 16 + 2 * tig];
+                bf[1] = *(const int *) &Ks[buf][nt * 8 + group][kt * 16 + 8 + 2 * tig];
 
                 gk_cu_mma_f16(s[nt], qf[kt], bf);
             }
@@ -2712,15 +2762,17 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
 #pragma unroll
             for (int kw = 0; kw < GK_CU_FAM_NKW(D_PAD); ++kw) {
                 int bf[2];
-                bf[0] = *(const int *) &Vt[ct * 8 + group][kw * 16 + 2 * tig];
-                bf[1] = *(const int *) &Vt[ct * 8 + group][kw * 16 + 8 + 2 * tig];
+                bf[0] = *(const int *) &Vt[buf][ct * 8 + group][kw * 16 + 2 * tig];
+                bf[1] = *(const int *) &Vt[buf][ct * 8 + group][kw * 16 + 8 + 2 * tig];
 
                 gk_cu_mma_f16(acc[ct], pf[kw], bf);
             }
         }
 
-        // The tile is read by every warp, so it cannot be overwritten until
-        // every warp is done with it.
+        // The only barrier in the loop, and it carries both obligations: the
+        // tile just fetched into the other buffer becomes visible, and every
+        // warp is known to have finished reading this one before the next
+        // iteration fetches over it.
         __syncthreads();
     }
 

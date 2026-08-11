@@ -329,6 +329,40 @@ static struct gk_tensor * build_conv_2d_f16(struct gk_ctx * ctx, struct gk_tenso
     return gk_conv_2d_direct(ctx, in[0], in[1], 1, 1, 1, 1, 1, 1);
 }
 
+// The transposed convolution, which the device computes by gathering where the
+// CPU pass scatters. A stride above one is the case that matters: it is what
+// leaves gaps in the output that only some kernel taps reach, so a wrong
+// divisibility test shows up as whole positions being wrong rather than as
+// drift. K > s0 also makes the taps overlap, so several of them land on one
+// output and the accumulation order is exercised too.
+static struct gk_tensor * build_conv_transpose_1d(struct gk_ctx * ctx, struct gk_tensor ** in,
+                                                  int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 5, 7, 4);   // [K, Cout, Cin]
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 13, 4, 3);  // [L, Cin, N]
+    *n_in = 2;
+    return gk_conv_transpose_1d(ctx, in[0], in[1], 3, 0, 1);
+}
+
+// Stride one, so every output position is reached by every tap - the opposite
+// coverage to the case above.
+static struct gk_tensor * build_conv_transpose_1d_s1(struct gk_ctx * ctx, struct gk_tensor ** in,
+                                                     int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 4, 6, 5);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 17, 5, 2);
+    *n_in = 2;
+    return gk_conv_transpose_1d(ctx, in[0], in[1], 1, 0, 1);
+}
+
+// The half-precision kernel, which rounds the input through f16 on the way in.
+// This is the shape MiniMax-H3's audio VAE decoder uses.
+static struct gk_tensor * build_conv_transpose_1d_f16(struct gk_ctx * ctx, struct gk_tensor ** in,
+                                                      int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F16, 5, 7, 4);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 13, 4, 3);
+    *n_in = 2;
+    return gk_conv_transpose_1d(ctx, in[0], in[1], 2, 0, 1);
+}
+
 // The two selective-scan variants. They differ only in A's first extent, but
 // that picks between one decay per head and one per state element, which is a
 // whole branch of the kernel each.
@@ -1620,6 +1654,9 @@ int main(void) {
     failures += run_op(gpu, "pool_2d avg",   build_pool_2d_avg);
     failures += run_op(gpu, "conv_2d",       build_conv_2d);
     failures += run_op(gpu, "conv_2d f16",   build_conv_2d_f16);
+    failures += run_op(gpu, "convT_1d s3",   build_conv_transpose_1d);
+    failures += run_op(gpu, "convT_1d s1",   build_conv_transpose_1d_s1);
+    failures += run_op(gpu, "convT_1d f16",  build_conv_transpose_1d_f16);
     failures += run_op(gpu, "ssm_scan m2",   build_ssm_scan_m2);
     failures += run_op(gpu, "ssm_scan m1",   build_ssm_scan_m1);
     failures += run_op(gpu, "mul_mat empty", build_empty_mul_mat);

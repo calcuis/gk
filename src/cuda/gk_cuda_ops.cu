@@ -1827,6 +1827,63 @@ static __global__ void gk_cu_k_conv_2d(gk_tview a, gk_tview b, gk_tview_mut d,
     }
 }
 
+// Transposed 1-D convolution: kernel [K, Cout, Cin], input [L, Cin, N],
+// result [(L-1)*s0 + K, Cout, N].
+//
+// The CPU pass *scatters*: it walks (input position, kernel tap) and adds each
+// product into `out[il*s0 + ik]`, so several taps land on the same output. On
+// a device that shape wants either atomics or a serialisation over `il`, and
+// it needs neither, because the mapping inverts exactly. `il*s0 + ik = ox` has
+// at most one solution per tap - `il = (ox - ik)/s0`, when `s0` divides
+// `ox - ik` and the quotient is a real input position - so gathering gives one
+// thread per output element with no contention at all.
+//
+// The taps are walked from the top down. That is not cosmetic: `il` falls as
+// `ik` rises, so descending taps visit the contributions in ascending `il`,
+// which is the order the CPU pass adds them in. Float addition is not
+// associative and these two passes are checked against each other.
+//
+// `p0` and `d0` are read from the op params and ignored, exactly as the CPU
+// pass ignores them - `gk_conv_transpose_1d` computes its output length for
+// p=0, d=1 and says so. Declining those cases here would only route them to a
+// pass that makes the same assumption.
+static __global__ void gk_cu_k_conv_transpose_1d(gk_tview a, gk_tview b, gk_tview_mut d,
+                                                 int s0, int64_t K, int64_t Cin, int64_t L,
+                                                 bool round_src, int64_t n) {
+    GK_CU_FLAT_LOOP(n) {
+        const gk_cu_idx o = gk_cu_decompose(k, d.ne);
+
+        float acc = 0.0f;
+
+        for (int64_t ik = K - 1; ik >= 0; --ik) {
+            const int64_t rel = o.i0 - ik;
+            if (rel < 0 || rel % s0 != 0) {
+                continue;
+            }
+
+            const int64_t il = rel / s0;
+            if (il >= L) {
+                continue;
+            }
+
+            for (int64_t ic = 0; ic < Cin; ++ic) {
+                float sv = gk_cu_get(b, il, ic, o.i2, 0);
+
+                // A half-precision kernel rounds the input to its own
+                // precision before multiplying, the same as gk_cu_k_conv_2d
+                // and for the same reason: it is what the CPU pass does.
+                if (round_src) {
+                    sv = __half2float(__float2half(sv));
+                }
+
+                acc += gk_cu_get(a, ik, o.i1, ic, 0) * sv;
+            }
+        }
+
+        gk_cu_set(d, o.i0, o.i1, o.i2, o.i3, acc);
+    }
+}
+
 // The 3-D unrolling. One thread per output element, which means undoing the
 // destination's flat layout twice: once to find which output cell the element
 // belongs to, and once to find which of the cell's (channel, kernel position)
@@ -2387,7 +2444,7 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         case GK_OP_SET_ROWS:
         case GK_OP_ROLL: case GK_OP_SSM_CONV: case GK_OP_POOL_2D:
         case GK_OP_CONV_2D: case GK_OP_SSM_SCAN:
-        case GK_OP_CONV_2D_DW:
+        case GK_OP_CONV_2D_DW: case GK_OP_CONV_TRANSPOSE_1D:
         case GK_OP_RWKV_WKV6: case GK_OP_RWKV_WKV7: case GK_OP_GATED_DELTA_NET:
         case GK_OP_PAD_REFLECT_1D: case GK_OP_CUMSUM:
             break;
@@ -2435,6 +2492,18 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         // decides whether the input is rounded on the way in.
         return op->type == GKT_F32 && s1 != NULL && s1->type == GKT_F32 &&
                (s0->type == GKT_F32 || s0->type == GKT_F16);
+    }
+    if ((int) op->op == GK_OP_CONV_TRANSPOSE_1D) {
+        // Same operand rules as conv_2d, and the same reason for the half
+        // case: an f16 kernel rounds the input on the way in.
+        //
+        // The stride is divided by per output element, so a zero would be a
+        // device-side fault rather than a wrong answer. It cannot come from
+        // gk_conv_transpose_1d, but supports_op is the wrong place to find
+        // that out.
+        return op->type == GKT_F32 && s1 != NULL && s1->type == GKT_F32 &&
+               (s0->type == GKT_F32 || s0->type == GKT_F16) &&
+               gk_get_op_params_i32(op, 0) > 0;
     }
     if ((int) op->op == GK_OP_SSM_SCAN) {
         // The scan indexes x, B and C as flat rows across their first two
@@ -3082,6 +3151,14 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 1.0f / sqrtf((float) S));
             return true;
         }
+
+        case GK_OP_CONV_TRANSPOSE_1D:
+            gk_cu_k_conv_transpose_1d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0),
+                src0->ne[0], src0->ne[2], src1->ne[0],
+                src0->type == GKT_F16, ne);
+            return true;
 
         case GK_OP_CONV_2D:
             gk_cu_k_conv_2d<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
