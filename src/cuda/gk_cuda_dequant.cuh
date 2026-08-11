@@ -112,6 +112,74 @@ static __device__ __forceinline__ float gk_cu_ue4m3(uint8_t v) {
     return f * 0.5f;
 }
 
+// The inverses of the two decoders above, for quantizing activations *into*
+// nvfp4. Only the FP4 tensor-core path needs them - every other path quantizes
+// activations to int8 - so they live here beside what they undo rather than in
+// the codec, which never encodes on the device.
+//
+// Both work in *true* units, unlike `gk_cu_ue4m3` and `gk_cu_e2m1_value`,
+// which are each off by a factor of two in opposite directions. Encoding is
+// where that convention has to be paid off, because the consumer is hardware
+// rather than the matching gk decoder.
+
+// A float to the nearest ue4m3 byte, as a true value: 2^(e-7) * (1 + m/8),
+// with e == 0 subnormal at 2^-6 * m/8. Round to nearest, ties away, saturating
+// at 0x7e - 0x7f is the NaN slot and gk's decoder reads it as zero.
+static __device__ __forceinline__ uint8_t gk_cu_f2ue4m3(float v) {
+    if (!(v > 0.0f)) {
+        return 0;   // negatives cannot happen (v is an amax) and NaN maps to 0
+    }
+
+    if (v >= 448.0f) {
+        return 0x7e;
+    }
+
+    if (v < (1.0f / 64.0f)) {
+        // Subnormal: the step is 2^-9, and eight steps reach the first normal.
+        const int m = (int) rintf(v * 512.0f);
+        return (uint8_t) (m > 7 ? 8 : m);   // 8 lands on e=1,m=0, which is 2^-6
+    }
+
+    int e;
+    const float frac = frexpf(v, &e);   // v = frac * 2^e, frac in [0.5, 1)
+    // frexpf's [0.5,1) against ue4m3's [1,2) is one exponent apart.
+    int exp = e - 1 + 7;
+    int man = (int) rintf((frac * 2.0f - 1.0f) * 8.0f);
+
+    if (man == 8) {     // rounded up out of the mantissa
+        man = 0;
+        ++exp;
+    }
+
+    if (exp >= 15 && man >= 7) {
+        return 0x7e;
+    }
+
+    return (uint8_t) ((exp << 3) | man);
+}
+
+// A float to the nearest e2m1 code. The eight magnitudes are 0, 0.5, 1, 1.5,
+// 2, 3, 4 and 6, and the code is the index into that list with the sign in
+// bit 3. Written as comparisons against midpoints rather than as arithmetic on
+// the exponent: eight cases is short enough that a branchless ladder beats
+// taking a logarithm, and the midpoints are what "nearest" means here.
+static __device__ __forceinline__ int gk_cu_f2e2m1(float v) {
+    const int   sign = v < 0.0f ? 8 : 0;
+    const float a    = fabsf(v);
+
+    int mag;
+    if      (a < 0.25f) { mag = 0; }
+    else if (a < 0.75f) { mag = 1; }
+    else if (a < 1.25f) { mag = 2; }
+    else if (a < 1.75f) { mag = 3; }
+    else if (a < 2.50f) { mag = 4; }
+    else if (a < 3.50f) { mag = 5; }
+    else if (a < 5.00f) { mag = 6; }
+    else                { mag = 7; }
+
+    return sign | mag;
+}
+
 // One ternary digit out of a base-3 byte, the same multiply-and-shift the
 // codec uses.
 static __device__ __forceinline__ int gk_cu_trit(uint8_t byte, int pow3) {
@@ -571,6 +639,28 @@ struct gk_cu_q8blk {
     float   d;    // value ~= d * code
     float   s;    // sum of the 32 codes
     int32_t q[8]; // the codes, four to a word
+};
+
+// 64 activations, quantized to nvfp4 rather than to int8.
+//
+// This exists for one instruction. Blackwell's block-scaled FP4 mma takes both
+// operands as e2m1 and applies a ue4m3 scale per sixteen elements *in
+// hardware*, so the activation side has to arrive in exactly that shape - and
+// when it does, nothing on the path decodes anything.
+//
+// `sc` is the four scales as the instruction wants them: one packed uint32,
+// byte `i` being the scale for elements `16i..16i+15`. It is handed to the PTX
+// verbatim. `q` is the codes in k order, eight nibbles to a word, which is
+// also verbatim - word `w` is the fragment register for elements `8w..8w+7`.
+//
+// The scales are stored as *true* ue4m3, not as gk's halved decode. That is
+// not a special case: gk's e2m1 table is doubled by exactly the same factor
+// (see `gk_cu_e2m1_value`), so the halved scale and the doubled code have
+// always multiplied out to the right answer, and the bytes on disk have always
+// been true ue4m3. The hardware reads them as such.
+struct gk_cu_fp4blk {
+    uint32_t sc;   // four ue4m3 scales, one per sixteen elements
+    uint32_t q[8]; // the codes, eight to a word, in k order
 };
 
 // Four 8-bit products accumulated into an int, in one instruction where the

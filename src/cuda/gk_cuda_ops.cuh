@@ -69,6 +69,8 @@ void gk_cuda_mul_mat   (gkStream_t stream, struct gk_cuda_scratch * scratch,
 // scratch allocation that failed, a tile too wide for the output. The profile
 // keys on this so the two questions are answered by one row.
 const char * gk_cuda_mm_last_path(void);
+void gk_cuda_fp4_stats(double * sq_err, double * sq_ref,
+                       unsigned long long * zero_groups, unsigned long long * groups);
 void gk_cuda_mul_mat_id(gkStream_t stream, struct gk_tensor * dst);
 void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         struct gk_tensor * dst);

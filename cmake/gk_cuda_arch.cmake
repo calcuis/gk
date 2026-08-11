@@ -185,22 +185,57 @@ function(gk_choose_cuda_architectures out_var)
 
     if (CMAKE_VERSION VERSION_LESS 3.18)
         # No -real/-virtual before 3.18. A bare list asks for SASS and PTX for
-        # every entry: larger than it needs to be, but correct.
+        # every entry: larger than it needs to be, but correct. Deliberately no
+        # `a` variants here either - a bare `120a` would ask for compute_120a
+        # PTX, and see below for why that is the one thing not to ship.
         set(result "${archs}")
     else()
+        # Blackwell consumer parts get the *architecture-specific* target,
+        # `120a` rather than `120`.
+        #
+        # This is not a tuning choice. Some instructions exist only under it -
+        # the FP4 tensor-core `mma.sync...kind::mxf4nvf4.block_scale...`, which
+        # is what an nvfp4 matmul on this hardware is - and nvcc defines
+        # `__CUDA_ARCH_FEAT_SM120_ALL` only when compiling for it. Plain
+        # `sm_120` silently produces a binary in which those kernels compiled
+        # to nothing, which at run time looks like a slow kernel rather than a
+        # missing one. Verified: the instruction reaches the PTX for
+        # `compute_120a` and does not for `compute_120`.
+        #
+        # The cost of `a` is that it is not forward compatible - a sm_121 or a
+        # Rubin part cannot load an sm_120a image - which is exactly what the
+        # PTX entry below is for, and why that entry has to stay on the *base*
+        # architecture. compute_120a PTX would carry the same restriction and
+        # would defeat the purpose; compute_120 PTX cannot contain the FP4
+        # instruction in the first place, because the feature macro that guards
+        # it is undefined there. The two halves fit together: SASS with the
+        # instruction for the parts that have it, PTX without it for the parts
+        # that come later.
+        #
+        # 10x (Blackwell datacenter) has the same split and is deliberately not
+        # rewritten - gk has no `sm_100a` code today, and an untested target is
+        # worse than a plain one.
         set(result "")
         foreach (arch IN LISTS archs)
-            if (arch EQUAL newest)
-                list(APPEND result ${arch})   # SASS + PTX
+            if (arch MATCHES "^12[0-9]$")
+                list(APPEND result ${arch}a-real)
             else()
                 list(APPEND result ${arch}-real)
             endif()
         endforeach()
+
+        # PTX for the newest, always as a separate entry on the base
+        # architecture. This is the forward-compatibility story this file
+        # exists for: a device newer than anything seen at build time JITs it
+        # rather than failing with "no kernel image is available".
+        list(APPEND result ${newest}-virtual)
     endif()
 
     string(REPLACE ";" ", " archs_text "${archs}")
+    string(REPLACE ";" ", " result_text "${result}")
     message(STATUS
         "gk: CUDA architectures ${archs_text} (${detected_by}), with PTX for ${newest}")
+    message(STATUS "gk: CUDA_ARCHITECTURES = ${result_text}")
 
     set(${out_var} "${result}" PARENT_SCOPE)
 endfunction()
@@ -212,6 +247,13 @@ function(gk_cuda_architectures_to_list architectures out_var)
     set(archs "")
     foreach (entry IN LISTS architectures)
         string(REGEX REPLACE "-(real|virtual)$" "" arch "${entry}")
+        # `120a` and `120` are the same device to the person reading the error
+        # message, and the run-time check they feed compares compute
+        # capabilities. Dropping the suffix here rather than dropping the whole
+        # entry: an unrecognised form used to vanish from the list silently,
+        # which would have made a 120a-only build report that it was built for
+        # nothing.
+        string(REGEX REPLACE "^([0-9]+)[af]$" "\\1" arch "${arch}")
         if (arch MATCHES "^[0-9]+$")
             list(APPEND archs ${arch})
         endif()

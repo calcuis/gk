@@ -437,6 +437,14 @@ static struct gk_tensor * fattn_square_d(struct gk_ctx * ctx, int64_t n_tok, int
 static struct gk_tensor * b_fa_dit_2k_d128(struct gk_ctx * c) { return fattn_square_d(c, 2048, 16, 128); }
 static struct gk_tensor * b_fa_dit_4k_d128(struct gk_ctx * c) { return fattn_square_d(c, 4096, 16, 128); }
 
+// The MiniMax-H3 video DiT's attention, at its real size: 8742 tokens against
+// itself, 56 heads of 128. It is 34% of a denoising step after Tier 2 - the
+// single largest thing left - and none of the shapes above reach it: the
+// widest is 4096 tokens and 16 heads, an eighth of the work, and this kernel's
+// cost is dominated by how many times a block re-reads the cache, which is a
+// function of exactly the token count the small cases shrink.
+static struct gk_tensor * b_fa_h3(struct gk_ctx * c) { return fattn_square_d(c, 8742, 56, 128); }
+
 static struct gk_tensor * b_fa_dit_1k(struct gk_ctx * c) { return fattn_square(c, 1024, 16); }
 static struct gk_tensor * b_fa_dit_2k(struct gk_ctx * c) { return fattn_square(c, 2048, 16); }
 static struct gk_tensor * b_fa_dit_4k(struct gk_ctx * c) { return fattn_square(c, 4096, 16); }
@@ -769,6 +777,7 @@ static const struct bench_case g_cases[] = {
     { NULL,        "flash_attn DiT",     "4096 tok x16",   b_fa_dit_4k,   ARENA_BIG   },
     { NULL,        "flash_attn DiT d128","2048 tok x16",   b_fa_dit_2k_d128, ARENA_BIG },
     { NULL,        "flash_attn DiT d128","4096 tok x16",   b_fa_dit_4k_d128, ARENA_BIG },
+    { NULL,        "flash_attn H3 d128", "8742 tok x56",   b_fa_h3,          ARENA_HUGE },
     { NULL,        "soft_max decode",    "2048x1x8",       b_softmax_dec, ARENA_SMALL },
     { NULL,        "soft_max prefill",   "512x512x8",      b_softmax_pre, ARENA_MID   },
 

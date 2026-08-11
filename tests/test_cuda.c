@@ -752,8 +752,9 @@ static struct gk_tensor * build_mul_mat_wide(struct gk_ctx * ctx, struct gk_tens
 // The batched integer tile, which needs all of: a format with an integer dot,
 // enough columns to take the tiled path at all, and enough rows to be worth
 // quantizing the activations for. Nothing else in this file meets all three -
-// build_mul_mat_wide_q is nvfp4 and a hundred rows, so it takes the float
-// tile - so these exist to reach it.
+// build_mul_mat_wide_q is nvfp4 and a hundred rows, so it takes whichever tile
+// the device has for that format rather than the batched integer one - so
+// these exist to reach that.
 //
 // The shapes are deliberately off every tile boundary: 64 is the tile in both
 // directions, so rows and columns that are not multiples of it are what
@@ -827,6 +828,189 @@ static struct gk_tensor * build_mma_nvfp4(struct gk_ctx * ctx, struct gk_tensor 
 
 static struct gk_tensor * build_mma_nvfp4_exact(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 512, 640, 64);
+}
+
+// The FP4 tensor-core tile, against a reference that is actually exact.
+//
+// This one does not go through `run_op_tol`, and the reason is the whole point
+// of it. That harness compares the device against gk's *CPU* matmul, and gk's
+// CPU nvfp4 dot quantizes the activation side to 8 bits before dotting. So the
+// reference carries an error of its own, of about the size being looked for -
+// and worse, the integer device tile makes the *same* 8-bit approximation, so
+// it agrees with the reference partly by being wrong in the same direction
+// while the FP4 tile disagrees by being more accurate. A tolerance over that
+// comparison cannot tell a correct kernel from a scrambled one.
+//
+// So: decode the weights on the host, dot in double, and feed activations the
+// FP4 quantizer reproduces exactly - every value on the e2m1 grid, and one
+// value of 6 per group of sixteen so the group's scale quantizes to exactly 1.
+// Both operands are then exact and the only thing left between the device and
+// the reference is the order f32 adds things up in, which at k=1024 is worth
+// about 1e-4 relative. A wrong fragment layout or a misplaced scale is worth
+// 100%.
+static int run_nvfp4_tile_exact(gk_backend_t gpu) {
+    const int64_t k = 1024;   // sixteen 64-element blocks
+    const int64_t m = 288;    // not a multiple of the 128-row tile
+    const int64_t n = 200;    // wide enough for a tile, ragged against 128
+
+    struct gk_ctx * ctx = gk_init((struct gk_init_params) {
+        .mem_size = 1u << 20, .mem_buffer = NULL, .no_alloc = true,
+    });
+    struct gk_tensor * w   = gk_new_tensor_2d(ctx, GK_TYPE_NVFP4, k, m);
+    struct gk_tensor * x   = gk_new_tensor_2d(ctx, GK_TYPE_F32,   k, n);
+    struct gk_tensor * out = gk_mul_mat(ctx, w, x);
+    gk_set_output(out);
+
+    struct gk_cgraph * graph = gk_new_graph(ctx);
+    gk_build_forward_expand(graph, out);
+
+    if (!gk_backend_supports_op(gpu, out)) {
+        printf("  %-14s FAIL: the backend declines the op\n", "mma nvfp4 exact");
+        gk_free(ctx);
+        return 1;
+    }
+
+    struct gk_gallocr * alloc = gk_gallocr_new(gk_backend_get_default_buffer_type(gpu));
+    if (alloc == NULL || !gk_gallocr_alloc_graph(alloc, graph)) {
+        printf("  %-14s FAIL: could not allocate the device graph\n", "mma nvfp4 exact");
+        gk_free(ctx);
+        return 1;
+    }
+
+    const int64_t nw = k * m;
+    const int64_t nx = k * n;
+    const int64_t no = m * n;
+
+    float * wf      = (float *) malloc((size_t) nw * sizeof(float));
+    float * decoded = (float *) malloc((size_t) nw * sizeof(float));
+    float * xf      = (float *) malloc((size_t) nx * sizeof(float));
+    float * got     = (float *) malloc((size_t) no * sizeof(float));
+    void  * enc     = malloc(gk_nbytes(w));
+
+    if (wf == NULL || decoded == NULL || xf == NULL || got == NULL || enc == NULL) {
+        return 1;
+    }
+
+    for (int64_t i = 0; i < nw; ++i) {
+        wf[i] = input_value((int) i) * 0.125f;
+    }
+
+    // Activations on the e2m1 grid, times a power of two that *changes from
+    // one group of sixteen to the next*.
+    //
+    // The varying scale is the point. A group's amax fixes its ue4m3 scale, so
+    // giving every group the same one leaves the activation scale register
+    // constant across the whole block - and a kernel that mapped those four
+    // scale bytes to the wrong sixteen elements, or read them from the wrong
+    // lane, would still be exactly right. That is not hypothetical: it is the
+    // bug this case was extended to catch, after a version that held every
+    // group at 1.0 measured zero error and still produced noise in a real
+    // model.
+    //
+    // Exactness survives because both parts are exact: a power of two is a
+    // ue4m3 value, and 6 times it is the group's amax, so the scale quantizes
+    // to itself and the codes are the grid.
+    //
+    // The cycle is four long and the spread only 2^-1..2^2, for two reasons.
+    // Four means every one of the four scale bytes in a 64-element block is
+    // distinct, so any permutation of them changes the answer. Narrow means
+    // the *integer* tile can still pass this case: it carries one activation
+    // scale per thirty-two, so two sub-groups share it, and a wide spread
+    // would cost the smaller one its precision and fail the case for a reason
+    // that has nothing to do with the kernel.
+    static const float grid[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    for (int64_t i = 0; i < nx; ++i) {
+        const float v     = input_value((int) (i + 7919));
+        const float sign  = v < 0.0f ? -1.0f : 1.0f;
+        const float gscl  = ldexpf(1.0f, (int) ((i / 16) % 4) - 1);   // 2^-1 .. 2^2
+
+        xf[i] = sign * grid[(int) (fabsf(v) * 9.0f) & 7] * gscl;
+    }
+    for (int64_t i = 0; i < nx; i += 16) {
+        const float gscl = ldexpf(1.0f, (int) ((i / 16) % 4) - 1);
+
+        xf[i] = (xf[i] < 0.0f ? -6.0f : 6.0f) * gscl;
+    }
+
+    const struct gk_type_traits * tr = gk_get_type_traits(GK_TYPE_NVFP4);
+    tr->from_float(wf, enc, nw);
+    tr->to_float(enc, decoded, nw);
+
+    gk_backend_tensor_set(w, enc, 0, gk_nbytes(w));
+    gk_backend_tensor_set(x, xf, 0, (size_t) nx * sizeof(float));
+
+    if (gk_backend_graph_compute(gpu, graph) != GK_STATUS_SUCCESS) {
+        printf("  %-14s FAIL: the device graph failed\n", "mma nvfp4 exact");
+        return 1;
+    }
+    gk_backend_synchronize(gpu);
+    gk_backend_tensor_get(out, got, 0, (size_t) no * sizeof(float));
+
+    int   bad     = 0;
+    float max_rel = 0.0f;
+
+    // The reference first, so the error can be scaled by the output's own RMS.
+    //
+    // Dividing each error by its own `1 + |expected|` was the obvious thing and
+    // it is wrong here: a dot product of signed data has outputs near zero, and
+    // an ordinary absolute error against one of those reads as a huge relative
+    // one. That is a property of the metric, not of the kernel - it flagged the
+    // integer tile on outputs whose true value was a rounding error away from
+    // nothing. The RMS of the whole output is the scale to judge against.
+    double * ref = (double *) malloc((size_t) no * sizeof(double));
+    if (ref == NULL) {
+        return 1;
+    }
+
+    double sum_sq = 0.0;
+    for (int64_t col = 0; col < n; ++col) {
+        for (int64_t row = 0; row < m; ++row) {
+            double precise = 0.0;
+            for (int64_t kk = 0; kk < k; ++kk) {
+                precise += (double) decoded[row * k + kk] * (double) xf[col * k + kk];
+            }
+            ref[col * m + row] = precise;
+            sum_sq += precise * precise;
+        }
+    }
+
+    const double rms = sqrt(sum_sq / (double) no);
+
+    for (int64_t col = 0; col < n; ++col) {
+        for (int64_t row = 0; row < m; ++row) {
+            const double precise = ref[col * m + row];
+
+            const float g   = got[col * m + row];
+            const float rel = (float) (fabs((double) g - precise) / (rms > 0.0 ? rms : 1.0));
+
+            if (rel > max_rel) {
+                max_rel = rel;
+            }
+            // 4e-2 rather than something tight, because this same case has
+            // to pass on the integer tile too - a pre-Blackwell part, or
+            // `GK_MM_NVFP4_FP4=0` - and that one quantizes the activations to
+            // eight bits and lands at about 2e-2 here. The bound is set to
+            // catch a wrong layout, which is worth ~100%, not to distinguish
+            // the two paths; the printed figure does that, and the difference
+            // is stark. The FP4 tile measures exactly 0.
+            if (!(rel <= 4e-2f)) {
+                bad++;
+            }
+        }
+    }
+
+    printf("  %-14s %5lld outputs, max rel error %.8g, %d mismatches%s\n",
+           "mma nvfp4 exact", (long long) no, max_rel, bad, bad == 0 ? "" : "  FAIL");
+
+    free(ref);
+    free(enc);
+    free(got);
+    free(xf);
+    free(decoded);
+    free(wf);
+    gk_gallocr_free(alloc);
+    gk_free(ctx);
+    return bad == 0 ? 0 : 1;
 }
 
 // Several k-blocks and a column count that leaves the last tile ragged.
@@ -1187,6 +1371,9 @@ static int run_op_tol(gk_backend_t gpu, const char * name, op_builder build, flo
     const int64_t no = gk_nelements(gpu_out);
     int   bad     = 0;
     float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    float * dump_got = NULL;
+    float * dump_exp = NULL;
 
     if (no > 0) {
         // The output need not be f32 - im2col hands a convolution an f16
@@ -1217,16 +1404,33 @@ static int run_op_tol(gk_backend_t gpu, const char * name, op_builder build, flo
             if (diff > max_abs) {
                 max_abs = diff;
             }
+            const float rel = diff / (1.0f + fabsf(expected[i]));
+            if (rel > max_rel) {
+                max_rel = rel;
+            }
             if (!(diff <= tol + tol * fabsf(expected[i]))) {
                 bad++;
             }
         }
-        free(got);
-        free(exp_buf);
+        dump_got = got;
+        dump_exp = exp_buf;
     }
 
-    printf("  %-14s %5lld outputs, max abs error %.8g, %d mismatches%s\n",
-           name, (long long) no, max_abs, bad, bad == 0 ? "" : "  FAIL");
+    printf("  %-14s %5lld outputs, max abs error %.8g (rel %.4g), %d mismatches%s\n",
+           name, (long long) no, max_abs, max_rel, bad, bad == 0 ? "" : "  FAIL");
+
+    if (bad != 0 && getenv("GK_TEST_DUMP") != NULL) {
+        // The first few values either side. A tolerance count says something
+        // is wrong; this says whether it is noise on top of the right answer
+        // or a different answer altogether, which are not fixed the same way.
+        const int64_t show = no < 8 ? no : 8;
+        for (int64_t i = 0; i < show; ++i) {
+            printf("      [%lld] device %12.6f  cpu %12.6f\n",
+                   (long long) i, dump_got[i], dump_exp[i]);
+        }
+    }
+    free(dump_got);
+    free(dump_exp);
 
     gk_free(cpu_ctx);
     gk_gallocr_free(alloc);
@@ -1712,7 +1916,10 @@ int main(void) {
     failures += run_op(gpu, "cont permuted",  build_cont_permuted);
     failures += run_op(gpu, "mul_mat permut", build_mul_mat_permuted);
     failures += run_op(gpu, "mul_mat wide",   build_mul_mat_wide);
-    failures += run_op_tol(gpu, "mul_mat wide q", build_mul_mat_wide_q, 4e-2f);
+    // nvfp4 and 145 columns, so on a Blackwell part this is the FP4 tile and
+    // is bounded by the format rather than by the kernel - see the nvfp4 block
+    // further down for why that number is what it is.
+    failures += run_op_tol(gpu, "mul_mat wide q", build_mul_mat_wide_q, 6e-1f);
     failures += run_op_tol(gpu, "mul_mat narw q", build_mul_mat_narrow_q, 4e-2f);
     failures += run_op(gpu, "mul_mat wide b", build_mul_mat_wide_batched);
 
@@ -1739,10 +1946,29 @@ int main(void) {
     failures += run_op_tol(gpu, "mmv q4_K",      build_mmv_q4_K,     8e-2f);
     failures += run_op_tol(gpu, "mmv q4_0 nc",   build_mmv_q4_0_nc,  4e-2f);
 
-    failures += run_op_tol(gpu, "mma nvfp4",     build_mma_nvfp4,         4e-2f);
-    failures += run_op_tol(gpu, "mma nvfp4 exct", build_mma_nvfp4_exact,  4e-2f);
-    failures += run_op_tol(gpu, "mma nvfp4 deep", build_mma_nvfp4_deep,   4e-2f);
-    failures += run_op_tol(gpu, "mma nvfp4 batch", build_mma_nvfp4_batched, 4e-2f);
+    // nvfp4, and the bound here needs its reasoning spelled out because it is
+    // far looser than anything else in this file and that is not slack.
+    //
+    // On a device with FP4 tensor cores these four run on a kernel that
+    // quantizes the *activations* to e2m1. Four bits on both operands is about
+    // 7% relative error on a dot product of random data - and unlike weight
+    // error it does not shrink with k, because signal and noise both grow as
+    // sqrt(k). The CPU reference meanwhile quantizes activations to eight
+    // bits. So this comparison is between two different approximations and its
+    // spread is a property of the formats rather than of the kernel: no bound
+    // over it separates a correct kernel from a broken one.
+    //
+    // `run_nvfp4_tile_exact` is what does that, against a double-precision
+    // reference and inputs both sides represent exactly, where the FP4 tile
+    // measures *zero* error. These four are kept because they cover shapes it
+    // does not - ragged tiles, batching, several k-blocks - and a gross
+    // failure still trips them. `GK_MM_NVFP4_FP4=0` puts them back on the
+    // integer tile, where they hold to 4e-2 as they always did.
+    failures += run_op_tol(gpu, "mma nvfp4",     build_mma_nvfp4,         6e-1f);
+    failures += run_nvfp4_tile_exact(gpu);
+    failures += run_op_tol(gpu, "mma nvfp4 exct", build_mma_nvfp4_exact,  6e-1f);
+    failures += run_op_tol(gpu, "mma nvfp4 deep", build_mma_nvfp4_deep,   6e-1f);
+    failures += run_op_tol(gpu, "mma nvfp4 batch", build_mma_nvfp4_batched, 6e-1f);
 
     // The f16 tensor-core tile. Held looser than the float paths for one
     // reason, and it is worth being explicit about it: the fragments are f16,

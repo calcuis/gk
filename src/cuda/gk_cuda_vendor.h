@@ -38,6 +38,7 @@
 #define gkMemsetAsync           hipMemsetAsync
 #define gkMemcpy                hipMemcpy
 #define gkMemcpyAsync           hipMemcpyAsync
+#define gkMemcpyFromSymbol      hipMemcpyFromSymbol
 #define gkMemcpyHostToDevice    hipMemcpyHostToDevice
 #define gkMemcpyDeviceToHost    hipMemcpyDeviceToHost
 #define gkMemcpyDeviceToDevice  hipMemcpyDeviceToDevice
@@ -91,6 +92,7 @@
 #define gkMemsetAsync           cudaMemsetAsync
 #define gkMemcpy                cudaMemcpy
 #define gkMemcpyAsync           cudaMemcpyAsync
+#define gkMemcpyFromSymbol      cudaMemcpyFromSymbol
 #define gkMemcpyHostToDevice    cudaMemcpyHostToDevice
 #define gkMemcpyDeviceToHost    cudaMemcpyDeviceToHost
 #define gkMemcpyDeviceToDevice  cudaMemcpyDeviceToDevice

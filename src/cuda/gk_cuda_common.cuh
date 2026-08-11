@@ -17,6 +17,11 @@
 
 #include <stdio.h>
 
+// The most CUDA devices gk will track. Here rather than beside the device
+// table it sizes, because the matmul dispatcher caches a per-device answer of
+// its own and the two have to agree on the bound.
+#define GK_CUDA_MAX_DEVICES 16
+
 #include <chrono>
 
 // --------------------------------------------------------------------------

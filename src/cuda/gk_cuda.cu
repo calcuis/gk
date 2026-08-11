@@ -29,8 +29,6 @@
 
 #include <chrono>
 
-#define GK_CUDA_MAX_DEVICES 16
-
 // Device memory is handed out in multiples of this. Coalesced loads want their
 // rows aligned and the driver's own allocations are far coarser than this
 // anyway, so it costs nothing to promise.
@@ -440,6 +438,22 @@ static void gk_cu_prof_dump(void) {
     extern double g_gk_mm_tile_ms;
     gk_logf("\ngk cuda nvfp4 mma: %.1f ms quantizing activations, %.1f ms in the tile\n",
             g_gk_mm_quant_ms, g_gk_mm_tile_ms);
+
+    {
+        // GK_MM_FP4_STATS, if it was on. Zero counters mean it was not.
+        double sq_err = 0.0, sq_ref = 0.0;
+        unsigned long long zero = 0, groups = 0;
+
+        gk_cuda_fp4_stats(&sq_err, &sq_ref, &zero, &groups);
+
+        if (groups != 0) {
+            gk_logf("\ngk cuda nvfp4 activations: rms error %.4f%% of signal, "
+                    "%llu of %llu groups of 16 zeroed by scale underflow (%.3f%%)\n",
+                    100.0 * (sq_ref > 0.0 ? sqrt(sq_err / sq_ref) : 0.0),
+                    (unsigned long long) zero, (unsigned long long) groups,
+                    100.0 * (double) zero / (double) groups);
+        }
+    }
 
     gk_logf("\ngk cuda scratch: %lld calls, %lld grows (%lld failed), %.1f ms in the grow path\n",
             (long long) g_gk_scratch_stats.calls, (long long) g_gk_scratch_stats.grows,

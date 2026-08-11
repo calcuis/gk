@@ -23,9 +23,21 @@
 #include "gk_cuda_ops.cuh"
 
 #include <chrono>
+#include <mutex>
 
 #include <float.h>
 #include <stdlib.h>
+
+// GK_MM_FP4_STATS: what the nvfp4 activation quantizer is actually doing to
+// this model's numbers. Three counters, summed over every block it writes:
+// the energy of the input, the energy of what it reconstructs to, and how many
+// groups of sixteen come out identically zero because their amax fell under
+// the smallest ue4m3 scale. Together they say whether a bad result is
+// four-bit rounding or a group being deleted.
+__device__ double g_gk_fp4_sq_err;
+__device__ double g_gk_fp4_sq_ref;
+__device__ unsigned long long g_gk_fp4_zero_groups;
+__device__ unsigned long long g_gk_fp4_groups;
 
 #define GK_CU_MM_BLOCK 128
 
@@ -321,6 +333,160 @@ static __global__ void gk_cu_k_quantize_act(gk_tview b, gk_cu_q8blk * out,
     out[t] = blk;
 }
 
+// The same pass, quantizing to nvfp4 instead of to int8, for the FP4
+// tensor-core tile.
+//
+// One block is 64 activations against the int8 pass's 32, because 64 is what
+// one `m16n8k64` covers and what one weight block holds. Within it the scale
+// changes every sixteen - so this finds four amaxes, not one.
+//
+// Two things here are chosen to make the tile's inner loop free of work:
+//
+//   * The scale is quantized to ue4m3 *first* and the codes are made against
+//     the quantized scale, not against the amax. The hardware will multiply by
+//     the ue4m3 value, so that is the divisor the codes have to be consistent
+//     with; dividing by the amax and letting the scale round afterwards would
+//     put the rounding error into every one of the sixteen values instead of
+//     into the scale alone.
+//   * The codes are written in k order, eight to a word, which is exactly the
+//     fragment layout. The tile stages words, not bytes, and never repacks.
+static __global__ void gk_cu_k_quantize_act_fp4(gk_tview b, gk_cu_fp4blk * out,
+                                                int64_t n_grp, int64_t n_cols,
+                                                int64_t total, bool stats) {
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= total) {
+        return;
+    }
+
+    const int64_t g   = t % n_grp;
+    const int64_t col = (t / n_grp) % n_cols;
+    const int64_t i23 = t / (n_grp * n_cols);
+
+    const int64_t i2 = i23 % b.ne[2];
+    const int64_t i3 = i23 / b.ne[2];
+
+    gk_cu_fp4blk blk;
+
+    uint32_t sc     = 0;
+    double   sq_err = 0.0;
+    double   sq_ref = 0.0;
+    int      zeroed = 0;
+
+    // A sub-group of sixteen at a time, because that is the unit the scale
+    // covers and the search below needs all sixteen values in registers.
+    for (int sub = 0; sub < 4; ++sub) {
+        float v[16];
+        float amax = 0.0f;
+
+#pragma unroll
+        for (int e = 0; e < 16; ++e) {
+            v[e] = gk_cu_get(b, g * 64 + sub * 16 + e, col, i2, i3);
+            amax = fmaxf(amax, fabsf(v[e]));
+        }
+
+        // The first candidate: the smallest scale that keeps the group inside
+        // the codebook, 6 being the largest e2m1 magnitude.
+        //
+        // Clamped to the smallest non-zero ue4m3 rather than allowed to flush.
+        // Flushing looks harmless - a group whose amax is under 2^-9 is tiny -
+        // but it deletes the group outright, and on a real DiT that happened to
+        // **24% of all groups**, which is not tiny in aggregate and was the
+        // difference between a picture and noise. A clamped scale represents
+        // such a group coarsely; a zero scale represents it not at all.
+        int first = (int) gk_cu_f2ue4m3(amax * (1.0f / 6.0f));
+        if (first == 0 && amax > 0.0f) {
+            first = 1;
+        }
+
+        // Then four neighbours either side of it. The first candidate is the
+        // smallest scale that does not clip, which is not the same as the one
+        // that reproduces the group best: a larger scale clips the extreme
+        // value but rounds the other fifteen more finely, and with only eight
+        // codes that trade is often worth taking. Five squared-error
+        // evaluations of sixteen values each, against a matmul that will use
+        // this block thousands of times.
+        int   best_code = first;
+        float best_err  = FLT_MAX;
+
+#pragma unroll
+        for (int i = 0; i < 5; ++i) {
+            static const int offs[5] = { 0, -1, 1, -2, 2 };
+            const int code = first + offs[i];
+
+            if (code < 1 || code > 0x7e) {
+                continue;
+            }
+
+            const float sv  = 2.0f * gk_cu_ue4m3((uint8_t) code);
+            const float inv = sv > 0.0f ? 1.0f / sv : 0.0f;
+
+            float err = 0.0f;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float r = sv * 0.5f * (float) gk_cu_e2m1_value(gk_cu_f2e2m1(v[e] * inv));
+                const float d = r - v[e];
+
+                err = fmaf(d, d, err);
+            }
+
+            if (err < best_err) {
+                best_err  = err;
+                best_code = code;
+            }
+        }
+
+        if (amax <= 0.0f) {
+            best_code = 0;
+            zeroed++;
+        }
+
+        const float sv  = 2.0f * gk_cu_ue4m3((uint8_t) best_code);
+        const float inv = sv > 0.0f ? 1.0f / sv : 0.0f;
+
+        sc |= (uint32_t) best_code << (8 * sub);
+
+        // Into gk's own nvfp4 nibble order, not k order: a byte holds elements
+        // `j` and `j + 8` of its sixteen, low nibble first. That is how the
+        // weight side is stored and how the tile stages it, and the tile
+        // relies on the two agreeing - see the staging comment in
+        // `gk_cu_k_mul_mat_mma_fp4`.
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            uint32_t packed = 0;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int q_lo = gk_cu_f2e2m1(v[half * 4 + e]     * inv);
+                const int q_hi = gk_cu_f2e2m1(v[half * 4 + e + 8] * inv);
+
+                packed |= (uint32_t) q_lo << (8 * e);
+                packed |= (uint32_t) q_hi << (8 * e + 4);
+            }
+            blk.q[sub * 2 + half] = packed;
+        }
+
+        if (stats) {
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float r = sv * 0.5f * (float) gk_cu_e2m1_value(gk_cu_f2e2m1(v[e] * inv));
+                const double d = (double) (r - v[e]);
+
+                sq_err += d * d;
+                sq_ref += (double) v[e] * (double) v[e];
+            }
+        }
+    }
+
+    blk.sc = sc;
+    out[t] = blk;
+
+    if (stats) {
+        atomicAdd(&g_gk_fp4_sq_err, sq_err);
+        atomicAdd(&g_gk_fp4_sq_ref, sq_ref);
+        atomicAdd(&g_gk_fp4_zero_groups, (unsigned long long) zeroed);
+        atomicAdd(&g_gk_fp4_groups,      (unsigned long long) 4);
+    }
+}
+
 template <int NC, int ATYPE>
 static __global__ void gk_cu_k_mul_mat_q8(gk_tview a, gk_tview_mut d,
                                           const gk_cu_q8blk * aq, int64_t n_grp,
@@ -408,6 +574,41 @@ static __global__ void gk_cu_k_mul_mat_q8(gk_tview a, gk_tview_mut d,
 #define GK_CU_HAVE_MMA 1
 #endif
 
+// The block-scaled FP4 mma, which is not simply "Blackwell or later".
+//
+// It lives behind the *architecture-specific* target, `sm_120a` rather than
+// `sm_120`, and nvcc marks that with `__CUDA_ARCH_FEAT_SM120_ALL`. Keying on
+// `__CUDA_ARCH__ >= 1200` instead would be wrong in the one case that matters:
+// this build also embeds `compute_120` PTX for forward compatibility, and that
+// PTX must not contain an instruction the assembler will reject. Verified both
+// ways - the instruction reaches the PTX for `compute_120a` and does not for
+// `compute_120`.
+//
+// The host side of the gate cannot read this macro, since it is device-only.
+// `gk_cuda_mm_mma_fp4_available` below settles that by asking the *build* what
+// it contains rather than asking the device what it can do.
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
+#define GK_CU_HAVE_MMA_FP4 1
+#endif
+
+// Whether this build has FP4 device code at all, as a host-visible answer.
+//
+// A host function cannot see `__CUDA_ARCH_FEAT_SM120_ALL` - it is defined only
+// during a device pass - so this is a constant folded out of the *device*
+// passes and read back. `gk_cu_k_fp4_probe` writes 1 from a pass that has the
+// instruction and 0 from one that does not, so the answer is whatever the
+// device actually running the kernel was compiled for. That is the honest
+// question: a fat binary can contain sm_89 without the instruction and
+// sm_120a with it, and the compute capability alone does not distinguish a
+// 12.0 device whose image was built as `120` from one built as `120a`.
+static __global__ void gk_cu_k_fp4_probe(int * out) {
+#if defined(GK_CU_HAVE_MMA_FP4)
+    *out = 1;
+#else
+    *out = 0;
+#endif
+}
+
 // D += A*B, for a 16x8 tile of s32 over 16 of k, warp-wide.
 //
 // The fragment layouts are the ones PTX fixes for this shape: with
@@ -452,6 +653,54 @@ static __device__ __forceinline__ void gk_cu_mma_s8_k32(int (&d)[4], const int (
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 #else
     (void) a; (void) b; (void) d;
+#endif
+}
+
+// --------------------------------------------------------------------------
+// D += A*B for a 16x8 tile over *sixty-four* of k, with both operands in fp4
+// and the block scales applied by the hardware.
+//
+// This is a different machine from the two above, not a wider version of them.
+// `mma.sync...s8` multiplies integers and hands back an integer that gk then
+// has to scale itself, once per window, in CUDA-core arithmetic - which is
+// what makes an nvfp4 tile expensive, because nvfp4's scale changes every
+// sixteen elements and the drain therefore runs four times per sixty-four.
+// This instruction takes the e2m1 codes and the ue4m3 scales as themselves,
+// applies the scales internally, and accumulates in f32. There is no drain,
+// nothing to convert, and nothing to rescale.
+//
+// The scale operands are the unusual part. `scale_vec::4X` means four scales
+// per sixty-four elements - one per sixteen, exactly nvfp4's own geometry -
+// packed one per byte into a single register. They are supplied per *warp*
+// rather than per lane: with the `{byte-id, thread-id}` selectors both zero,
+// the hardware reads `a_scale` from threads 0 and 1 of each quad and
+// `b_scale` from thread 0, so a lane must hold
+//
+//   a_scale: the four scales of A row `lane/4 + (lane%2)*8`
+//   b_scale: the four scales of B column `lane/4`
+//
+// Lanes the hardware does not read still have to hold *something* defined;
+// the tile below simply computes the same expression in all four lanes of a
+// quad, which costs nothing and avoids a branch.
+//
+// A and B are the ordinary m16n8 fragments with eight codes to a register
+// rather than four bytes: `a[0]` and `a[1]` are rows `group` and `group+8` at
+// k `8*tig..+7`, `a[2]` and `a[3]` the same rows thirty-two further along, and
+// `b[0]`/`b[1]` column `group` at those same two k windows.
+static __device__ __forceinline__ void gk_cu_mma_fp4(float (&d)[4], const int (&a)[4],
+                                                     const int (&b)[2],
+                                                     unsigned sa, unsigned sb) {
+#if defined(GK_CU_HAVE_MMA_FP4)
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col."
+        "f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+        "%10, {0, 0}, %11, {0, 0};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+          "r"(sa), "r"(sb));
+#else
+    (void) a; (void) b; (void) d; (void) sa; (void) sb;
 #endif
 }
 
@@ -727,6 +976,68 @@ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
     }
 }
 
+// Whether the FP4 tensor-core tile can run on the device this stream is on.
+//
+// Asked of the *binary*, by launching a kernel that reports which device pass
+// it was compiled from, and cached per device. Two reasons it is not a compute
+// capability test:
+//
+//   * a fat binary can hold sm_120a code with the instruction and sm_120 code
+//     without it, and the capability is 12.0 either way;
+//   * `__CUDA_ARCH_FEAT_SM120_ALL` is device-only, so the host has no other
+//     way to find out.
+//
+// The cost is one launch and one 4-byte copy the first time a device is used.
+// A failure of any kind answers "no", which is always safe: the integer tile
+// computes the same thing.
+static bool gk_cuda_mm_mma_fp4_available(const struct gk_cuda_scratch * s,
+                                         gkStream_t stream) {
+#if defined(GK_USE_HIP)
+    (void) s; (void) stream;
+    return false;
+#else
+    if (s == NULL || s->cc < 120) {
+        return false;
+    }
+
+    static int         cache[GK_CUDA_MAX_DEVICES];
+    static bool        known[GK_CUDA_MAX_DEVICES] = { false };
+    static std::mutex  lock;
+
+    int dev = 0;
+    if (gkGetDevice(&dev) != gkSuccess || dev < 0 || dev >= GK_CUDA_MAX_DEVICES) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(lock);
+
+    if (known[dev]) {
+        return cache[dev] != 0;
+    }
+
+    known[dev] = true;
+    cache[dev] = 0;
+
+    int * flag = NULL;
+    if (gkMalloc((void **) &flag, sizeof(int)) != gkSuccess) {
+        return false;
+    }
+
+    int host = 0;
+    gk_cu_k_fp4_probe<<<1, 1, 0, stream>>>(flag);
+
+    if (gkGetLastError() == gkSuccess &&
+        gkMemcpyAsync(&host, flag, sizeof(int), gkMemcpyDeviceToHost, stream) == gkSuccess &&
+        gkStreamSynchronize(stream) == gkSuccess) {
+        cache[dev] = host;
+    }
+
+    gkFree(flag);
+
+    return cache[dev] != 0;
+#endif
+}
+
 // An integer knob read from the environment, once. `def` when it is unset or
 // unparseable - a typo should leave the default in place rather than select a
 // third thing.
@@ -741,6 +1052,220 @@ static int gk_cu_env_int(const char * name, int def) {
     const long v  = strtol(e, &end, 10);
 
     return (end != NULL && *end == '\0') ? (int) v : def;
+}
+
+// --------------------------------------------------------------------------
+// The FP4 tensor-core tile.
+//
+// Geometry, staging and epilogue are the integer tile above; the inner loop is
+// `gk_cu_mma_fp4`. Almost everything that makes this faster follows from the
+// instruction covering sixty-four of k rather than sixteen:
+//
+//   * No drain. The integer tile spends roughly sixteen CUDA-core
+//     instructions per tensor-core instruction emptying and rescaling an s32
+//     accumulator, four times per sixty-four of k, because that is how often
+//     an nvfp4 sub-scale changes. Here the scales are an operand.
+//   * Half the staging. A row's sixty-four codes are eight words of packed
+//     nibbles, where the integer tile stages eight words per *thirty-two*
+//     elements - so the same shared memory and the same barrier count carry
+//     twice the k.
+//   * Two registers of scale per lane instead of four floats plus the
+//     temporaries the drain needs.
+//
+// The one thing that is *not* free is the weight repack. gk stores an nvfp4
+// sub-block as "low nibbles are elements 0..7, high nibbles are 8..15", and a
+// fragment register wants eight consecutive elements. Those turn out to be the
+// same set: element `8*tig..+7` of a sub-block is entirely low nibbles when
+// `tig` is even and entirely high when it is odd, so a register is one
+// nibble-gather over eight bytes and never a cross-byte shuffle. It is done
+// once per weight row per k-step and used TILE_N times.
+// --------------------------------------------------------------------------
+
+// One A fragment - 16 rows by 64 fp4 codes - straight out of shared memory.
+//
+// `ldmatrix` rather than four indexed loads, and that is not a tuning choice
+// either. The per-lane register layout an mma expects for its A operand is
+// fixed by the hardware and is not the obvious one; `ldmatrix` is the
+// instruction that produces it from a row-major tile, so using it means the
+// layout never has to be written down, only the tile does. Four hand-rolled
+// loads have to guess it, and a wrong guess is a kernel that computes
+// something plausible-looking and wrong.
+//
+// `xs` is the lane's own row of the tile: row `lane % 16`, and the second half
+// of the k range for the upper sixteen lanes. Rows are 8 ints, so both halves
+// are 16-byte aligned, which the instruction requires.
+static __device__ __forceinline__ void gk_cu_ldmatrix_x4(int (&d)[4], const int * xs) {
+#if defined(GK_CU_HAVE_MMA)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "l"(xs));
+#else
+    (void) xs;
+    d[0] = d[1] = d[2] = d[3] = 0;
+#endif
+}
+
+#define GK_CU_MMA_FP4_K 64   // one nvfp4 block; one mma window
+
+template <int WARPS_M, int WN>
+static __global__ __launch_bounds__(GK_CU_MMA_THREADS(WARPS_M), 1)
+void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
+                             const gk_cu_fp4blk * aq, int64_t n_grp,
+                             int64_t r2, int64_t r3) {
+    constexpr int TILE_M = GK_CU_MMA_TILE_M_OF(WARPS_M);
+    constexpr int TILE_N = GK_CU_MMA_TILE_N_OF(WN);
+    constexpr int WNT    = WN / 8;
+
+    static_assert(TILE_M + TILE_N == GK_CU_MMA_THREADS(WARPS_M),
+                  "staging assumes one thread per staged row and column");
+
+    // 16-byte aligned because `ldmatrix` reads As in 16-byte pieces.
+    __shared__ __align__(16) uint32_t As[TILE_M][8];
+    __shared__ __align__(16) uint32_t Bs[TILE_N][8];
+    __shared__ uint32_t Ws[TILE_M];   // four ue4m3 scales, packed
+    __shared__ uint32_t Ad[TILE_N];
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int warp_m = warp / GK_CU_MMA_WARPS_N;
+    const int warp_n = warp % GK_CU_MMA_WARPS_N;
+
+    const int64_t m0  = (int64_t) blockIdx.x * TILE_M;
+    const int64_t n0  = (int64_t) blockIdx.y * TILE_N;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_fp4blk * aq23 = aq + i23 * n_cols * n_grp;
+
+    // The scale registers the hardware will read from this lane: A row
+    // `group + (lane%2)*8`, B column `group`. Computed in every lane of a quad
+    // rather than only in the two that are read - see `gk_cu_mma_fp4`.
+    const int sc_row = group + (lane % 2) * 8;
+
+    float acc[GK_CU_MMA_WMT][WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    for (int64_t g = 0; g < n_grp; ++g) {
+        if (threadIdx.x < TILE_M) {
+            const int     r = (int) threadIdx.x;
+            const int64_t m = m0 + r;
+
+            if (m < n_rows) {
+                // 36 bytes a block: four ue4m3 scales, then sixty-four codes.
+                const uint8_t * blk = (const uint8_t *) gk_cu_row(a, m, a2, a3) + g * 36;
+
+                // Verbatim. gk stores an nvfp4 sub-block as "low nibbles are
+                // elements 0..7, high nibbles are 8..15", which is not the
+                // order of k - but a matmul sums over k, so a permutation of
+                // it costs nothing as long as *both* operands carry the same
+                // one. The activation quantizer writes this same order for
+                // exactly that reason, and the two cancel. What must survive
+                // the permutation is the scale grouping, and it does: a
+                // sub-block is two whole words either way.
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    As[r][w] = (uint32_t) gk_cu_int_b2(blk + 4, w);
+                }
+
+                Ws[r] = (uint32_t) gk_cu_int_b2(blk, 0);
+            } else {
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    As[r][w] = 0;
+                }
+                Ws[r] = 0;
+            }
+        } else if (threadIdx.x < TILE_M + TILE_N) {
+            const int     c = (int) threadIdx.x - TILE_M;
+            const int64_t n = n0 + c;
+
+            if (n < n_cols) {
+                const gk_cu_fp4blk & ab = aq23[n * n_grp + g];
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    Bs[c][w] = ab.q[w];
+                }
+                Ad[c] = ab.sc;
+            } else {
+#pragma unroll
+                for (int w = 0; w < 8; ++w) {
+                    Bs[c][w] = 0;
+                }
+                Ad[c] = 0;
+            }
+        }
+
+        __syncthreads();
+
+        int      af[GK_CU_MMA_WMT][4];
+        unsigned as[GK_CU_MMA_WMT];
+
+#pragma unroll
+        for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+            const int r0 = warp_m * GK_CU_MMA_WM + wt * 16;
+
+            gk_cu_ldmatrix_x4(af[wt],
+                              (const int *) &As[r0 + (lane % 16)][(lane / 16) * 4]);
+
+            as[wt] = Ws[r0 + sc_row];
+        }
+
+#pragma unroll
+        for (int ct = 0; ct < WNT; ++ct) {
+            const int c = warp_n * WN + ct * 8 + group;
+
+            int bf[2];
+            bf[0] = (int) Bs[c][tig];
+            bf[1] = (int) Bs[c][4 + tig];
+
+            const unsigned bs = Ad[c];
+
+#pragma unroll
+            for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+                gk_cu_mma_fp4(acc[wt][ct], af[wt], bf, as[wt], bs);
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_MMA_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * WN + ct * 8
+                                + tig * 2 + (i & 1);
+
+                if (m < n_rows && n < n_cols) {
+                    gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                }
+            }
+        }
+    }
 }
 
 // Whether a shape should take the wide nvfp4 tile.
@@ -1726,6 +2251,7 @@ static const char * g_gk_mm_path = "-";
 double g_gk_mm_quant_ms = 0.0;
 double g_gk_mm_tile_ms  = 0.0;
 
+
 // Both diagnostics below are off in every run that is not being investigated,
 // so the environment is read once rather than once per matmul.
 static bool gk_cu_env_on(const char * name) {
@@ -1741,6 +2267,40 @@ static bool gk_cu_mm_dump_on(void) {
 static bool gk_cu_mm_split_on(void) {
     static const bool on = gk_cu_env_on("GK_MM_SPLIT");
     return on;
+}
+
+// `GK_MM_NVFP4_FP4=0` sends nvfp4 back to the integer tile on a device that
+// has the FP4 instruction. It is how the two are A/B'd, and how a numerical
+// question about fp4 activations gets a same-binary control - the two paths
+// quantize the activation side differently, so they are the one pair here that
+// does *not* agree bit for bit.
+static bool gk_cu_mm_fp4_stats_on(void) {
+    static const bool on = gk_cu_env_on("GK_MM_FP4_STATS");
+    return on;
+}
+
+static bool gk_cu_mm_fp4_enabled(void) {
+    static const int on = gk_cu_env_int("GK_MM_NVFP4_FP4", 1);
+    return on != 0;
+}
+
+// The FP4 activation counters, read in the translation unit that owns them.
+//
+// Not read directly from the profile printer, and that is not tidiness: gk
+// builds with separable compilation off, so each .cu is its own device module
+// and an `extern __device__` in another file does not resolve to these. It
+// silently reads a different, permanently zero copy - which is exactly what it
+// did before this function existed.
+void gk_cuda_fp4_stats(double * sq_err, double * sq_ref,
+                       unsigned long long * zero_groups, unsigned long long * groups) {
+    *sq_err = 0.0; *sq_ref = 0.0; *zero_groups = 0; *groups = 0;
+
+    if (gkMemcpyFromSymbol(sq_err,      g_gk_fp4_sq_err,      sizeof(*sq_err))      != gkSuccess ||
+        gkMemcpyFromSymbol(sq_ref,      g_gk_fp4_sq_ref,      sizeof(*sq_ref))      != gkSuccess ||
+        gkMemcpyFromSymbol(zero_groups, g_gk_fp4_zero_groups, sizeof(*zero_groups)) != gkSuccess ||
+        gkMemcpyFromSymbol(groups,      g_gk_fp4_groups,      sizeof(*groups))      != gkSuccess) {
+        *groups = 0;
+    }
 }
 
 const char * gk_cuda_mm_last_path(void) {
@@ -1800,6 +2360,72 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         // exists: `mma.sync` with integer operands is Ampere and later. A
         // 64-element nvfp4 block and a 32-element activation block both have
         // to divide k, so 64 does.
+        // The FP4 tensor-core tile, where the hardware has the instruction.
+        // Same shapes and the same gate as the integer nvfp4 path below, so
+        // this sits in front of it rather than beside it; `GK_MM_NVFP4_FP4=0`
+        // puts a run back on the integer tile for comparison.
+        if ((int) src0->type == GK_TYPE_NVFP4 && k_len % 64 == 0 &&
+            gk_cu_mm_fp4_enabled() && gk_cuda_mm_mma_fp4_available(scratch, stream)) {
+            const int64_t n_grp  = k_len / 64;
+            const int64_t n_cols = dst->ne[1];
+            const int64_t n_23   = dst->ne[2] * dst->ne[3];
+            const int64_t n_blk  = n_grp * n_cols * n_23;
+
+            gk_cu_fp4blk * aq = (gk_cu_fp4blk *) gk_cu_scratch_get(
+                scratch, (size_t) n_blk * sizeof(gk_cu_fp4blk), stream);
+
+            if (aq != NULL) {
+                const bool split = gk_cu_mm_split_on();
+                if (split) { GK_CUDA_CHECK(gkStreamSynchronize(stream)); }
+                const std::chrono::steady_clock::time_point q0 =
+                    std::chrono::steady_clock::now();
+
+                gk_cu_k_quantize_act_fp4<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
+                                           GK_CUDA_BLOCK, 0, stream>>>(
+                    gk_cu_view(src1), aq, n_grp, n_cols, n_blk,
+                    gk_cu_mm_fp4_stats_on());
+
+                if (split) {
+                    GK_CUDA_CHECK(gkStreamSynchronize(stream));
+                    g_gk_mm_quant_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - q0).count();
+                }
+
+                const bool wide = gk_cu_mma_nvfp4_wide(dst, scratch);
+
+                const int64_t tile_m = wide ? GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_WIDE)
+                                            : GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_NARROW);
+                const int64_t tile_n = wide ? GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_WIDE)
+                                            : GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_NARROW);
+
+                dim3 mgrid;
+                mgrid.x = (unsigned) ((dst->ne[0] + tile_m - 1) / tile_m);
+                mgrid.y = (unsigned) ((n_cols     + tile_n - 1) / tile_n);
+                mgrid.z = (unsigned) n_23;
+
+                g_gk_mm_path = wide ? "mma-fp4-128" : "mma-fp4-64";
+                const std::chrono::steady_clock::time_point m0 =
+                    std::chrono::steady_clock::now();
+
+                if (wide) {
+                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_WIDE, GK_CU_MMA_WN_WIDE>
+                        <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_WIDE), 0, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                } else {
+                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_NARROW, GK_CU_MMA_WN_NARROW>
+                        <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_NARROW), 0, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                }
+
+                if (split) {
+                    GK_CUDA_CHECK(gkStreamSynchronize(stream));
+                    g_gk_mm_tile_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - m0).count();
+                }
+                return;
+            }
+        }
+
         if ((int) src0->type == GK_TYPE_NVFP4 && k_len % 64 == 0 &&
             scratch != NULL && scratch->cc >= 80) {
             const int64_t n_grp  = k_len / 32;
