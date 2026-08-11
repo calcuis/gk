@@ -25,6 +25,7 @@
 #include <chrono>
 
 #include <float.h>
+#include <stdlib.h>
 
 #define GK_CU_MM_BLOCK 128
 
@@ -501,29 +502,63 @@ static __device__ __forceinline__ int gk_cu_e2m1_quad(int w, int shift) {
 // where f16 read 1.5, and was 1.2x to 2.4x slower for it.
 //
 // Two row tiles per warp make each B fragment feed two instructions and each A
-// fragment four, without changing the block's 64x64 tile or how many blocks a
-// shape gets - which matters here, because these shapes are wide and short and
-// several of them only just fill the device as it is.
-#define GK_CU_MMA_TILE_M 64   // rows a block owns
-#define GK_CU_MMA_TILE_N 64   // columns a block owns
-#define GK_CU_MMA_WARPS_M 2
-#define GK_CU_MMA_WARPS_N 2
-#define GK_CU_MMA_WM     (GK_CU_MMA_TILE_M / GK_CU_MMA_WARPS_M)  // 32 rows a warp owns
-#define GK_CU_MMA_WN     (GK_CU_MMA_TILE_N / GK_CU_MMA_WARPS_N)  // 32 columns
-#define GK_CU_MMA_WMT    (GK_CU_MMA_WM / 16)                     // 2 mma row tiles
-#define GK_CU_MMA_WNT    (GK_CU_MMA_WN /  8)                     // 4 mma column tiles
-#define GK_CU_MMA_K      32   // one activation block; two mma windows of 16
+// fragment four.
+//
+// How wide the block's tile is, on the other hand, is what decides how many
+// times each operand is read from memory rather than from shared: a TILE_M x
+// TILE_N tile re-streams the weights `n_cols / TILE_N` times and the
+// activations `n_rows / TILE_M` times, so doubling both halves both. At
+// MiniMax-H3's 28672x8742x5376 those multipliers are 137 and 448 at 64x64 -
+// 34 GB of requests against 140 MB of actual operands - which is what makes
+// the tile, not the instruction, the thing worth changing. The integer tile
+// for the k-quants learned this the expensive way (see `mma-q8` below, where
+// the instruction was worth 16% and the width the other 1.5x), and this is the
+// same lever on the format that pilot was written for.
+//
+// So the geometry is a template parameter with two instantiations. A wide tile
+// buys its reuse by making blocks scarce - a quarter as many for the same
+// output - and the shapes this kernel serves range from a MiniMax-H3
+// projection, thousands of blocks at either width, down to a UNet's deepest
+// level at 5120x1280 with 256 columns, which is eighty blocks narrow and
+// twenty wide on a part with 170 multiprocessors. Measured, that shape is 1.9x
+// *slower* wide. `gk_cu_mma_nvfp4_wide` below is where the choice is made.
+#define GK_CU_MMA_WARPS_N 2   // columns of warps, both widths
+#define GK_CU_MMA_WM      32  // rows a warp owns, both widths
+#define GK_CU_MMA_WMT     (GK_CU_MMA_WM / 16)  // 2 mma row tiles
+#define GK_CU_MMA_K       32  // one activation block; two mma windows of 16
 
-static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
-                                                 const gk_cu_q8blk * aq, int64_t n_grp,
-                                                 int64_t r2, int64_t r3) {
+// The narrow tile: 64x64 over 4 warps. The wide one: 128x128 over 8.
+#define GK_CU_MMA_WARPS_M_NARROW 2
+#define GK_CU_MMA_WN_NARROW      32
+#define GK_CU_MMA_WARPS_M_WIDE   4
+#define GK_CU_MMA_WN_WIDE        64
+
+#define GK_CU_MMA_THREADS(warps_m) ((warps_m) * GK_CU_MMA_WARPS_N * GK_WARP_SIZE)
+#define GK_CU_MMA_TILE_M_OF(warps_m) ((warps_m) * GK_CU_MMA_WM)
+#define GK_CU_MMA_TILE_N_OF(wn)      (GK_CU_MMA_WARPS_N * (wn))
+
+template <int WARPS_M, int WN>
+static __global__ __launch_bounds__(GK_CU_MMA_THREADS(WARPS_M), 1)
+void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
+                               const gk_cu_q8blk * aq, int64_t n_grp,
+                               int64_t r2, int64_t r3) {
+    constexpr int TILE_M = GK_CU_MMA_TILE_M_OF(WARPS_M);
+    constexpr int TILE_N = GK_CU_MMA_TILE_N_OF(WN);
+    constexpr int WNT    = WN / 8;   // mma column tiles a warp owns
+
+    // Staging is one thread per row and one per column, so the two together
+    // are the block - which is what keeps the wide tile from needing a strided
+    // staging loop, exactly as in `mma-q8`.
+    static_assert(TILE_M + TILE_N == GK_CU_MMA_THREADS(WARPS_M),
+                  "staging assumes one thread per staged row and column");
+
     // Staged as ints rather than bytes so that the fragment reads below are
     // plain aligned loads: word `h*4 + tig` is exactly the four codes a lane
     // wants for half `h`.
-    __shared__ int   As[GK_CU_MMA_TILE_M][8];
-    __shared__ int   Bs[GK_CU_MMA_TILE_N][8];
-    __shared__ float Ws[GK_CU_MMA_TILE_M][2];
-    __shared__ float Ad[GK_CU_MMA_TILE_N];
+    __shared__ int   As[TILE_M][8];
+    __shared__ int   Bs[TILE_N][8];
+    __shared__ float Ws[TILE_M][2];
+    __shared__ float Ad[TILE_N];
 
     const int lane  = threadIdx.x % GK_WARP_SIZE;
     const int warp  = threadIdx.x / GK_WARP_SIZE;
@@ -533,8 +568,8 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
     const int warp_m = warp / GK_CU_MMA_WARPS_N;
     const int warp_n = warp % GK_CU_MMA_WARPS_N;
 
-    const int64_t m0  = (int64_t) blockIdx.x * GK_CU_MMA_TILE_M;
-    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMA_TILE_N;
+    const int64_t m0  = (int64_t) blockIdx.x * TILE_M;
+    const int64_t n0  = (int64_t) blockIdx.y * TILE_N;
     const int64_t i23 = blockIdx.z;
 
     const int64_t i2 = i23 % d.ne[2];
@@ -548,11 +583,11 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
 
     const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
 
-    float acc[GK_CU_MMA_WMT][GK_CU_MMA_WNT][4];
+    float acc[GK_CU_MMA_WMT][WNT][4];
 #pragma unroll
     for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
 #pragma unroll
-        for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
+        for (int ct = 0; ct < WNT; ++ct) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 acc[wt][ct][i] = 0.0f;
@@ -563,9 +598,9 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
     for (int64_t g = 0; g < n_grp; ++g) {
         const int64_t kk0 = g * GK_CU_MMA_K;
 
-        // Staging: sixty-four threads take a weight row each, the other
-        // sixty-four an activation column each.
-        if (threadIdx.x < GK_CU_MMA_TILE_M) {
+        // Staging: TILE_M threads take a weight row each, the other TILE_N an
+        // activation column each - the whole block, at either width.
+        if (threadIdx.x < TILE_M) {
             const int     r = (int) threadIdx.x;
             const int64_t m = m0 + r;
 
@@ -598,8 +633,8 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
                 Ws[r][0] = 0.0f;
                 Ws[r][1] = 0.0f;
             }
-        } else if (threadIdx.x < GK_CU_MMA_TILE_M + GK_CU_MMA_TILE_N) {
-            const int     c = (int) threadIdx.x - GK_CU_MMA_TILE_M;
+        } else if (threadIdx.x < TILE_M + TILE_N) {
+            const int     c = (int) threadIdx.x - TILE_M;
             const int64_t n = n0 + c;
 
             if (n < n_cols) {
@@ -624,10 +659,10 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
         // the same for both mma windows below - read once per k-step rather
         // than once per window, which is eight of the shared loads this loop
         // used to make per window.
-        float adv[GK_CU_MMA_WNT][2];
+        float adv[WNT][2];
 #pragma unroll
-        for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
-            const int c = warp_n * GK_CU_MMA_WN + ct * 8 + tig * 2;
+        for (int ct = 0; ct < WNT; ++ct) {
+            const int c = warp_n * WN + ct * 8 + tig * 2;
             adv[ct][0] = Ad[c + 0];
             adv[ct][1] = Ad[c + 1];
         }
@@ -651,10 +686,10 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
             }
 
 #pragma unroll
-            for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
+            for (int ct = 0; ct < WNT; ++ct) {
                 // One B fragment, both row tiles - which is what giving a warp
                 // two of them buys.
-                const int bf = Bs[warp_n * GK_CU_MMA_WN + ct * 8 + group][h * 4 + tig];
+                const int bf = Bs[warp_n * WN + ct * 8 + group][h * 4 + tig];
 
 #pragma unroll
                 for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
@@ -676,12 +711,12 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
 #pragma unroll
     for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
 #pragma unroll
-        for (int ct = 0; ct < GK_CU_MMA_WNT; ++ct) {
+        for (int ct = 0; ct < WNT; ++ct) {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int64_t m = m0 + warp_m * GK_CU_MMA_WM + wt * 16
                                 + group + (i >= 2 ? 8 : 0);
-                const int64_t n = n0 + warp_n * GK_CU_MMA_WN + ct * 8
+                const int64_t n = n0 + warp_n * WN + ct * 8
                                 + tig * 2 + (i & 1);
 
                 if (m < n_rows && n < n_cols) {
@@ -690,6 +725,59 @@ static __global__ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
             }
         }
     }
+}
+
+// An integer knob read from the environment, once. `def` when it is unset or
+// unparseable - a typo should leave the default in place rather than select a
+// third thing.
+static int gk_cu_env_int(const char * name, int def) {
+    const char * e = getenv(name);
+
+    if (e == NULL || e[0] == '\0') {
+        return def;
+    }
+
+    char *    end = NULL;
+    const long v  = strtol(e, &end, 10);
+
+    return (end != NULL && *end == '\0') ? (int) v : def;
+}
+
+// Whether a shape should take the wide nvfp4 tile.
+//
+// The wide tile halves both re-read multipliers, so it is what you want
+// whenever it can be kept fed - and it is paid for in blocks, four of the
+// narrow tile's for every one of its own. The test is therefore not about the
+// shape in the abstract but about this device: a grid that no longer covers
+// the multiprocessors has multiprocessors standing idle, and no amount of
+// reuse inside a block makes up for that.
+//
+// One block per multiprocessor is the floor rather than a target. Above it the
+// wide tile wins on every diffusion shape measured; below it the narrow one is
+// strictly better, because the device is short of work rather than short of
+// bandwidth.
+//
+// `GK_MM_NVFP4_TILE=64` or `=128` overrides the heuristic. That exists for two
+// reasons and both are worth more than the knob: it is how the two widths are
+// A/B'd at a fixed shape, and it is how the wide tile gets *tested* at all -
+// every nvfp4 case in `test_cuda.c` is far too small to select it, so without
+// a way to force the choice the widening would ship covered by nothing.
+static __host__ __forceinline__ bool gk_cu_mma_nvfp4_wide(const struct gk_tensor * dst,
+                                                          const struct gk_cuda_scratch * s) {
+    static const int forced = gk_cu_env_int("GK_MM_NVFP4_TILE", 0);
+
+    if (forced == 64 || forced == 128) {
+        return forced == 128;
+    }
+
+    const int64_t tm = GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_WIDE);
+    const int64_t tn = GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_WIDE);
+
+    const int64_t blocks = ((dst->ne[0] + tm - 1) / tm)
+                         * ((dst->ne[1] + tn - 1) / tn)
+                         * dst->ne[2] * dst->ne[3];
+
+    return s != NULL && s->n_sm > 0 && blocks >= (int64_t) s->n_sm;
 }
 
 // --------------------------------------------------------------------------
@@ -1742,17 +1830,35 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         std::chrono::steady_clock::now() - q0).count();
                 }
 
+                const bool wide = gk_cu_mma_nvfp4_wide(dst, scratch);
+
+                const int64_t tile_m = wide ? GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_WIDE)
+                                            : GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_NARROW);
+                const int64_t tile_n = wide ? GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_WIDE)
+                                            : GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_NARROW);
+
                 dim3 mgrid;
-                mgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMA_TILE_M - 1) / GK_CU_MMA_TILE_M);
-                mgrid.y = (unsigned) ((n_cols     + GK_CU_MMA_TILE_N - 1) / GK_CU_MMA_TILE_N);
+                mgrid.x = (unsigned) ((dst->ne[0] + tile_m - 1) / tile_m);
+                mgrid.y = (unsigned) ((n_cols     + tile_n - 1) / tile_n);
                 mgrid.z = (unsigned) n_23;
 
-                g_gk_mm_path = "mma-nvfp4";
+                // The width is in the path name because it is the thing most
+                // worth knowing about a run of this kernel, and a profile that
+                // said only "mma-nvfp4" would hide the heuristic above going
+                // the wrong way on a shape.
+                g_gk_mm_path = wide ? "mma-nvfp4-128" : "mma-nvfp4-64";
                 const std::chrono::steady_clock::time_point m0 =
                     std::chrono::steady_clock::now();
 
-                gk_cu_k_mul_mat_mma_nvfp4<<<mgrid, 128, 0, stream>>>(
-                    gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                if (wide) {
+                    gk_cu_k_mul_mat_mma_nvfp4<GK_CU_MMA_WARPS_M_WIDE, GK_CU_MMA_WN_WIDE>
+                        <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_WIDE), 0, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                } else {
+                    gk_cu_k_mul_mat_mma_nvfp4<GK_CU_MMA_WARPS_M_NARROW, GK_CU_MMA_WN_NARROW>
+                        <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_NARROW), 0, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                }
 
                 if (split) {
                     GK_CUDA_CHECK(gkStreamSynchronize(stream));

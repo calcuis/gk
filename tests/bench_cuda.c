@@ -352,6 +352,33 @@ DIT_MM(proj,  3072,  3072)   // attention qkv / out projection - 48 per step
 DIT_MM(ffup,  3072, 12288)   // feed-forward in  - 12 per step
 DIT_MM(ffdn, 12288,  3072)   // feed-forward out - 12 per step
 
+// The four matmuls a MiniMax-H3 video DiT step is made of, read off a profile
+// of an actual 480x480x124 generation: 8742 tokens, hidden 5376, feed-forward
+// to 14336, and a fused qkv of 28672 rows. Between them they are 59% of a
+// denoising step at nvfp4, so the same argument as above applies with a wider
+// margin - and the shapes are five times the MageFlow ones in every direction,
+// which is where a tile that re-streams its operands starts to show.
+//
+// Same three ways: nvfp4 is what runs, f16 is the no-decode ceiling, q4_K is
+// the control that takes a *different* kernel at the same shape. That last one
+// is the point of the group - the two formats have separate tiles, and their
+// separation is the hypothesis being tested.
+#define DIT_H3(name, k, rows)                                                            \
+    static struct gk_tensor * b_h3_##name##_nv (struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_NVFP4, (k), (rows), 8742);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_h3_##name##_f16(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_F16,   (k), (rows), 8742);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_h3_##name##_q4k(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_Q4_K,  (k), (rows), 8742);                        \
+    }
+
+DIT_H3(qkv,   5376, 28672)   // fused qkv projection
+DIT_H3(proj,  5376, 21504)   // the 21504-row projection
+DIT_H3(ffdn, 14336,  5376)   // feed-forward out - the long-k shape
+DIT_H3(ffo,   7168,  5376)   // the 7168-k projection
+
 static struct gk_tensor * b_mm_gate_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0, N_EMBD, N_FF,    N_PREFILL); }
 static struct gk_tensor * b_mm_down_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_1, N_FF,   N_EMBD,  N_PREFILL); }
 static struct gk_tensor * b_mm_f16_pre (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,  N_EMBD, N_FF,    N_PREFILL); }
@@ -653,6 +680,9 @@ struct bench_case {
     size_t       arena;   // 0 for the default
 };
 
+// A MiniMax-H3 output tile alone is 28672x8742 floats - one gigabyte - so the
+// group below needs an arena the others would never touch.
+#define ARENA_HUGE  ((size_t) 6144u << 20)
 #define ARENA_BIG   ((size_t) 3072u << 20)
 #define ARENA_MID   ((size_t) 1024u << 20)
 #define ARENA_SMALL ((size_t)  256u << 20)
@@ -710,6 +740,20 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ff down   nvfp4", "12288x3072 n=2048",  b_dit_ffdn_nv,  ARENA_BIG },
     { NULL,            "ff down   f16",   "12288x3072 n=2048",  b_dit_ffdn_f16, ARENA_BIG },
     { NULL,            "ff down   q4_K",  "12288x3072 n=2048",  b_dit_ffdn_q4k, ARENA_BIG },
+
+    { "MiniMax-H3 video DiT matmuls (nvfp4, against f16 and q4_K at the same shape)",
+                       "qkv       nvfp4", "5376x28672 n=8742",  b_h3_qkv_nv,   ARENA_HUGE },
+    { NULL,            "qkv       f16",   "5376x28672 n=8742",  b_h3_qkv_f16,  ARENA_HUGE },
+    { NULL,            "qkv       q4_K",  "5376x28672 n=8742",  b_h3_qkv_q4k,  ARENA_HUGE },
+    { NULL,            "proj      nvfp4", "5376x21504 n=8742",  b_h3_proj_nv,  ARENA_HUGE },
+    { NULL,            "proj      f16",   "5376x21504 n=8742",  b_h3_proj_f16, ARENA_HUGE },
+    { NULL,            "proj      q4_K",  "5376x21504 n=8742",  b_h3_proj_q4k, ARENA_HUGE },
+    { NULL,            "ff down   nvfp4", "14336x5376 n=8742",  b_h3_ffdn_nv,  ARENA_HUGE },
+    { NULL,            "ff down   f16",   "14336x5376 n=8742",  b_h3_ffdn_f16, ARENA_HUGE },
+    { NULL,            "ff down   q4_K",  "14336x5376 n=8742",  b_h3_ffdn_q4k, ARENA_HUGE },
+    { NULL,            "ff out    nvfp4", "7168x5376 n=8742",   b_h3_ffo_nv,   ARENA_HUGE },
+    { NULL,            "ff out    f16",   "7168x5376 n=8742",   b_h3_ffo_f16,  ARENA_HUGE },
+    { NULL,            "ff out    q4_K",  "7168x5376 n=8742",   b_h3_ffo_q4k,  ARENA_HUGE },
 
     { "matmul (prefill, 512 columns)", "ffn_gate/up q4_0", "1536x6144",   b_mm_gate_pre,  ARENA_MID   },
     { NULL,                            "ffn_down    q4_1", "6144x1536",   b_mm_down_pre,  ARENA_MID   },
