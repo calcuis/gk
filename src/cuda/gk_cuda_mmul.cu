@@ -3198,13 +3198,14 @@ static __device__ __forceinline__ int gk_cu_pack2_half(float lo, float hi) {
 // element costs several times what the arithmetic does, and the kernel becomes
 // a memcpy with a tensor core attached. Whether the eight can be taken as one
 // word is decided on the host, once per launch.
-static __device__ __forceinline__ int4 gk_cu_fam_run8(const gk_tview & t, bool vec,
+template <bool VEC>
+static __device__ __forceinline__ int4 gk_cu_fam_run8(const gk_tview & t,
                                                       int64_t i0, int64_t i1,
                                                       int64_t i2, int64_t i3,
                                                       int64_t n0) {
     const char * row = gk_cu_row(t, i1, i2, i3);
 
-    if (vec && i0 + 8 <= n0) {
+    if (VEC && i0 + 8 <= n0) {
         return *(const int4 *) (row + i0 * 2);
     }
 
@@ -3217,16 +3218,49 @@ static __device__ __forceinline__ int4 gk_cu_fam_run8(const gk_tview & t, bool v
     return *(const int4 *) h;
 }
 
-template <int D_PAD>
+// One Q element, for the three float types Q can actually arrive as.
+//
+// Same reason as the mask below: `gk_cu_get` resolves the type at run time
+// across every format gk supports, and inlining that switch into the 32
+// unrolled reads that fill a warp's Q fragments is a jump table each. Three
+// arms of one load each is what this is instead. The host gate restricts Q to
+// these types so the fourth case cannot happen.
+static __device__ __forceinline__ float gk_cu_fam_qval(const gk_tview & q,
+                                                       int64_t k0, int64_t r,
+                                                       int64_t i2, int64_t i3) {
+    const char * p = gk_cu_row(q, r, i2, i3) + k0 * q.nb[0];
+
+    if (q.type == GKT_F32) {
+        return *(const float *) p;
+    }
+    if (q.type == GKT_F16) {
+        return __half2float(*(const __half *) p);
+    }
+    return gk_cu_bf2f(*(const uint16_t *) p);
+}
+
+// One mask element, read as the f16 it is required to be.
+//
+// Not `gk_cu_get`. That resolves the tensor's type at run time, and a type
+// switch is a jump table - which, inlined into a loop that reads sixteen mask
+// elements per key tile, is most of what this kernel's inner loop compiles to.
+// The host gate below requires an f16 mask precisely so that this can be a
+// load.
+static __device__ __forceinline__ float gk_cu_fam_mask(const gk_tview & m,
+                                                       int64_t ic, int64_t r,
+                                                       int64_t i2, int64_t i3) {
+    return __half2float(*(const __half *) (gk_cu_row(m, r, i2, i3) + ic * m.nb[0]));
+}
+
+template <int D_PAD, bool VEC, bool HAS_MASK>
 static __global__ __launch_bounds__(GK_CU_FAM_THREADS)
 void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
-                            gk_tview mask, bool has_mask,
+                            gk_tview mask,
                             const float * sinks, gk_tview_mut d,
                             float scale, float max_bias,
                             float logit_softcap, int64_t n_head_log2,
                             int64_t rk2, int64_t rk3,
-                            int64_t rv2, int64_t rv3,
-                            bool k_vec, bool v_vec) {
+                            int64_t rv2, int64_t rv3) {
     const int NT_K = GK_CU_FAM_NTK(D_PAD);
     const int NT_V = GK_CU_FAM_NTV(D_PAD);
 
@@ -3275,8 +3309,8 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
             const int64_t r  = (j & 1) ? row1 : row0;
             const int64_t k0 = kt * 16 + (j >= 2 ? 8 : 0) + 2 * tig;
 
-            const float a = r < n_q && k0     < DK ? gk_cu_get(q, k0,     r, iq2, iq3) : 0.0f;
-            const float b = r < n_q && k0 + 1 < DK ? gk_cu_get(q, k0 + 1, r, iq2, iq3) : 0.0f;
+            const float a = r < n_q && k0     < DK ? gk_cu_fam_qval(q, k0,     r, iq2, iq3) : 0.0f;
+            const float b = r < n_q && k0 + 1 < DK ? gk_cu_fam_qval(q, k0 + 1, r, iq2, iq3) : 0.0f;
 
             qf[kt][j] = gk_cu_pack2_half(a, b);
         }
@@ -3317,7 +3351,7 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
             const int64_t ic = c_base + c;
 
             *(int4 *) &Ks[buf][c][i] = ic < n_kv
-                ? gk_cu_fam_run8(k, k_vec, i, ic, ik2, ik3, DK)
+                ? gk_cu_fam_run8<VEC>(k, i, ic, ik2, ik3, DK)
                 : make_int4(0, 0, 0, 0);
         }
 
@@ -3329,7 +3363,7 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
             const int64_t ic = c_base + c;
 
             const int4 w = ic < n_kv
-                ? gk_cu_fam_run8(v, v_vec, i, ic, iv2, iv3, DV)
+                ? gk_cu_fam_run8<VEC>(v, i, ic, iv2, iv3, DV)
                 : make_int4(0, 0, 0, 0);
 
             // The one scattered write in the kernel: eight value dimensions of
@@ -3417,10 +3451,10 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
                     if (logit_softcap != 0.0f) {
                         x = logit_softcap * tanhf(x);
                     }
-                    if (has_mask) {
-                        const float mv = slope * gk_cu_get(mask, ic, r,
-                                                           iq2 % mask.ne[2],
-                                                           iq3 % mask.ne[3]);
+                    if (HAS_MASK) {
+                        const float mv = slope * gk_cu_fam_mask(mask, ic, r,
+                                                                iq2 % mask.ne[2],
+                                                                iq3 % mask.ne[3]);
                         x = mv == -INFINITY ? -INFINITY : x + mv;
                     }
                 }
@@ -3878,6 +3912,9 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
 
     if (fam_d != 0 && q->ne[1] >= 16 &&
         (int) k->type == GK_TYPE_F16 && (int) v->type == GK_TYPE_F16 &&
+        (mask == NULL || (int) mask->type == GK_TYPE_F16) &&
+        ((int) q->type == GK_TYPE_F32 || (int) q->type == GK_TYPE_F16 ||
+         (int) q->type == GK_TYPE_BF16) &&
         scratch != NULL && scratch->cc >= 80) {
 
         dim3 mgrid;
@@ -3885,23 +3922,58 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
         mgrid.y = (unsigned) q->ne[2];
         mgrid.z = (unsigned) q->ne[3];
 
-#define GK_CU_FAM_LAUNCH(D)                                                        \
-        gk_cu_k_flash_attn_mma<D><<<mgrid, GK_CU_FAM_THREADS, 0, stream>>>(         \
+        // Whether the eight halves of a run can be taken as one 16-byte load
+        // is a *template* parameter, not an argument, and the difference is
+        // not small. As an argument both paths are compiled into every kernel,
+        // and the scalar one - eight separate loads, each with its own 64-bit
+        // stride arithmetic, inside unrolled staging loops - dominated the
+        // result: the d=128 kernel was 73k SASS instructions around 64 `HMMA`,
+        // with 8131 `LDG` and 7227 branches for a tile it stages with sixteen
+        // vector loads. Splitting the instantiation leaves the fast kernel
+        // with only the fast path in it.
+#define GK_CU_FAM_LAUNCH_VM(D, V, M)                                               \
+        gk_cu_k_flash_attn_mma<D, V, M><<<mgrid, GK_CU_FAM_THREADS, 0, stream>>>(   \
             gk_cu_view(q), gk_cu_view(k), gk_cu_view(v),                            \
-            mask ? gk_cu_view(mask) : gk_cu_view(q), mask != NULL,                  \
+            mask ? gk_cu_view(mask) : gk_cu_view(q),                                \
             sinks ? (const float *) sinks->data : NULL,                             \
             gk_cu_view_mut(dst), scale, max_bias, logit_softcap, n_head_log2,       \
             q->ne[2] / k->ne[2], q->ne[3] / k->ne[3],                               \
-            q->ne[2] / v->ne[2], q->ne[3] / v->ne[3],                               \
-            gk_cuda_fam_vec(k), gk_cuda_fam_vec(v))
+            q->ne[2] / v->ne[2], q->ne[3] / v->ne[3])
+
+        // Whether there is a mask at all is the other template parameter, and
+        // it is worth more than the contiguity one. The mask read is the only
+        // per-element access in the inner loop that goes through a tensor
+        // view, and a diffusion transformer's self-attention has no mask - so
+        // for the shape this kernel spends its life on, this deletes the code
+        // rather than predicating it.
+#define GK_CU_FAM_LAUNCH_V(D, V)                                    \
+        do {                                                        \
+            if (mask) { GK_CU_FAM_LAUNCH_VM(D, V, true);  }         \
+            else      { GK_CU_FAM_LAUNCH_VM(D, V, false); }         \
+        } while (0)
+
+        // One flag for both operands rather than two: K and V come from the
+        // same cache and are contiguous or not together, so the mixed case is
+        // not worth a third and fourth instantiation of a kernel this size. If
+        // either is strided, both take the scalar path.
+        const bool fam_vec = gk_cuda_fam_vec(k) && gk_cuda_fam_vec(v);
+
+#define GK_CU_FAM_LAUNCH(D)                                    \
+        do {                                                   \
+            if (fam_vec) { GK_CU_FAM_LAUNCH_V(D, true);  }     \
+            else         { GK_CU_FAM_LAUNCH_V(D, false); }     \
+            return;                                            \
+        } while (0)
 
         switch (fam_d) {
-            case  40: GK_CU_FAM_LAUNCH( 40); return;
-            case  64: GK_CU_FAM_LAUNCH( 64); return;
-            case  80: GK_CU_FAM_LAUNCH( 80); return;
-            case 128: GK_CU_FAM_LAUNCH(128); return;
-            default:  GK_CU_FAM_LAUNCH(160); return;
+            case  40: GK_CU_FAM_LAUNCH( 40);
+            case  64: GK_CU_FAM_LAUNCH( 64);
+            case  80: GK_CU_FAM_LAUNCH( 80);
+            case 128: GK_CU_FAM_LAUNCH(128);
+            default:  GK_CU_FAM_LAUNCH(160);
         }
+#undef GK_CU_FAM_LAUNCH_V
+#undef GK_CU_FAM_LAUNCH_VM
 
 #undef GK_CU_FAM_LAUNCH
     }
