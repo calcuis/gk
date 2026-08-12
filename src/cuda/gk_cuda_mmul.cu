@@ -782,6 +782,32 @@ static __device__ __forceinline__ int gk_cu_e2m1_quad(int w, int shift) {
 #define GK_CU_MMA_WARPS_M_WIDE   4
 #define GK_CU_MMA_WN_WIDE        64
 
+// A third width, for the FP4 tile only: sixteen warps and a 128x256 tile.
+//
+// The FP4 GEMM's time is A's re-read traffic. Every column tile reads the
+// whole of A, so A crosses DRAM n/TILE_N times - 68 times for the qkv shape,
+// 5.9 GB of it - and B does not, because the resident blocks share a column
+// tile and its few hundred KB sit in L2. **Only TILE_N moves that number.**
+//
+// 256 columns is bought with WARPS_N rather than WN, because WN sets WNT and
+// WNT sets the 64-register accumulator, which is already half of what this
+// kernel is allowed. Four warp columns of 64 leave the accumulator alone.
+// Sixteen warps of 512 threads at 128 registers is exactly the register file,
+// so this variant runs one block per multiprocessor and keeps the same sixteen
+// warps that two blocks of eight were giving.
+//
+// The 256x128 arrangement - the same sixteen warps stacked in M instead - was
+// measured first and is *worse* (qkv 7.70 ms against 7.24). That is the
+// asymmetry above showing up: doubling TILE_M only halves the B traffic that
+// L2 was already absorbing.
+#define GK_CU_MMA_WARPS_M_XWIDE  4
+#define GK_CU_MMA_WARPS_N_XWIDE  4
+#define GK_CU_MMA_WN_XWIDE       64
+
+// 256 threads can hold two blocks per multiprocessor at <=128 registers; 512
+// threads at the same register count fill it with one.
+#define GK_CU_MMA_FP4_BLOCKS(warps_m) (GK_CU_MMA_THREADS(warps_m) <= 256 ? 2 : 1)
+
 #define GK_CU_MMA_THREADS(warps_m) ((warps_m) * GK_CU_MMA_WARPS_N * GK_WARP_SIZE)
 #define GK_CU_MMA_TILE_M_OF(warps_m) ((warps_m) * GK_CU_MMA_WM)
 #define GK_CU_MMA_TILE_N_OF(wn)      (GK_CU_MMA_WARPS_N * (wn))
@@ -1130,27 +1156,50 @@ static __device__ __forceinline__ void gk_cu_ldmatrix_x4(int (&d)[4], const int 
 // `ldmatrix` requires of every address it is given.
 #define GK_CU_MMA_FP4_PAD 4
 
-// Two blocks per multiprocessor, not one.
+// Sixteen warps per multiprocessor, however they are packaged.
 //
-// Asking for one lets the compiler spend up to 255 registers, and on sm_120a
-// it settled on 130 - which is two over the 128 that a second block of 256
+// Asking for one block let the compiler spend up to 255 registers, and on
+// sm_120a it settled on 130 - two over the 128 that a second block of 256
 // threads needs to fit in the 65536-register file, so the kernel ran at 8
-// warps of a possible 48. This kernel is not the flash attention one: it has
-// no 64-register accumulator it cannot move, so the two registers are cheap to
-// find and the occupancy doubles.
-#define GK_CU_MMA_FP4_BLOCKS_PER_SM 2
-
-template <int WARPS_M, int WN>
-static __global__ __launch_bounds__(GK_CU_MMA_THREADS(WARPS_M), GK_CU_MMA_FP4_BLOCKS_PER_SM)
+// warps of a possible 48. This kernel is not the flash attention one: its
+// 64-register accumulator is the only large thing it holds, so the two
+// registers were free.
+//
+// `GK_CU_MMA_FP4_BLOCKS` reads that constraint the other way round for the
+// 512-thread tile: 512 threads at 128 registers *are* the register file, so
+// that one asks for a single block and gets the same sixteen warps.
+// WARPS_N is a template parameter here, unlike the other two mma kernels.
+//
+// The tile has to grow in N rather than in M, and the reason is which operand
+// actually reaches DRAM. Every column tile reads the whole of A, and every row
+// tile reads the whole of B, so nominally the traffic is
+// |A|*(n/TILE_N) + |B|*(m/TILE_M) and the two look symmetric. They are not:
+// `blockIdx.x` varies fastest, so the blocks resident at any moment share a
+// column tile, B's few hundred KB of it stay in L2, and only A is genuinely
+// streamed. So A's re-read count - and only that - is the traffic, and it is
+// set by TILE_N alone.
+//
+// Growing TILE_N through WN would double WNT and with it the 64-register
+// accumulator; growing it through WARPS_N does not, which is why this is a
+// warp count and not a wider warp.
+template <int WARPS_M, int WN, int WARPS_N>
+static __global__
+__launch_bounds__(WARPS_M * WARPS_N * GK_WARP_SIZE,
+                  (WARPS_M * WARPS_N * GK_WARP_SIZE) <= 256 ? 2 : 1)
 void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                              const gk_cu_fp4blk * aq, int64_t n_grp,
                              int64_t r2, int64_t r3) {
-    constexpr int TILE_M = GK_CU_MMA_TILE_M_OF(WARPS_M);
-    constexpr int TILE_N = GK_CU_MMA_TILE_N_OF(WN);
-    constexpr int WNT    = WN / 8;
+    constexpr int THREADS = WARPS_M * WARPS_N * GK_WARP_SIZE;
+    constexpr int TILE_M  = GK_CU_MMA_TILE_M_OF(WARPS_M);
+    constexpr int TILE_N  = WARPS_N * WN;
+    constexpr int WNT     = WN / 8;
 
-    static_assert(TILE_M + TILE_N == GK_CU_MMA_THREADS(WARPS_M),
-                  "staging assumes one thread per staged row and column");
+    // One thread per staged row or column, and beyond 256 threads there are
+    // more threads than there are of either - the tail of the block simply
+    // does not stage. Equalising that costs an extra index computation per
+    // thread and buys nothing: staging is not what this kernel is short of.
+    static_assert(TILE_M + TILE_N <= THREADS,
+                  "staging assumes at most one thread per staged row and column");
 
     constexpr int KS  = GK_CU_MMA_FP4_KSTEP;
     constexpr int ROW = 8 * KS + GK_CU_MMA_FP4_PAD;   // words per staged row
@@ -1158,6 +1207,11 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
     static_assert(GK_CU_MMA_FP4_PAD % 4 == 0,
                   "ldmatrix needs every address it is handed 16-byte aligned, "
                   "so the row stride must stay a multiple of four words");
+
+    static_assert(ROW % 2 == 0,
+                  "the B fragment pair is read as one 8-byte load at an even "
+                  "word offset, so an odd row stride would misalign it on "
+                  "every odd column");
 
     // 16-byte aligned because `ldmatrix` reads As in 16-byte pieces.
     __shared__ __align__(16) uint32_t As[TILE_M][ROW];
@@ -1170,8 +1224,8 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
     const int group = lane / 4;
     const int tig   = lane % 4;
 
-    const int warp_m = warp / GK_CU_MMA_WARPS_N;
-    const int warp_n = warp % GK_CU_MMA_WARPS_N;
+    const int warp_m = warp / WARPS_N;
+    const int warp_n = warp % WARPS_N;
 
     const int64_t m0  = (int64_t) blockIdx.x * TILE_M;
     const int64_t n0  = (int64_t) blockIdx.y * TILE_N;
@@ -1262,9 +1316,24 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
 
                 if (col != NULL && g < n_grp) {
                     const gk_cu_fp4blk & ab = col[g];
+
+                    // Interleaved, not verbatim: word w goes to 2w for the
+                    // low half and 2(w-4)+1 for the high half.
+                    //
+                    // A lane's two B fragment registers are words `tig` and
+                    // `tig + 4`, which are four apart and so are two separate
+                    // `LDS`. Stored this way they are adjacent and the pair is
+                    // one 8-byte load, which halves the shared-memory
+                    // instruction count of the whole B side - 16 loads per
+                    // warp per group become 8, against the 16 `mma` they feed.
+                    //
+                    // This is a permutation of *storage* only. The read below
+                    // undoes it exactly, so each fragment register receives the
+                    // same word it always did and the mma cannot tell.
 #pragma unroll
-                    for (int w = 0; w < 8; ++w) {
-                        Bs[c][kk * 8 + w] = ab.q[w];
+                    for (int w = 0; w < 4; ++w) {
+                        Bs[c][kk * 8 + 2 * w    ] = ab.q[w];
+                        Bs[c][kk * 8 + 2 * w + 1] = ab.q[w + 4];
                     }
                     Ad[kk][c] = ab.sc;
                 } else {
@@ -1299,9 +1368,15 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
             for (int ct = 0; ct < WNT; ++ct) {
                 const int c = warp_n * WN + ct * 8 + group;
 
+                // One 8-byte load where there were two 4-byte ones. See the
+                // interleaved store above: `2*tig` holds what word `tig` held
+                // and `2*tig + 1` what word `tig + 4` held, so the pair lands
+                // in the fragment registers in the order the mma expects.
+                const uint2 b2 = *(const uint2 *) &Bs[c][kk * 8 + 2 * tig];
+
                 int bf[2];
-                bf[0] = (int) Bs[c][kk * 8 + tig];
-                bf[1] = (int) Bs[c][kk * 8 + 4 + tig];
+                bf[0] = (int) b2.x;
+                bf[1] = (int) b2.y;
 
                 const unsigned bs = Ad[kk][c];
 
@@ -1357,8 +1432,11 @@ static __host__ __forceinline__ bool gk_cu_mma_nvfp4_wide(const struct gk_tensor
                                                           const struct gk_cuda_scratch * s) {
     static const int forced = gk_cu_env_int("GK_MM_NVFP4_TILE", 0);
 
-    if (forced == 64 || forced == 128) {
-        return forced == 128;
+    // 256 is the FP4 tile's third width and this kernel has no such variant;
+    // give it the widest it does have rather than silently dropping to the
+    // narrow one, which would make an A/B at =256 compare two things at once.
+    if (forced != 0) {
+        return forced != 64;
     }
 
     const int64_t tm = GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_WIDE);
@@ -1369,6 +1447,39 @@ static __host__ __forceinline__ bool gk_cu_mma_nvfp4_wide(const struct gk_tensor
                          * dst->ne[2] * dst->ne[3];
 
     return s != NULL && s->n_sm > 0 && blocks >= (int64_t) s->n_sm;
+}
+
+// Whether a shape should take the 256x128 FP4 tile instead of the 128x128 one.
+//
+// Same argument as the width above, one step further along, and for the same
+// reason: this kernel's time is the operands' re-read traffic, so the tile
+// wants to be as large as the register file allows and no larger than the grid
+// can afford. Doubling M halves how many times A is read and doubles how many
+// times the grid must cover the multiprocessors to stay busy, so the test is
+// again a floor on blocks rather than anything about the shape.
+//
+// The floor is two blocks per multiprocessor rather than one. At 512 threads
+// this variant is a single block of sixteen warps, so a grid that only just
+// covers the device leaves no second block to overlap the tail with.
+//
+// `GK_MM_NVFP4_TILE=256` forces it, and as with the other widths that is how
+// it gets tested at all - `test_cuda.c`'s shapes are far too small to select it.
+static __host__ __forceinline__ bool gk_cu_mma_nvfp4_xwide(const struct gk_tensor * dst,
+                                                           const struct gk_cuda_scratch * s) {
+    static const int forced = gk_cu_env_int("GK_MM_NVFP4_TILE", 0);
+
+    if (forced != 0) {
+        return forced == 256;
+    }
+
+    const int64_t tm = GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_XWIDE);
+    const int64_t tn = (int64_t) GK_CU_MMA_WARPS_N_XWIDE * GK_CU_MMA_WN_XWIDE;
+
+    const int64_t blocks = ((dst->ne[0] + tm - 1) / tm)
+                         * ((dst->ne[1] + tn - 1) / tn)
+                         * dst->ne[2] * dst->ne[3];
+
+    return s != NULL && s->n_sm > 0 && blocks >= 2 * (int64_t) s->n_sm;
 }
 
 // --------------------------------------------------------------------------
@@ -2457,28 +2568,40 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         std::chrono::steady_clock::now() - q0).count();
                 }
 
-                const bool wide = gk_cu_mma_nvfp4_wide(dst, scratch);
+                const bool xwide = gk_cu_mma_nvfp4_xwide(dst, scratch);
+                const bool wide  = !xwide && gk_cu_mma_nvfp4_wide(dst, scratch);
 
-                const int64_t tile_m = wide ? GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_WIDE)
-                                            : GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_NARROW);
-                const int64_t tile_n = wide ? GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_WIDE)
-                                            : GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_NARROW);
+                const int64_t tile_m = xwide ? GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_XWIDE)
+                                     : wide  ? GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_WIDE)
+                                             : GK_CU_MMA_TILE_M_OF(GK_CU_MMA_WARPS_M_NARROW);
+                const int64_t tile_n = xwide ? (int64_t) GK_CU_MMA_WARPS_N_XWIDE * GK_CU_MMA_WN_XWIDE
+                                     : wide  ? GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_WIDE)
+                                             : GK_CU_MMA_TILE_N_OF(GK_CU_MMA_WN_NARROW);
 
                 dim3 mgrid;
                 mgrid.x = (unsigned) ((dst->ne[0] + tile_m - 1) / tile_m);
                 mgrid.y = (unsigned) ((n_cols     + tile_n - 1) / tile_n);
                 mgrid.z = (unsigned) n_23;
 
-                g_gk_mm_path = wide ? "mma-fp4-128" : "mma-fp4-64";
+                g_gk_mm_path = xwide ? "mma-fp4-256" : wide ? "mma-fp4-128" : "mma-fp4-64";
                 const std::chrono::steady_clock::time_point m0 =
                     std::chrono::steady_clock::now();
 
-                if (wide) {
-                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_WIDE, GK_CU_MMA_WN_WIDE>
+                if (xwide) {
+                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_XWIDE, GK_CU_MMA_WN_XWIDE,
+                                            GK_CU_MMA_WARPS_N_XWIDE>
+                        <<<mgrid,
+                           GK_CU_MMA_WARPS_M_XWIDE * GK_CU_MMA_WARPS_N_XWIDE * GK_WARP_SIZE,
+                           0, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                } else if (wide) {
+                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_WIDE, GK_CU_MMA_WN_WIDE,
+                                            GK_CU_MMA_WARPS_N>
                         <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_WIDE), 0, stream>>>(
                             gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
                 } else {
-                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_NARROW, GK_CU_MMA_WN_NARROW>
+                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_NARROW, GK_CU_MMA_WN_NARROW,
+                                            GK_CU_MMA_WARPS_N>
                         <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_NARROW), 0, stream>>>(
                             gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
                 }
