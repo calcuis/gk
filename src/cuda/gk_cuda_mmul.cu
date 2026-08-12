@@ -1145,7 +1145,21 @@ static __device__ __forceinline__ void gk_cu_ldmatrix_x4(int (&d)[4], const int 
 // Shared cost is (TILE_M + TILE_N) * (8*KSTEP + PAD) * 4 bytes plus the scales.
 // KSTEP 2 on the wide tile is ~20 KB, so two blocks per multiprocessor still
 // fit in the 99 KB without the opt-in.
-#define GK_CU_MMA_FP4_KSTEP 1
+// k-step per tile width, in nvfp4 groups of 64.
+//
+// Nsight says why this matters: at a k-step of one group the kernel's largest
+// single stall is `barrier`, at **16.0 cycles per issued instruction against
+// ggml's 0.37**, because two `__syncthreads()` buy only 64 elements of k.
+// ggml's NVFP4 path runs `MMQ_ITER_K_FP4 = 512` - eight groups a round - and
+// its dominant stall is `math_pipe_throttle`, which is the tensor cores being
+// the limit and is where this kernel wants to be.
+//
+// Eight groups only fit the 128x128 tile. Shared is
+// (TILE_M + TILE_N) * (8*KSTEP + PAD) * 4 plus the scales, so 128x128 at eight
+// is ~76 KB of the 99 available while 128x256 at eight would be ~114 KB. The
+// wide tile therefore goes deep and the extra-wide one stays shallower.
+#define GK_CU_MMA_FP4_KSTEP_WIDE  4
+#define GK_CU_MMA_FP4_KSTEP_XWIDE 4
 
 // Words of padding on each staged row, to keep rows off the same shared banks.
 //
@@ -1182,10 +1196,22 @@ static __device__ __forceinline__ void gk_cu_ldmatrix_x4(int (&d)[4], const int 
 // Growing TILE_N through WN would double WNT and with it the 64-register
 // accumulator; growing it through WARPS_N does not, which is why this is a
 // warp count and not a wider warp.
-template <int WARPS_M, int WN, int WARPS_N>
+// Words of dynamic shared a configuration needs. Host and device both compute
+// it from this, so the launch and the kernel cannot disagree about the layout.
+#define GK_CU_FP4_SMEM_WORDS(tile_m, tile_n, ks)                    \
+    (((tile_m) + (tile_n)) * (8 * (ks) + GK_CU_MMA_FP4_PAD)         \
+     + (ks) * ((tile_m) + (tile_n)))
+
+// Blocks per multiprocessor to ask the compiler for. A deep k-step puts the
+// staging in shared memory rather than registers, and past 48 KB only one
+// block fits anyway - so asking for two would cap registers at 128 for nothing.
+#define GK_CU_FP4_BPSM(warps_m, warps_n, ks) \
+    ((((warps_m) * (warps_n) * GK_WARP_SIZE) <= 256 && (ks) <= 2) ? 2 : 1)
+
+template <int WARPS_M, int WN, int WARPS_N, int KSTEP>
 static __global__
 __launch_bounds__(WARPS_M * WARPS_N * GK_WARP_SIZE,
-                  (WARPS_M * WARPS_N * GK_WARP_SIZE) <= 256 ? 2 : 1)
+                  GK_CU_FP4_BPSM(WARPS_M, WARPS_N, KSTEP))
 void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                              const gk_cu_fp4blk * aq, int64_t n_grp,
                              int64_t r2, int64_t r3) {
@@ -1201,7 +1227,7 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
     static_assert(TILE_M + TILE_N <= THREADS,
                   "staging assumes at most one thread per staged row and column");
 
-    constexpr int KS  = GK_CU_MMA_FP4_KSTEP;
+    constexpr int KS  = KSTEP;
     constexpr int ROW = 8 * KS + GK_CU_MMA_FP4_PAD;   // words per staged row
 
     static_assert(GK_CU_MMA_FP4_PAD % 4 == 0,
@@ -1213,11 +1239,20 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                   "word offset, so an odd row stride would misalign it on "
                   "every odd column");
 
-    // 16-byte aligned because `ldmatrix` reads As in 16-byte pieces.
-    __shared__ __align__(16) uint32_t As[TILE_M][ROW];
-    __shared__ __align__(16) uint32_t Bs[TILE_N][ROW];
-    __shared__ uint32_t Ws[KS][TILE_M];   // four ue4m3 scales, packed
-    __shared__ uint32_t Ad[KS][TILE_N];
+    // Dynamic, not static, because a deep k-step needs more than the 48 KB a
+    // block gets without asking. The caller raises the cap with
+    // `gkFuncAttributeMaxDynamicSharedMemorySize` and passes the size, and
+    // both sides size it with GK_CU_FP4_SMEM_WORDS so the layout cannot drift.
+    //
+    // 16-byte aligned because `ldmatrix` reads As in 16-byte pieces. Each
+    // following block starts a multiple of ROW (a multiple of four) words in,
+    // so all four stay aligned.
+    extern __shared__ __align__(16) uint32_t gk_fp4_smem[];
+
+    uint32_t * const As = gk_fp4_smem;                   // TILE_M rows of ROW
+    uint32_t * const Bs = As + (size_t) TILE_M * ROW;    // TILE_N rows of ROW
+    uint32_t * const Ws = Bs + (size_t) TILE_N * ROW;    // KS x TILE_M scales
+    uint32_t * const Ad = Ws + (size_t) KS * TILE_M;     // KS x TILE_N scales
 
     const int lane  = threadIdx.x % GK_WARP_SIZE;
     const int warp  = threadIdx.x / GK_WARP_SIZE;
@@ -1276,7 +1311,17 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
 
                 if (row != NULL && g < n_grp) {
                     // 36 bytes a block: four ue4m3 scales, then sixty-four codes.
-                    const uint8_t * blk = row + g * 36;
+                    //
+                    // Read as words, not as `gk_cu_int_b2`. That helper pairs
+                    // two 16-bit loads because it cannot assume alignment, and
+                    // here it costs **18 `LDG.E.U16` where 9 `LDG.E` would
+                    // do** - which Nsight attributes as `lg_throttle`, 9.4 of
+                    // this kernel's 53.7 stall cycles per issued instruction.
+                    // A block is 36 bytes and no view can begin part-way
+                    // through one, so a row is a multiple of 36 from a base
+                    // the allocator gives at least 16-byte alignment: every
+                    // block, and every word inside it, is 4-byte aligned.
+                    const uint32_t * blk = (const uint32_t *) (row + g * 36);
 
                     // Verbatim. gk stores an nvfp4 sub-block as "low nibbles are
                     // elements 0..7, high nibbles are 8..15", which is not the
@@ -1288,10 +1333,10 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                     // sub-block is two whole words either way.
 #pragma unroll
                     for (int w = 0; w < 8; ++w) {
-                        As[r][kk * 8 + w] = (uint32_t) gk_cu_int_b2(blk + 4, w);
+                        As[r * ROW + kk * 8 + w] = blk[1 + w];   // word 0 is the scales
                     }
 
-                    Ws[kk][r] = (uint32_t) gk_cu_int_b2(blk, 0);
+                    Ws[kk * TILE_M + r] = blk[0];
                 } else {
                     // Past the end of the matrix, or past the end of k on the
                     // last round. A zero scale with zero codes contributes
@@ -1299,9 +1344,9 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                     // need no separate path.
 #pragma unroll
                     for (int w = 0; w < 8; ++w) {
-                        As[r][kk * 8 + w] = 0;
+                        As[r * ROW + kk * 8 + w] = 0;
                     }
-                    Ws[kk][r] = 0;
+                    Ws[kk * TILE_M + r] = 0;
                 }
             }
         } else if (threadIdx.x < TILE_M + TILE_N) {
@@ -1332,16 +1377,16 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                     // same word it always did and the mma cannot tell.
 #pragma unroll
                     for (int w = 0; w < 4; ++w) {
-                        Bs[c][kk * 8 + 2 * w    ] = ab.q[w];
-                        Bs[c][kk * 8 + 2 * w + 1] = ab.q[w + 4];
+                        Bs[c * ROW + kk * 8 + 2 * w    ] = ab.q[w];
+                        Bs[c * ROW + kk * 8 + 2 * w + 1] = ab.q[w + 4];
                     }
-                    Ad[kk][c] = ab.sc;
+                    Ad[kk * TILE_N + c] = ab.sc;
                 } else {
 #pragma unroll
                     for (int w = 0; w < 8; ++w) {
-                        Bs[c][kk * 8 + w] = 0;
+                        Bs[c * ROW + kk * 8 + w] = 0;
                     }
-                    Ad[kk][c] = 0;
+                    Ad[kk * TILE_N + c] = 0;
                 }
             }
         }
@@ -1359,9 +1404,9 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
 
                 gk_cu_ldmatrix_x4(
                     af[wt],
-                    (const int *) &As[r0 + (lane % 16)][kk * 8 + (lane / 16) * 4]);
+                    (const int *) &As[(r0 + (lane % 16)) * ROW + kk * 8 + (lane / 16) * 4]);
 
-                as[wt] = Ws[kk][r0 + sc_row];
+                as[wt] = Ws[kk * TILE_M + r0 + sc_row];
             }
 
 #pragma unroll
@@ -1372,13 +1417,13 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                 // interleaved store above: `2*tig` holds what word `tig` held
                 // and `2*tig + 1` what word `tig + 4` held, so the pair lands
                 // in the fragment registers in the order the mma expects.
-                const uint2 b2 = *(const uint2 *) &Bs[c][kk * 8 + 2 * tig];
+                const uint2 b2 = *(const uint2 *) &Bs[c * ROW + kk * 8 + 2 * tig];
 
                 int bf[2];
                 bf[0] = (int) b2.x;
                 bf[1] = (int) b2.y;
 
-                const unsigned bs = Ad[kk][c];
+                const unsigned bs = Ad[kk * TILE_N + c];
 
 #pragma unroll
                 for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
@@ -1448,6 +1493,35 @@ static __host__ __forceinline__ bool gk_cu_mma_nvfp4_wide(const struct gk_tensor
 
     return s != NULL && s->n_sm > 0 && blocks >= (int64_t) s->n_sm;
 }
+
+// Launch one FP4 tile configuration: size its dynamic shared memory, raise the
+// per-kernel cap the first time if it wants more than the 48 KB a block gets
+// for free, and launch.
+//
+// The cap is a property of the kernel rather than of the launch, so it is
+// raised once per instantiation - `raised` is function-local static, and each
+// macro expansion is its own scope and so its own flag.
+#define GK_CU_FP4_LAUNCH(warps_m, wn, warps_n, kstep)                              \
+    do {                                                                           \
+        constexpr int  tm_    = GK_CU_MMA_TILE_M_OF(warps_m);                      \
+        constexpr int  tn_    = (warps_n) * (wn);                                  \
+        constexpr int  thr_   = (warps_m) * (warps_n) * GK_WARP_SIZE;              \
+        constexpr size_t smem_ =                                                   \
+            (size_t) GK_CU_FP4_SMEM_WORDS(tm_, tn_, kstep) * sizeof(uint32_t);     \
+        if (smem_ > 48u * 1024u) {                                                 \
+            static bool raised = false;                                            \
+            if (!raised) {                                                         \
+                raised = true;                                                     \
+                GK_CUDA_CHECK(gkFuncSetAttribute(                                  \
+                    (const void *) gk_cu_k_mul_mat_mma_fp4<warps_m, wn,            \
+                                                           warps_n, kstep>,        \
+                    gkFuncAttributeMaxDynamicSharedMemorySize, (int) smem_));      \
+            }                                                                      \
+        }                                                                          \
+        gk_cu_k_mul_mat_mma_fp4<warps_m, wn, warps_n, kstep>                       \
+            <<<mgrid, thr_, smem_, stream>>>(                                      \
+                gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);         \
+    } while (0)
 
 // Whether a shape should take the 256x128 FP4 tile instead of the 128x128 one.
 //
@@ -2588,22 +2662,14 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                     std::chrono::steady_clock::now();
 
                 if (xwide) {
-                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_XWIDE, GK_CU_MMA_WN_XWIDE,
-                                            GK_CU_MMA_WARPS_N_XWIDE>
-                        <<<mgrid,
-                           GK_CU_MMA_WARPS_M_XWIDE * GK_CU_MMA_WARPS_N_XWIDE * GK_WARP_SIZE,
-                           0, stream>>>(
-                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                    GK_CU_FP4_LAUNCH(GK_CU_MMA_WARPS_M_XWIDE, GK_CU_MMA_WN_XWIDE,
+                                     GK_CU_MMA_WARPS_N_XWIDE, GK_CU_MMA_FP4_KSTEP_XWIDE);
                 } else if (wide) {
-                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_WIDE, GK_CU_MMA_WN_WIDE,
-                                            GK_CU_MMA_WARPS_N>
-                        <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_WIDE), 0, stream>>>(
-                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                    GK_CU_FP4_LAUNCH(GK_CU_MMA_WARPS_M_WIDE, GK_CU_MMA_WN_WIDE,
+                                     GK_CU_MMA_WARPS_N, GK_CU_MMA_FP4_KSTEP_WIDE);
                 } else {
-                    gk_cu_k_mul_mat_mma_fp4<GK_CU_MMA_WARPS_M_NARROW, GK_CU_MMA_WN_NARROW,
-                                            GK_CU_MMA_WARPS_N>
-                        <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_NARROW), 0, stream>>>(
-                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                    GK_CU_FP4_LAUNCH(GK_CU_MMA_WARPS_M_NARROW, GK_CU_MMA_WN_NARROW,
+                                     GK_CU_MMA_WARPS_N, 1);
                 }
 
                 if (split) {
