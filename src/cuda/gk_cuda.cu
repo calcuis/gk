@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include <chrono>
+#include <vector>
 
 // Device memory is handed out in multiples of this. Coalesced loads want their
 // rows aligned and the driver's own allocations are far coarser than this
@@ -557,6 +558,99 @@ static bool gk_cu_prof_on(void) {
     return g_prof_enabled != 0;
 }
 
+// --------------------------------------------------------------------------
+// launch profile
+//
+// GK_OP_PROFILE answers "which op costs the milliseconds". This answers a
+// different question that shape-level profile cannot: is the GPU actually
+// busy for those milliseconds, or is it idle waiting for this thread to hand
+// it the next kernel?
+//
+// A graph this deep is thousands of launches, and a launch costs host time
+// whether or not the device has anything left to do. Timing the loop without
+// synchronizing gives the host cost - every launch here is asynchronous, so
+// the loop returns as soon as the last one is *queued*. Synchronizing after
+// it gives what the device still had left. If the queueing time is the larger
+// of the two, the kernels are irrelevant: the device finished each one before
+// the next arrived, and the fix is fewer launches, not faster ones.
+//
+// Set GK_LAUNCH_PROFILE=1.
+// --------------------------------------------------------------------------
+
+static double            g_launch_host_ms = 0.0;   // time spent queueing
+static double            g_launch_wait_ms = 0.0;   // device time left after queueing
+static long long         g_launch_nodes   = 0;
+static long long         g_launch_graphs  = 0;
+static int               g_launch_enabled = -1;
+
+// GK_LAUNCH_PROFILE=2 additionally brackets every launch in a pair of events.
+// Host timing cannot separate "the device is idle waiting for this thread"
+// from "this thread is blocked because the device is behind" - both show up as
+// time inside the loop. Events are recorded in the stream, so the gap between
+// one kernel's end event and the next kernel's start event is device idle time
+// and nothing else. Summing the brackets gives busy; the span from the first
+// start to the last end gives elapsed; the difference is what a captured graph
+// could give back.
+static double            g_launch_busy_ms = 0.0;
+static double            g_launch_span_ms = 0.0;
+static bool              g_launch_events  = false;
+
+static void gk_cu_launch_prof_dump(void) {
+    if (g_launch_graphs == 0) {
+        return;
+    }
+
+    const double total = g_launch_host_ms + g_launch_wait_ms;
+
+    gk_logf("\ngk cuda launch profile: %lld graphs, %lld nodes (%.0f nodes/graph)\n",
+            (long long) g_launch_graphs, (long long) g_launch_nodes,
+            (double) g_launch_nodes / (double) g_launch_graphs);
+    gk_logf("  host, queueing launches   %9.1f ms  %5.1f%%   (%.2f us/node)\n",
+            g_launch_host_ms, total > 0.0 ? 100.0 * g_launch_host_ms / total : 0.0,
+            g_launch_nodes ? 1000.0 * g_launch_host_ms / (double) g_launch_nodes : 0.0);
+    gk_logf("  device, after queueing    %9.1f ms  %5.1f%%\n",
+            g_launch_wait_ms, total > 0.0 ? 100.0 * g_launch_wait_ms / total : 0.0);
+
+    if (g_launch_span_ms > 0.0) {
+        gk_logf("  device busy (events)      %9.1f ms  %5.1f%% of the %.1f ms the stream spanned\n",
+                g_launch_busy_ms, 100.0 * g_launch_busy_ms / g_launch_span_ms, g_launch_span_ms);
+        gk_logf("  device idle between ops   %9.1f ms  %5.1f%%   <- what a captured graph can recover\n",
+                g_launch_span_ms - g_launch_busy_ms,
+                100.0 * (g_launch_span_ms - g_launch_busy_ms) / g_launch_span_ms);
+    } else {
+        gk_logf("  (set GK_LAUNCH_PROFILE=2 to bracket every launch in events and separate\n"
+                "   device-idle from host-blocked - host time alone cannot tell them apart.)\n");
+    }
+}
+
+static bool gk_cu_launch_prof_on(void) {
+    if (g_launch_enabled < 0) {
+        const char * e = getenv("GK_LAUNCH_PROFILE");
+        g_launch_enabled = e != NULL && e[0] != '0';
+        g_launch_events  = e != NULL && e[0] == '2';
+        if (g_launch_enabled) {
+            atexit(gk_cu_launch_prof_dump);
+        }
+    }
+    return g_launch_enabled != 0;
+}
+
+// One pair per node, reused across graphs and grown on demand. Creating them
+// per graph would time the event allocator as much as the kernels.
+static std::vector<gkEvent_t> g_launch_ev;
+
+static void gk_cu_launch_ev_reserve(int n) {
+    const size_t want = (size_t) n * 2;
+    while (g_launch_ev.size() < want) {
+        gkEvent_t e = NULL;
+        if (gkEventCreate(&e) != gkSuccess) {
+            g_launch_events = false;   // out of events: fall back to host timing
+            return;
+        }
+        g_launch_ev.push_back(e);
+    }
+}
+
 static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cgraph * graph) {
     struct gk_cuda_backend_ctx * ctx = (struct gk_cuda_backend_ctx *) backend->context;
 
@@ -572,8 +666,26 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
     const int  n    = gk_graph_n_nodes(graph);
     const bool prof = gk_cu_prof_on();
 
+    // Deliberately not `prof`: the per-node profile synchronizes around every
+    // launch, which is exactly the overlap this measurement is about. The two
+    // are mutually exclusive and the launch one wins.
+    const bool lprof = !prof && gk_cu_launch_prof_on();
+
+    std::chrono::steady_clock::time_point lt0;
+    const bool lev = lprof && g_launch_events;
+    if (lprof) {
+        if (lev) {
+            gk_cu_launch_ev_reserve(n);
+        }
+        lt0 = std::chrono::steady_clock::now();
+    }
+
     for (int i = 0; i < n; ++i) {
         struct gk_tensor * node = gk_graph_node(graph, i);
+
+        if (lev && g_launch_events) {
+            GK_CUDA_CHECK(gkEventRecord(g_launch_ev[(size_t) i * 2], ctx->stream));
+        }
 
         std::chrono::steady_clock::time_point t0;
         if (prof) {
@@ -602,6 +714,10 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
             return GK_STATUS_NO_STORAGE;
         }
 
+        if (lev && g_launch_events) {
+            GK_CUDA_CHECK(gkEventRecord(g_launch_ev[(size_t) i * 2 + 1], ctx->stream));
+        }
+
         if (prof) {
             GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
             const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
@@ -612,6 +728,38 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
             gk_cu_prof_add(key,
                            std::chrono::duration<double, std::milli>(t1 - t0).count(),
                            flops);
+        }
+    }
+
+    if (lprof) {
+        const std::chrono::steady_clock::time_point lt1 = std::chrono::steady_clock::now();
+        GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
+        const std::chrono::steady_clock::time_point lt2 = std::chrono::steady_clock::now();
+
+        g_launch_host_ms += std::chrono::duration<double, std::milli>(lt1 - lt0).count();
+        g_launch_wait_ms += std::chrono::duration<double, std::milli>(lt2 - lt1).count();
+        g_launch_nodes   += n;
+        g_launch_graphs  += 1;
+
+        if (lev && g_launch_events && n > 0) {
+            // The stream is already drained, so every event has a timestamp.
+            // Sum the brackets for busy time and take first-to-last for the
+            // span; their difference is device idle.
+            double busy = 0.0;
+            for (int i = 0; i < n; ++i) {
+                float ms = 0.0f;
+                if (gkEventElapsedTime(&ms, g_launch_ev[(size_t) i * 2],
+                                       g_launch_ev[(size_t) i * 2 + 1]) == gkSuccess) {
+                    busy += ms;
+                }
+            }
+
+            float span = 0.0f;
+            if (gkEventElapsedTime(&span, g_launch_ev[0],
+                                   g_launch_ev[(size_t) (n - 1) * 2 + 1]) == gkSuccess) {
+                g_launch_span_ms += span;
+                g_launch_busy_ms += busy;
+            }
         }
     }
 

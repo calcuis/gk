@@ -1107,8 +1107,41 @@ static __device__ __forceinline__ void gk_cu_ldmatrix_x4(int (&d)[4], const int 
 
 #define GK_CU_MMA_FP4_K 64   // one nvfp4 block; one mma window
 
+// How many nvfp4 groups the tile stages per round.
+//
+// One group is 64 elements of k, and every round costs two `__syncthreads()`.
+// At k=5376 that was 84 rounds and 168 barriers to do 84 groups of work, with
+// the global load latency exposed on each of them because nothing else was in
+// flight. Staging several groups at once divides the barrier count by KSTEP and
+// multiplies the mma work between barriers by it, which is what gives the
+// scheduler something to hide the next round's loads behind.
+//
+// Shared cost is (TILE_M + TILE_N) * (8*KSTEP + PAD) * 4 bytes plus the scales.
+// KSTEP 2 on the wide tile is ~20 KB, so two blocks per multiprocessor still
+// fit in the 99 KB without the opt-in.
+#define GK_CU_MMA_FP4_KSTEP 1
+
+// Words of padding on each staged row, to keep rows off the same shared banks.
+//
+// A row of KSTEP groups is 8*KSTEP words, and both 8 and 16 divide the 32-bank
+// width - so without padding every second (KSTEP=2) or fourth (KSTEP=1) row
+// starts on the same bank and the ldmatrix reads collide. Four words moves the
+// stride off a power of two while keeping it a multiple of 16 bytes, which
+// `ldmatrix` requires of every address it is given.
+#define GK_CU_MMA_FP4_PAD 4
+
+// Two blocks per multiprocessor, not one.
+//
+// Asking for one lets the compiler spend up to 255 registers, and on sm_120a
+// it settled on 130 - which is two over the 128 that a second block of 256
+// threads needs to fit in the 65536-register file, so the kernel ran at 8
+// warps of a possible 48. This kernel is not the flash attention one: it has
+// no 64-register accumulator it cannot move, so the two registers are cheap to
+// find and the occupancy doubles.
+#define GK_CU_MMA_FP4_BLOCKS_PER_SM 2
+
 template <int WARPS_M, int WN>
-static __global__ __launch_bounds__(GK_CU_MMA_THREADS(WARPS_M), 1)
+static __global__ __launch_bounds__(GK_CU_MMA_THREADS(WARPS_M), GK_CU_MMA_FP4_BLOCKS_PER_SM)
 void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                              const gk_cu_fp4blk * aq, int64_t n_grp,
                              int64_t r2, int64_t r3) {
@@ -1119,11 +1152,18 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
     static_assert(TILE_M + TILE_N == GK_CU_MMA_THREADS(WARPS_M),
                   "staging assumes one thread per staged row and column");
 
+    constexpr int KS  = GK_CU_MMA_FP4_KSTEP;
+    constexpr int ROW = 8 * KS + GK_CU_MMA_FP4_PAD;   // words per staged row
+
+    static_assert(GK_CU_MMA_FP4_PAD % 4 == 0,
+                  "ldmatrix needs every address it is handed 16-byte aligned, "
+                  "so the row stride must stay a multiple of four words");
+
     // 16-byte aligned because `ldmatrix` reads As in 16-byte pieces.
-    __shared__ __align__(16) uint32_t As[TILE_M][8];
-    __shared__ __align__(16) uint32_t Bs[TILE_N][8];
-    __shared__ uint32_t Ws[TILE_M];   // four ue4m3 scales, packed
-    __shared__ uint32_t Ad[TILE_N];
+    __shared__ __align__(16) uint32_t As[TILE_M][ROW];
+    __shared__ __align__(16) uint32_t Bs[TILE_N][ROW];
+    __shared__ uint32_t Ws[KS][TILE_M];   // four ue4m3 scales, packed
+    __shared__ uint32_t Ad[KS][TILE_N];
 
     const int lane  = threadIdx.x % GK_WARP_SIZE;
     const int warp  = threadIdx.x / GK_WARP_SIZE;
@@ -1165,84 +1205,110 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
         }
     }
 
-    for (int64_t g = 0; g < n_grp; ++g) {
+    for (int64_t g0 = 0; g0 < n_grp; g0 += KS) {
         if (threadIdx.x < TILE_M) {
             const int     r = (int) threadIdx.x;
             const int64_t m = m0 + r;
 
-            if (m < n_rows) {
-                // 36 bytes a block: four ue4m3 scales, then sixty-four codes.
-                const uint8_t * blk = (const uint8_t *) gk_cu_row(a, m, a2, a3) + g * 36;
+            // Hoisted: the row is the same for every group this round, and
+            // only the 36-byte block offset moves.
+            const uint8_t * row = m < n_rows
+                                ? (const uint8_t *) gk_cu_row(a, m, a2, a3)
+                                : NULL;
 
-                // Verbatim. gk stores an nvfp4 sub-block as "low nibbles are
-                // elements 0..7, high nibbles are 8..15", which is not the
-                // order of k - but a matmul sums over k, so a permutation of
-                // it costs nothing as long as *both* operands carry the same
-                // one. The activation quantizer writes this same order for
-                // exactly that reason, and the two cancel. What must survive
-                // the permutation is the scale grouping, and it does: a
-                // sub-block is two whole words either way.
 #pragma unroll
-                for (int w = 0; w < 8; ++w) {
-                    As[r][w] = (uint32_t) gk_cu_int_b2(blk + 4, w);
-                }
+            for (int kk = 0; kk < KS; ++kk) {
+                const int64_t g = g0 + kk;
 
-                Ws[r] = (uint32_t) gk_cu_int_b2(blk, 0);
-            } else {
+                if (row != NULL && g < n_grp) {
+                    // 36 bytes a block: four ue4m3 scales, then sixty-four codes.
+                    const uint8_t * blk = row + g * 36;
+
+                    // Verbatim. gk stores an nvfp4 sub-block as "low nibbles are
+                    // elements 0..7, high nibbles are 8..15", which is not the
+                    // order of k - but a matmul sums over k, so a permutation of
+                    // it costs nothing as long as *both* operands carry the same
+                    // one. The activation quantizer writes this same order for
+                    // exactly that reason, and the two cancel. What must survive
+                    // the permutation is the scale grouping, and it does: a
+                    // sub-block is two whole words either way.
 #pragma unroll
-                for (int w = 0; w < 8; ++w) {
-                    As[r][w] = 0;
+                    for (int w = 0; w < 8; ++w) {
+                        As[r][kk * 8 + w] = (uint32_t) gk_cu_int_b2(blk + 4, w);
+                    }
+
+                    Ws[kk][r] = (uint32_t) gk_cu_int_b2(blk, 0);
+                } else {
+                    // Past the end of the matrix, or past the end of k on the
+                    // last round. A zero scale with zero codes contributes
+                    // nothing to the accumulator, which is what makes the tail
+                    // need no separate path.
+#pragma unroll
+                    for (int w = 0; w < 8; ++w) {
+                        As[r][kk * 8 + w] = 0;
+                    }
+                    Ws[kk][r] = 0;
                 }
-                Ws[r] = 0;
             }
         } else if (threadIdx.x < TILE_M + TILE_N) {
             const int     c = (int) threadIdx.x - TILE_M;
             const int64_t n = n0 + c;
 
-            if (n < n_cols) {
-                const gk_cu_fp4blk & ab = aq23[n * n_grp + g];
+            const gk_cu_fp4blk * col = n < n_cols ? aq23 + n * n_grp : NULL;
+
 #pragma unroll
-                for (int w = 0; w < 8; ++w) {
-                    Bs[c][w] = ab.q[w];
-                }
-                Ad[c] = ab.sc;
-            } else {
+            for (int kk = 0; kk < KS; ++kk) {
+                const int64_t g = g0 + kk;
+
+                if (col != NULL && g < n_grp) {
+                    const gk_cu_fp4blk & ab = col[g];
 #pragma unroll
-                for (int w = 0; w < 8; ++w) {
-                    Bs[c][w] = 0;
+                    for (int w = 0; w < 8; ++w) {
+                        Bs[c][kk * 8 + w] = ab.q[w];
+                    }
+                    Ad[kk][c] = ab.sc;
+                } else {
+#pragma unroll
+                    for (int w = 0; w < 8; ++w) {
+                        Bs[c][kk * 8 + w] = 0;
+                    }
+                    Ad[kk][c] = 0;
                 }
-                Ad[c] = 0;
             }
         }
 
         __syncthreads();
 
-        int      af[GK_CU_MMA_WMT][4];
-        unsigned as[GK_CU_MMA_WMT];
-
 #pragma unroll
-        for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
-            const int r0 = warp_m * GK_CU_MMA_WM + wt * 16;
-
-            gk_cu_ldmatrix_x4(af[wt],
-                              (const int *) &As[r0 + (lane % 16)][(lane / 16) * 4]);
-
-            as[wt] = Ws[r0 + sc_row];
-        }
-
-#pragma unroll
-        for (int ct = 0; ct < WNT; ++ct) {
-            const int c = warp_n * WN + ct * 8 + group;
-
-            int bf[2];
-            bf[0] = (int) Bs[c][tig];
-            bf[1] = (int) Bs[c][4 + tig];
-
-            const unsigned bs = Ad[c];
+        for (int kk = 0; kk < KS; ++kk) {
+            int      af[GK_CU_MMA_WMT][4];
+            unsigned as[GK_CU_MMA_WMT];
 
 #pragma unroll
             for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
-                gk_cu_mma_fp4(acc[wt][ct], af[wt], bf, as[wt], bs);
+                const int r0 = warp_m * GK_CU_MMA_WM + wt * 16;
+
+                gk_cu_ldmatrix_x4(
+                    af[wt],
+                    (const int *) &As[r0 + (lane % 16)][kk * 8 + (lane / 16) * 4]);
+
+                as[wt] = Ws[kk][r0 + sc_row];
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < WNT; ++ct) {
+                const int c = warp_n * WN + ct * 8 + group;
+
+                int bf[2];
+                bf[0] = (int) Bs[c][kk * 8 + tig];
+                bf[1] = (int) Bs[c][kk * 8 + 4 + tig];
+
+                const unsigned bs = Ad[kk][c];
+
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+                    gk_cu_mma_fp4(acc[wt][ct], af[wt], bf, as[wt], bs);
+                }
             }
         }
 

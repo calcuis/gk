@@ -52,6 +52,12 @@
 #define gkStreamSynchronize     hipStreamSynchronize
 #define gkDeviceSynchronize     hipDeviceSynchronize
 
+#define gkEventCreate           hipEventCreate
+#define gkEventDestroy          hipEventDestroy
+#define gkEventRecord           hipEventRecord
+#define gkEventSynchronize      hipEventSynchronize
+#define gkEventElapsedTime      hipEventElapsedTime
+
 #define gkSetDevice             hipSetDevice
 #define gkGetDevice             hipGetDevice
 #define gkGetDeviceCount        hipGetDeviceCount
@@ -110,6 +116,12 @@
 #define gkStreamDestroy         cudaStreamDestroy
 #define gkStreamSynchronize     cudaStreamSynchronize
 #define gkDeviceSynchronize     cudaDeviceSynchronize
+
+#define gkEventCreate           cudaEventCreate
+#define gkEventDestroy          cudaEventDestroy
+#define gkEventRecord           cudaEventRecord
+#define gkEventSynchronize      cudaEventSynchronize
+#define gkEventElapsedTime      cudaEventElapsedTime
 
 #define gkSetDevice             cudaSetDevice
 #define gkGetDevice             cudaGetDevice

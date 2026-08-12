@@ -830,6 +830,18 @@ static struct gk_tensor * build_mma_nvfp4_exact(struct gk_ctx * ctx, struct gk_t
     return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 512, 640, 64);
 }
 
+// An *odd* number of 64-element groups: 320 of k is five of them.
+//
+// The tile stages GK_CU_MMA_FP4_KSTEP groups per round, so a k whose group
+// count is not a multiple of KSTEP leaves a partial last round that has to
+// stage zeros rather than read past the end of the row. Every other nvfp4 case
+// here has k in {256, 512, 1024} - four, eight and sixteen groups - so all of
+// them divide by any KSTEP anyone is likely to pick, and none of them would
+// notice if the tail were wrong.
+static struct gk_tensor * build_mma_nvfp4_odd_k(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 320, 600, 40);
+}
+
 // The FP4 tensor-core tile, against a reference that is actually exact.
 //
 // This one does not go through `run_op_tol`, and the reason is the whole point
@@ -1968,6 +1980,7 @@ int main(void) {
     failures += run_nvfp4_tile_exact(gpu);
     failures += run_op_tol(gpu, "mma nvfp4 exct", build_mma_nvfp4_exact,  6e-1f);
     failures += run_op_tol(gpu, "mma nvfp4 deep", build_mma_nvfp4_deep,   6e-1f);
+    failures += run_op_tol(gpu, "mma nvfp4 oddk", build_mma_nvfp4_odd_k,  6e-1f);
     failures += run_op_tol(gpu, "mma nvfp4 batch", build_mma_nvfp4_batched, 6e-1f);
 
     // The f16 tensor-core tile. Held looser than the float paths for one
