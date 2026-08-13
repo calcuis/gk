@@ -219,6 +219,366 @@ static __global__ void gk_cu_k_fill(gk_tview_mut d, float c, int64_t n) {
     }
 }
 
+// --------------------------------------------------------------------------
+// row-mapped elementwise
+//
+// The kernels above decompose a flat index into (i0,i1,i2,i3) with four 64-bit
+// divisions, and a binary op pays four more taking the broadcast modulo of the
+// second operand. A 64-bit division is software on this hardware - some tens
+// of instructions - so an add of a million f32 elements spends an order of
+// magnitude more instructions decomposing indices than it does adding, and
+// measures at a flat ~13 G elements/s whatever the tensor's size. That flat
+// rate is the tell: a bandwidth-bound kernel gets faster per element when its
+// operands fit in L2, and this one does not.
+//
+// Mapping the grid to the shape instead - one block row per (i1,i2,i3), the
+// block's threads walking i0 - costs one division per *block* and none per
+// element, and lets a contiguous row be read four floats at a time.
+//
+// It applies when every operand is f32 with a unit innermost stride, which is
+// every residual add, bias add, per-channel scale and activation in a
+// diffusion UNet. Everything else - a permuted innermost axis, f16, a
+// broadcast that is neither the full extent nor one - still goes through the
+// flat kernels above, which stay correct for any stride, type and shape.
+// --------------------------------------------------------------------------
+
+// The launch, decided on the host. `ok` false means this shape has to use the
+// flat kernel; nothing below is then valid.
+struct gk_cu_rows_plan {
+    bool    ok;
+    bool    vec;        // four floats per thread per step
+    bool    bcast0;     // src1 has one column, broadcast along i0
+    dim3    grid;
+    int     block;
+    int64_t as[4], bs[4], ds[4];   // strides in elements, outer three used
+    struct gk_cu_fastdiv ne2;      // splits blockIdx.z into (i2, i3)
+};
+
+// gridDim.y and gridDim.z are 16-bit on every device gk runs on; a tensor
+// taller than this in either keeps the flat kernel.
+#define GK_CU_ROWS_MAX_DIM 65535
+
+// Enough blocks along i0 to cover the row without an unbounded grid; the
+// kernels stride whatever is left.
+#define GK_CU_ROWS_MAX_X 256
+
+static __host__ bool gk_cu_rows_strides(const struct gk_tensor * t, int64_t * s) {
+    if (t->nb[0] != sizeof(float)) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (t->nb[i] % sizeof(float) != 0) {
+            return false;
+        }
+        s[i] = (int64_t) (t->nb[i] / sizeof(float));
+    }
+    return true;
+}
+
+// `b` may be NULL for the one-operand kernels.
+static __host__ struct gk_cu_rows_plan gk_cu_rows_plan_make(const struct gk_tensor * d,
+                                                            const struct gk_tensor * a,
+                                                            const struct gk_tensor * b) {
+    struct gk_cu_rows_plan p;
+    memset(&p, 0, sizeof(p));
+
+    if (d->type != GKT_F32 || a->type != GKT_F32 || (b != NULL && b->type != GKT_F32)) {
+        return p;
+    }
+    if (!gk_are_same_shape(a, d)) {
+        return p;
+    }
+    if (d->ne[1] > GK_CU_ROWS_MAX_DIM || d->ne[2] * d->ne[3] > GK_CU_ROWS_MAX_DIM) {
+        return p;
+    }
+    if (d->ne[2] > GK_CU_FASTDIV_MAX) {
+        return p;
+    }
+    if (!gk_cu_rows_strides(d, p.ds) || !gk_cu_rows_strides(a, p.as)) {
+        return p;
+    }
+
+    if (b != NULL) {
+        // The flat kernel takes `i % b->ne[i]` in every dimension. Only the two
+        // divisors that mean something - the full extent, or one - are
+        // reproduced here as a stride and a zero; anything else falls back
+        // rather than be approximated.
+        for (int i = 0; i < 4; ++i) {
+            if (b->ne[i] != d->ne[i] && b->ne[i] != 1) {
+                return p;
+            }
+        }
+        if (!gk_cu_rows_strides(b, p.bs)) {
+            return p;
+        }
+        for (int i = 1; i < 4; ++i) {
+            if (b->ne[i] == 1) {
+                p.bs[i] = 0;
+            }
+        }
+        p.bcast0 = b->ne[0] == 1 && d->ne[0] != 1;
+    }
+
+    // Four at a time needs the row length and every row start to be a multiple
+    // of four floats, and the tensors themselves to be sixteen-byte aligned.
+    p.vec = d->ne[0] % 4 == 0;
+    for (int i = 1; i < 4 && p.vec; ++i) {
+        p.vec = p.ds[i] % 4 == 0 && p.as[i] % 4 == 0 && (b == NULL || p.bs[i] % 4 == 0);
+    }
+    if (p.vec) {
+        p.vec = ((uintptr_t) d->data % 16 == 0) && ((uintptr_t) a->data % 16 == 0) &&
+                (b == NULL || (uintptr_t) b->data % 16 == 0);
+    }
+    if (p.vec && b != NULL && !p.bcast0) {
+        p.vec = p.bs[0] == 1;
+    }
+
+    const int64_t per = p.vec ? d->ne[0] / 4 : d->ne[0];
+    int64_t gx = (per + GK_CUDA_BLOCK - 1) / GK_CUDA_BLOCK;
+    if (gx > GK_CU_ROWS_MAX_X) {
+        gx = GK_CU_ROWS_MAX_X;
+    }
+
+    p.grid  = dim3((unsigned) gx, (unsigned) d->ne[1], (unsigned) (d->ne[2] * d->ne[3]));
+    p.block = GK_CUDA_BLOCK;
+    p.ne2   = gk_cu_fastdiv_make((uint32_t) d->ne[2]);
+    p.ok    = true;
+
+    return p;
+}
+
+static __device__ __forceinline__ float gk_cu_binary_apply(int kind, float va, float vb) {
+    switch (kind) {
+        case 0:  return va + vb;
+        case 1:  return va - vb;
+        case 2:  return va * vb;
+        default: return va / vb;
+    }
+}
+
+// The flat form of the same idea, for the case where every operand is
+// contiguous. Then the destination's flat index *is* the address, so there is
+// no decomposition to do at all - and unlike the row-mapped kernels, a block
+// is fully busy however short a row is. A residual add in a UNet is
+// {W, H, C, 1} with W=64: row-mapped, that is 64 lanes of a 256-thread block
+// working and the other 192 idle.
+//
+// The second operand's broadcast is the only thing that needs an index, and it
+// takes one 32-bit fast division rather than four 64-bit ones - and only in
+// the shapes that broadcast at all.
+enum gk_cu_bcast {
+    GK_CU_BCAST_NONE = 0,   // src1 has the destination's shape
+    GK_CU_BCAST_ROW  = 1,   // src1 is one row:     {ne0, 1, 1, 1}
+    GK_CU_BCAST_CH   = 2,   // src1 is one column:  {1, 1, ne2, ne3}
+    GK_CU_BCAST_ONE  = 3,   // src1 is one element
+};
+
+// Whether a source broadcasts onto `d` in one of the four patterns above, or
+// -1 for anything else. Contiguity is the caller's to check.
+static __host__ int gk_cu_bcast_kind(const struct gk_tensor * d, const struct gk_tensor * b) {
+    if (b->ne[0] == d->ne[0] && b->ne[1] == d->ne[1] &&
+        b->ne[2] == d->ne[2] && b->ne[3] == d->ne[3]) {
+        return GK_CU_BCAST_NONE;
+    }
+    if (b->ne[0] == 1 && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1) {
+        return GK_CU_BCAST_ONE;
+    }
+    if (b->ne[0] == d->ne[0] && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1) {
+        return GK_CU_BCAST_ROW;
+    }
+    if (b->ne[0] == 1 && b->ne[1] == 1 && b->ne[2] == d->ne[2] && b->ne[3] == d->ne[3]) {
+        return GK_CU_BCAST_CH;
+    }
+    return -1;
+}
+
+static __host__ bool gk_cu_flat_ok(const struct gk_tensor * t) {
+    return t->type == GKT_F32 && gk_is_contiguous(t);
+}
+
+// Sixteen-byte reads need the base aligned and the run a multiple of four.
+static __host__ bool gk_cu_flat_vec(const struct gk_tensor * t, int64_t n) {
+    return n % 4 == 0 && (uintptr_t) t->data % 16 == 0;
+}
+
+#define GK_CU_FLAT_BLOCKS(n) ((int) (((n) + GK_CUDA_BLOCK - 1) / GK_CUDA_BLOCK) > 65535 \
+                              ? 65535 : (int) (((n) + GK_CUDA_BLOCK - 1) / GK_CUDA_BLOCK))
+
+// `row` divides the flat index by ne0 (or ne0/4 in the vector kernel) and
+// `plane` by ne0*ne1; only the one the broadcast needs is ever used.
+template <int KIND, int BC>
+static __global__ void gk_cu_k_binary_flat(const float * __restrict__ a,
+                                           const float * __restrict__ b,
+                                           float * __restrict__ d, int64_t n,
+                                           struct gk_cu_fastdiv row,
+                                           struct gk_cu_fastdiv plane) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        float vb;
+        if      (BC == GK_CU_BCAST_NONE) { vb = b[i]; }
+        else if (BC == GK_CU_BCAST_ONE)  { vb = b[0]; }
+        else if (BC == GK_CU_BCAST_ROW)  { uint32_t r; gk_cu_fastdiv_qr(row, (uint32_t) i, &r); vb = b[r]; }
+        else                             { vb = b[gk_cu_fastdiv_q(plane, (uint32_t) i)]; }
+
+        d[i] = gk_cu_binary_apply(KIND, a[i], vb);
+    }
+}
+
+template <int KIND, int BC>
+static __global__ void gk_cu_k_binary_flat4(const float4 * __restrict__ a,
+                                            const float * __restrict__ b,
+                                            float4 * __restrict__ d, int64_t n4,
+                                            struct gk_cu_fastdiv row,
+                                            struct gk_cu_fastdiv plane) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n4;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 va = a[i];
+
+        float4 vb;
+        if (BC == GK_CU_BCAST_NONE) {
+            vb = ((const float4 *) b)[i];
+        } else if (BC == GK_CU_BCAST_ROW) {
+            uint32_t r;
+            gk_cu_fastdiv_qr(row, (uint32_t) i, &r);
+            vb = ((const float4 *) b)[r];
+        } else {
+            const float s = BC == GK_CU_BCAST_ONE ? b[0]
+                                                  : b[gk_cu_fastdiv_q(plane, (uint32_t) i)];
+            vb = make_float4(s, s, s, s);
+        }
+
+        d[i] = make_float4(gk_cu_binary_apply(KIND, va.x, vb.x),
+                           gk_cu_binary_apply(KIND, va.y, vb.y),
+                           gk_cu_binary_apply(KIND, va.z, vb.z),
+                           gk_cu_binary_apply(KIND, va.w, vb.w));
+    }
+}
+
+static __global__ void gk_cu_k_unary_flat(const float * __restrict__ a, float * __restrict__ d,
+                                          int64_t n, int op,
+                                          float p1, float p2, float p3, float p4) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        d[i] = gk_cu_unary(op, a[i], p1, p2, p3, p4);
+    }
+}
+
+static __global__ void gk_cu_k_unary_flat4(const float4 * __restrict__ a, float4 * __restrict__ d,
+                                           int64_t n4, int op,
+                                           float p1, float p2, float p3, float p4) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n4;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        const float4 v = a[i];
+        d[i] = make_float4(gk_cu_unary(op, v.x, p1, p2, p3, p4),
+                           gk_cu_unary(op, v.y, p1, p2, p3, p4),
+                           gk_cu_unary(op, v.z, p1, p2, p3, p4),
+                           gk_cu_unary(op, v.w, p1, p2, p3, p4));
+    }
+}
+
+template <int KIND, bool BCAST0>
+static __global__ void gk_cu_k_binary_rows(const float * __restrict__ a,
+                                           const float * __restrict__ b,
+                                           float * __restrict__ d,
+                                           int64_t ne0,
+                                           int64_t as1, int64_t as2, int64_t as3,
+                                           int64_t bs0, int64_t bs1, int64_t bs2, int64_t bs3,
+                                           int64_t ds1, int64_t ds2, int64_t ds3,
+                                           struct gk_cu_fastdiv ne2) {
+    uint32_t i2;
+    const uint32_t i3 = gk_cu_fastdiv_qr(ne2, blockIdx.z, &i2);
+    const uint32_t i1 = blockIdx.y;
+
+    const float * ar = a + i1 * as1 + i2 * as2 + i3 * as3;
+    const float * br = b + i1 * bs1 + i2 * bs2 + i3 * bs3;
+    float       * dr = d + i1 * ds1 + i2 * ds2 + i3 * ds3;
+
+    const float bv = BCAST0 ? br[0] : 0.0f;
+
+    for (int64_t i0 = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i0 < ne0;
+         i0 += (int64_t) gridDim.x * blockDim.x) {
+        dr[i0] = gk_cu_binary_apply(KIND, ar[i0], BCAST0 ? bv : br[i0 * bs0]);
+    }
+}
+
+template <int KIND, bool BCAST0>
+static __global__ void gk_cu_k_binary_rows4(const float * __restrict__ a,
+                                            const float * __restrict__ b,
+                                            float * __restrict__ d,
+                                            int64_t ne0_4,
+                                            int64_t as1, int64_t as2, int64_t as3,
+                                            int64_t bs1, int64_t bs2, int64_t bs3,
+                                            int64_t ds1, int64_t ds2, int64_t ds3,
+                                            struct gk_cu_fastdiv ne2) {
+    uint32_t i2;
+    const uint32_t i3 = gk_cu_fastdiv_qr(ne2, blockIdx.z, &i2);
+    const uint32_t i1 = blockIdx.y;
+
+    const float4 * ar = (const float4 *) (a + i1 * as1 + i2 * as2 + i3 * as3);
+    const float4 * br = (const float4 *) (b + i1 * bs1 + i2 * bs2 + i3 * bs3);
+    float4       * dr = (float4 *)       (d + i1 * ds1 + i2 * ds2 + i3 * ds3);
+
+    const float bv = BCAST0 ? *(const float *) br : 0.0f;
+
+    for (int64_t i0 = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i0 < ne0_4;
+         i0 += (int64_t) gridDim.x * blockDim.x) {
+        const float4 va = ar[i0];
+        const float4 vb = BCAST0 ? make_float4(bv, bv, bv, bv) : br[i0];
+
+        dr[i0] = make_float4(gk_cu_binary_apply(KIND, va.x, vb.x),
+                             gk_cu_binary_apply(KIND, va.y, vb.y),
+                             gk_cu_binary_apply(KIND, va.z, vb.z),
+                             gk_cu_binary_apply(KIND, va.w, vb.w));
+    }
+}
+
+// unary, and the five that carry their own op id. Both take the op as a
+// runtime argument: the branch is uniform across the launch, and the cost this
+// path exists to remove is the index arithmetic, not the switch.
+static __global__ void gk_cu_k_unary_rows(const float * __restrict__ a,
+                                          float * __restrict__ d,
+                                          int64_t ne0,
+                                          int64_t as1, int64_t as2, int64_t as3,
+                                          int64_t ds1, int64_t ds2, int64_t ds3,
+                                          int op, float p1, float p2, float p3, float p4,
+                                          struct gk_cu_fastdiv ne2) {
+    uint32_t i2;
+    const uint32_t i3 = gk_cu_fastdiv_qr(ne2, blockIdx.z, &i2);
+    const uint32_t i1 = blockIdx.y;
+
+    const float * ar = a + i1 * as1 + i2 * as2 + i3 * as3;
+    float       * dr = d + i1 * ds1 + i2 * ds2 + i3 * ds3;
+
+    for (int64_t i0 = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i0 < ne0;
+         i0 += (int64_t) gridDim.x * blockDim.x) {
+        dr[i0] = gk_cu_unary(op, ar[i0], p1, p2, p3, p4);
+    }
+}
+
+static __global__ void gk_cu_k_unary_rows4(const float * __restrict__ a,
+                                           float * __restrict__ d,
+                                           int64_t ne0_4,
+                                           int64_t as1, int64_t as2, int64_t as3,
+                                           int64_t ds1, int64_t ds2, int64_t ds3,
+                                           int op, float p1, float p2, float p3, float p4,
+                                           struct gk_cu_fastdiv ne2) {
+    uint32_t i2;
+    const uint32_t i3 = gk_cu_fastdiv_qr(ne2, blockIdx.z, &i2);
+    const uint32_t i1 = blockIdx.y;
+
+    const float4 * ar = (const float4 *) (a + i1 * as1 + i2 * as2 + i3 * as3);
+    float4       * dr = (float4 *)       (d + i1 * ds1 + i2 * ds2 + i3 * ds3);
+
+    for (int64_t i0 = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i0 < ne0_4;
+         i0 += (int64_t) gridDim.x * blockDim.x) {
+        const float4 v = ar[i0];
+        dr[i0] = make_float4(gk_cu_unary(op, v.x, p1, p2, p3, p4),
+                             gk_cu_unary(op, v.y, p1, p2, p3, p4),
+                             gk_cu_unary(op, v.z, p1, p2, p3, p4),
+                             gk_cu_unary(op, v.w, p1, p2, p3, p4));
+    }
+}
+
 static __global__ void gk_cu_k_leaky_relu(gk_tview a, gk_tview_mut d, float slope, int64_t n) {
     GK_CU_FLAT_LOOP(n) {
         const gk_cu_idx x = gk_cu_decompose(k, d.ne);
@@ -332,6 +692,70 @@ static __global__ void gk_cu_k_norm(gk_tview a, gk_tview_mut d, int kind, float 
 
 // Group norm's statistic spans a group of channels and their whole spatial
 // extent, so the unit of work is a group rather than a row.
+// A group of a contiguous f32 tensor is a contiguous span: the groups partition
+// the channel axis and the channel axis is the outer one, so group g of batch
+// i3 owns [(i3*n_groups + g)*count, +count). That removes the whole index
+// decomposition the general kernel below does three times per element, and
+// lets the span be read four floats at a time.
+//
+// The block is also four times wider than the general kernel's. One block per
+// group is forced by the reduction, and a UNet normalizes 32 groups at a time -
+// 32 blocks on a twenty-multiprocessor part, so a narrow block leaves most of
+// the device idle for a pass that is otherwise pure bandwidth.
+#define GK_CU_GNORM_BLOCK 1024
+
+template <bool VEC>
+static __global__ __launch_bounds__(GK_CU_GNORM_BLOCK, 1)
+void gk_cu_k_group_norm_flat(const float * __restrict__ a, float * __restrict__ d,
+                             int64_t count, float eps) {
+    __shared__ float scratch[GK_CU_GNORM_BLOCK / GK_WARP_SIZE];
+
+    const int64_t off = (int64_t) blockIdx.x * count;
+
+    const float  * ar = a + off;
+    float        * dr = d + off;
+    const float4 * a4 = (const float4 *) ar;
+    float4       * d4 = (float4 *)       dr;
+
+    const int64_t n    = VEC ? count / 4 : count;
+    const int64_t step = blockDim.x;
+
+    float sum = 0.0f;
+    for (int64_t i = threadIdx.x; i < n; i += step) {
+        if (VEC) {
+            const float4 v = a4[i];
+            sum += v.x + v.y + v.z + v.w;
+        } else {
+            sum += ar[i];
+        }
+    }
+    const float mean = gk_cu_block_sum(sum, scratch) / (float) count;
+    __syncthreads();
+
+    float var = 0.0f;
+    for (int64_t i = threadIdx.x; i < n; i += step) {
+        if (VEC) {
+            const float4 v = a4[i];
+            const float4 c = make_float4(v.x - mean, v.y - mean, v.z - mean, v.w - mean);
+            var += c.x * c.x + c.y * c.y + c.z * c.z + c.w * c.w;
+        } else {
+            const float c = ar[i] - mean;
+            var += c * c;
+        }
+    }
+    const float scale = rsqrtf(gk_cu_block_sum(var, scratch) / (float) count + eps);
+
+    for (int64_t i = threadIdx.x; i < n; i += step) {
+        if (VEC) {
+            const float4 v = a4[i];
+            d4[i] = make_float4((v.x - mean) * scale, (v.y - mean) * scale,
+                                (v.z - mean) * scale, (v.w - mean) * scale);
+        } else {
+            dr[i] = (ar[i] - mean) * scale;
+        }
+    }
+}
+
 static __global__ void gk_cu_k_group_norm(gk_tview a, gk_tview_mut d,
                                           int n_groups, float eps) {
     __shared__ float scratch[GK_CU_NORM_BLOCK / GK_WARP_SIZE];
@@ -2620,6 +3044,120 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
 
         case GK_OP_ADD: case GK_OP_SUB: case GK_OP_MUL: case GK_OP_DIV: {
             const int kind = op == GK_OP_ADD ? 0 : op == GK_OP_SUB ? 1 : op == GK_OP_MUL ? 2 : 3;
+
+            // Everything contiguous, and src1 broadcasting in one of the four
+            // patterns a graph actually uses: no index arithmetic at all.
+            if (gk_cu_flat_ok(node) && gk_cu_flat_ok(src0) && gk_cu_flat_ok(src1)) {
+                const int bc = gk_cu_bcast_kind(node, src1);
+
+                // The divisor the broadcast needs is taken in float4 units by
+                // the vector kernel, so a row - or a plane, for a per-channel
+                // operand - that is not a whole number of them keeps the scalar
+                // one, where the divisor is in elements and always exact.
+                const bool vec = gk_cu_flat_vec(node, ne) && gk_cu_flat_vec(src0, ne) &&
+                                 (bc != GK_CU_BCAST_NONE || gk_cu_flat_vec(src1, ne)) &&
+                                 (bc != GK_CU_BCAST_ROW  || (node->ne[0] % 4 == 0 &&
+                                                             (uintptr_t) src1->data % 16 == 0)) &&
+                                 (bc != GK_CU_BCAST_CH   || node->ne[0] * node->ne[1] % 4 == 0);
+
+                const int64_t n     = vec ? ne / 4 : ne;
+                const int64_t row_d = vec ? node->ne[0] / 4 : node->ne[0];
+                const int64_t plane = vec ? node->ne[0] * node->ne[1] / 4
+                                          : node->ne[0] * node->ne[1];
+
+                // The flat index is taken as 32 bits inside the kernel, and a
+                // fast division needs a divisor of at least one.
+                if (bc >= 0 && n <= GK_CU_FASTDIV_MAX && row_d >= 1 && plane >= 1 &&
+                    row_d <= GK_CU_FASTDIV_MAX && plane <= GK_CU_FASTDIV_MAX) {
+                    const struct gk_cu_fastdiv fr = gk_cu_fastdiv_make((uint32_t) row_d);
+                    const struct gk_cu_fastdiv fp = gk_cu_fastdiv_make((uint32_t) plane);
+                    const int nblk = GK_CU_FLAT_BLOCKS(n);
+
+#define GK_CU_LAUNCH_BIN_FLAT(K, B)                                                    \
+                    do {                                                               \
+                        if (vec) {                                                     \
+                            gk_cu_k_binary_flat4<K, B><<<nblk, GK_CUDA_BLOCK, 0, stream>>>( \
+                                (const float4 *) src0->data, (const float *) src1->data,    \
+                                (float4 *) node->data, n, fr, fp);                     \
+                        } else {                                                       \
+                            gk_cu_k_binary_flat<K, B><<<nblk, GK_CUDA_BLOCK, 0, stream>>>(  \
+                                (const float *) src0->data, (const float *) src1->data,     \
+                                (float *) node->data, n, fr, fp);                      \
+                        }                                                              \
+                    } while (0)
+
+#define GK_CU_LAUNCH_BIN_FLAT_BC(K)                                                    \
+                    do {                                                               \
+                        switch (bc) {                                                  \
+                            case GK_CU_BCAST_NONE: GK_CU_LAUNCH_BIN_FLAT(K, GK_CU_BCAST_NONE); break; \
+                            case GK_CU_BCAST_ROW:  GK_CU_LAUNCH_BIN_FLAT(K, GK_CU_BCAST_ROW);  break; \
+                            case GK_CU_BCAST_CH:   GK_CU_LAUNCH_BIN_FLAT(K, GK_CU_BCAST_CH);   break; \
+                            default:               GK_CU_LAUNCH_BIN_FLAT(K, GK_CU_BCAST_ONE);  break; \
+                        }                                                              \
+                    } while (0)
+
+                    switch (kind) {
+                        case 0:  GK_CU_LAUNCH_BIN_FLAT_BC(0); break;
+                        case 1:  GK_CU_LAUNCH_BIN_FLAT_BC(1); break;
+                        case 2:  GK_CU_LAUNCH_BIN_FLAT_BC(2); break;
+                        default: GK_CU_LAUNCH_BIN_FLAT_BC(3); break;
+                    }
+#undef GK_CU_LAUNCH_BIN_FLAT_BC
+#undef GK_CU_LAUNCH_BIN_FLAT
+                    return true;
+                }
+            }
+
+            const struct gk_cu_rows_plan p = gk_cu_rows_plan_make(node, src0, src1);
+
+            if (p.ok) {
+#define GK_CU_LAUNCH_BIN_ROWS(K)                                                       \
+                do {                                                                   \
+                    if (p.vec) {                                                       \
+                        if (p.bcast0) {                                                \
+                            gk_cu_k_binary_rows4<K, true><<<p.grid, p.block, 0, stream>>>( \
+                                (const float *) src0->data, (const float *) src1->data, \
+                                (float *) node->data, node->ne[0] / 4,                  \
+                                p.as[1], p.as[2], p.as[3],                              \
+                                p.bs[1], p.bs[2], p.bs[3],                              \
+                                p.ds[1], p.ds[2], p.ds[3], p.ne2);                      \
+                        } else {                                                        \
+                            gk_cu_k_binary_rows4<K, false><<<p.grid, p.block, 0, stream>>>( \
+                                (const float *) src0->data, (const float *) src1->data, \
+                                (float *) node->data, node->ne[0] / 4,                  \
+                                p.as[1], p.as[2], p.as[3],                              \
+                                p.bs[1], p.bs[2], p.bs[3],                              \
+                                p.ds[1], p.ds[2], p.ds[3], p.ne2);                      \
+                        }                                                               \
+                    } else {                                                            \
+                        if (p.bcast0) {                                                 \
+                            gk_cu_k_binary_rows<K, true><<<p.grid, p.block, 0, stream>>>( \
+                                (const float *) src0->data, (const float *) src1->data, \
+                                (float *) node->data, node->ne[0],                      \
+                                p.as[1], p.as[2], p.as[3],                              \
+                                p.bs[0], p.bs[1], p.bs[2], p.bs[3],                     \
+                                p.ds[1], p.ds[2], p.ds[3], p.ne2);                      \
+                        } else {                                                        \
+                            gk_cu_k_binary_rows<K, false><<<p.grid, p.block, 0, stream>>>( \
+                                (const float *) src0->data, (const float *) src1->data, \
+                                (float *) node->data, node->ne[0],                      \
+                                p.as[1], p.as[2], p.as[3],                              \
+                                p.bs[0], p.bs[1], p.bs[2], p.bs[3],                     \
+                                p.ds[1], p.ds[2], p.ds[3], p.ne2);                      \
+                        }                                                               \
+                    }                                                                   \
+                } while (0)
+
+                switch (kind) {
+                    case 0:  GK_CU_LAUNCH_BIN_ROWS(0); break;
+                    case 1:  GK_CU_LAUNCH_BIN_ROWS(1); break;
+                    case 2:  GK_CU_LAUNCH_BIN_ROWS(2); break;
+                    default: GK_CU_LAUNCH_BIN_ROWS(3); break;
+                }
+#undef GK_CU_LAUNCH_BIN_ROWS
+                return true;
+            }
+
             gk_cu_k_binary<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
                 gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(node), kind, ne);
             return true;
@@ -2635,6 +3173,51 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
 
         case GK_OP_UNARY: {
             const int uop = (int) gk_get_unary_op(node);
+
+            if (gk_cu_flat_ok(node) && gk_cu_flat_ok(src0)) {
+                const bool  vec  = gk_cu_flat_vec(node, ne) && gk_cu_flat_vec(src0, ne);
+                const int64_t n  = vec ? ne / 4 : ne;
+                const int   nblk = GK_CU_FLAT_BLOCKS(n);
+
+                const float p1 = gk_get_op_params_f32(node, 1);
+                const float p2 = gk_get_op_params_f32(node, 2);
+                const float p3 = gk_get_op_params_f32(node, 3);
+                const float p4 = gk_get_op_params_f32(node, 4);
+
+                if (vec) {
+                    gk_cu_k_unary_flat4<<<nblk, GK_CUDA_BLOCK, 0, stream>>>(
+                        (const float4 *) src0->data, (float4 *) node->data, n,
+                        uop, p1, p2, p3, p4);
+                } else {
+                    gk_cu_k_unary_flat<<<nblk, GK_CUDA_BLOCK, 0, stream>>>(
+                        (const float *) src0->data, (float *) node->data, n,
+                        uop, p1, p2, p3, p4);
+                }
+                return true;
+            }
+
+            const struct gk_cu_rows_plan p = gk_cu_rows_plan_make(node, src0, NULL);
+
+            if (p.ok) {
+                const float p1 = gk_get_op_params_f32(node, 1);
+                const float p2 = gk_get_op_params_f32(node, 2);
+                const float p3 = gk_get_op_params_f32(node, 3);
+                const float p4 = gk_get_op_params_f32(node, 4);
+
+                if (p.vec) {
+                    gk_cu_k_unary_rows4<<<p.grid, p.block, 0, stream>>>(
+                        (const float *) src0->data, (float *) node->data, node->ne[0] / 4,
+                        p.as[1], p.as[2], p.as[3], p.ds[1], p.ds[2], p.ds[3],
+                        uop, p1, p2, p3, p4, p.ne2);
+                } else {
+                    gk_cu_k_unary_rows<<<p.grid, p.block, 0, stream>>>(
+                        (const float *) src0->data, (float *) node->data, node->ne[0],
+                        p.as[1], p.as[2], p.as[3], p.ds[1], p.ds[2], p.ds[3],
+                        uop, p1, p2, p3, p4, p.ne2);
+                }
+                return true;
+            }
+
             gk_cu_k_unary<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
                 gk_cu_view(src0), gk_cu_view_mut(node), uop,
                 gk_get_op_params_f32(node, 1), gk_get_op_params_f32(node, 2),
@@ -2684,6 +3267,26 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
 
         case GK_OP_GROUP_NORM: {
             const int n_groups = gk_get_op_params_i32(node, 0);
+
+            if (gk_cu_flat_ok(node) && gk_cu_flat_ok(src0) && src0->ne[2] % n_groups == 0) {
+                const int64_t count = src0->ne[0] * src0->ne[1] * (src0->ne[2] / n_groups);
+                const int     nblk  = (int) (node->ne[3] * n_groups);
+                const bool    vec   = count % 4 == 0 &&
+                                      (uintptr_t) src0->data % 16 == 0 &&
+                                      (uintptr_t) node->data % 16 == 0;
+
+                if (vec) {
+                    gk_cu_k_group_norm_flat<true><<<nblk, GK_CU_GNORM_BLOCK, 0, stream>>>(
+                        (const float *) src0->data, (float *) node->data, count,
+                        gk_get_op_params_f32(node, 1));
+                } else {
+                    gk_cu_k_group_norm_flat<false><<<nblk, GK_CU_GNORM_BLOCK, 0, stream>>>(
+                        (const float *) src0->data, (float *) node->data, count,
+                        gk_get_op_params_f32(node, 1));
+                }
+                return true;
+            }
+
             gk_cu_k_group_norm<<<(int) (node->ne[3] * n_groups), GK_CU_NORM_BLOCK, 0, stream>>>(
                 gk_cu_view(src0), gk_cu_view_mut(node), n_groups, gk_get_op_params_f32(node, 1));
             return true;

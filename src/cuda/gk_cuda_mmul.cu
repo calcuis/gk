@@ -1805,8 +1805,18 @@ void gk_cu_k_mul_mat_mma_f16(gk_tview a, gk_tview b, gk_tview_mut d,
 
     const int n_threads = WARPS_M * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE;
 
-    const int64_t m0  = (int64_t) blockIdx.x * TILE_M;
-    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMA_F16_TILE_N;
+    // x is the *column* tile and y the row tile, which is the opposite of the
+    // obvious assignment and is deliberate. Blocks are dispatched x fastest, so
+    // whichever axis x carries is the one whose blocks are co-resident - and
+    // the blocks that should be co-resident are the ones that share an operand.
+    // Here every block covering a row tile reads the same TILE_M rows of A,
+    // which for a UNet's convolutions is the big operand: 4096x8640 halves, 71
+    // MB, against a 5 MB weight. With x on the row axis those blocks are
+    // separated by the whole grid and A is re-read from DRAM once per column
+    // tile; with x on the column axis they run together and the re-reads come
+    // out of L2.
+    const int64_t m0  = (int64_t) blockIdx.y * TILE_M;
+    const int64_t n0  = (int64_t) blockIdx.x * GK_CU_MMA_F16_TILE_N;
 
     // z carries the slice and, when k is split, which piece of k this block
     // reduces. A split block owns the same output patch as its siblings and
@@ -2947,8 +2957,8 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 const bool b_vec = gk_cuda_mma_f16_vec(src1, k_len);
 
                 dim3 fgrid;
-                fgrid.x = (unsigned) grid_m;
-                fgrid.y = (unsigned) grid_n;
+                fgrid.x = (unsigned) grid_n;   // column tiles: see the kernel
+                fgrid.y = (unsigned) grid_m;
                 fgrid.z = (unsigned) (n_23 * n_splits);
 
                 g_gk_mm_path = "mma-f16";
