@@ -333,6 +333,42 @@ static __global__ void gk_cu_k_quantize_act(gk_tview b, gk_cu_q8blk * out,
     out[t] = blk;
 }
 
+// The column scale that puts a column's group scales in the middle of ue4m3's
+// range, as a power of two.
+//
+// ue4m3 spans 2^-9 to 448, and a group scale is `amax/6`, so a group whose
+// amax is below about 2^-6 has no scale that fits and one below 2^-11 cannot
+// be represented at all. That is not a hypothetical: measured on this DiT the
+// activation quantizer's round trip was **74.9% of signal**, because most of
+// its groups live down there. A per-16 ue4m3 scale on its own is simply not a
+// float; NVFP4 is a two-level format, and this is the level gk was missing.
+//
+// A power of two rather than `amax/T`, so that dividing by it and multiplying
+// back in the epilogue are both exact and add no rounding of their own. The
+// target puts the column's own amax in [512, 1024), which leaves the largest
+// group scale at about 170 against ue4m3's 448 - room for the search below to
+// try a code or two above it - and gives a group 2^13 times smaller than the
+// column's peak a scale that is still normal.
+static __device__ __forceinline__ void gk_cu_fp4_col_scale(float amax, float * scale,
+                                                           float * inv) {
+    if (!(amax > 0.0f)) {
+        *scale = 1.0f;
+        *inv   = 0.0f;
+        return;
+    }
+
+    int e;
+    frexpf(amax, &e);   // amax = frac * 2^e, frac in [0.5, 1)
+
+    // Kept inside the exponent range where both directions stay normal: the
+    // scale multiplies the accumulator and its inverse multiplies activations,
+    // so a subnormal either way would lose what it is here to protect.
+    e = min(max(e, -110), 110);
+
+    *scale = ldexpf(1.0f, e - 10);
+    *inv   = ldexpf(1.0f, 10 - e);
+}
+
 // The same pass, quantizing to nvfp4 instead of to int8, for the FP4
 // tensor-core tile.
 //
@@ -348,142 +384,197 @@ static __global__ void gk_cu_k_quantize_act(gk_tview b, gk_cu_q8blk * out,
 //     with; dividing by the amax and letting the scale round afterwards would
 //     put the rounding error into every one of the sixteen values instead of
 //     into the scale alone.
-//   * The codes are written in k order, eight to a word, which is exactly the
-//     fragment layout. The tile stages words, not bytes, and never repacks.
+//   * The codes are written in gk's own nibble order, eight to a word. That is
+//     a permutation of k, and the tile applies the same one to the weights, so
+//     the two cancel inside the dot product and neither side ever repacks.
+//
+// One block of threads per column rather than one thread per group, because
+// the column scale above needs the whole column before any of it can be
+// quantized. The column is therefore read twice - once to reduce, once to
+// encode - and the second read is out of cache, since a column is at most
+// 48 KB and the block that wants it has just walked it.
 static __global__ void gk_cu_k_quantize_act_fp4(gk_tview b, gk_cu_fp4blk * out,
-                                                int64_t n_grp, int64_t n_cols,
-                                                int64_t total, bool stats) {
-    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= total) {
-        return;
-    }
-
-    const int64_t g   = t % n_grp;
-    const int64_t col = (t / n_grp) % n_cols;
-    const int64_t i23 = t / (n_grp * n_cols);
+                                                float * col_scale, int64_t n_grp,
+                                                int64_t n_cols, bool stats) {
+    const int64_t cid = blockIdx.x;             // one block per column
+    const int64_t col = cid % n_cols;
+    const int64_t i23 = cid / n_cols;
 
     const int64_t i2 = i23 % b.ne[2];
     const int64_t i3 = i23 / b.ne[2];
 
-    gk_cu_fp4blk blk;
+    const int64_t k_len = n_grp * 64;
 
-    uint32_t sc     = 0;
-    double   sq_err = 0.0;
-    double   sq_ref = 0.0;
-    int      zeroed = 0;
-
-    // A sub-group of sixteen at a time, because that is the unit the scale
-    // covers and the search below needs all sixteen values in registers.
-    for (int sub = 0; sub < 4; ++sub) {
-        float v[16];
-        float amax = 0.0f;
-
-#pragma unroll
-        for (int e = 0; e < 16; ++e) {
-            v[e] = gk_cu_get(b, g * 64 + sub * 16 + e, col, i2, i3);
-            amax = fmaxf(amax, fabsf(v[e]));
-        }
-
-        // The first candidate: the smallest scale that keeps the group inside
-        // the codebook, 6 being the largest e2m1 magnitude.
-        //
-        // Clamped to the smallest non-zero ue4m3 rather than allowed to flush.
-        // Flushing looks harmless - a group whose amax is under 2^-9 is tiny -
-        // but it deletes the group outright, and on a real DiT that happened to
-        // **24% of all groups**, which is not tiny in aggregate and was the
-        // difference between a picture and noise. A clamped scale represents
-        // such a group coarsely; a zero scale represents it not at all.
-        int first = (int) gk_cu_f2ue4m3(amax * (1.0f / 6.0f));
-        if (first == 0 && amax > 0.0f) {
-            first = 1;
-        }
-
-        // Then four neighbours either side of it. The first candidate is the
-        // smallest scale that does not clip, which is not the same as the one
-        // that reproduces the group best: a larger scale clips the extreme
-        // value but rounds the other fifteen more finely, and with only eight
-        // codes that trade is often worth taking. Five squared-error
-        // evaluations of sixteen values each, against a matmul that will use
-        // this block thousands of times.
-        int   best_code = first;
-        float best_err  = FLT_MAX;
-
-#pragma unroll
-        for (int i = 0; i < 5; ++i) {
-            static const int offs[5] = { 0, -1, 1, -2, 2 };
-            const int code = first + offs[i];
-
-            if (code < 1 || code > 0x7e) {
-                continue;
-            }
-
-            const float sv  = 2.0f * gk_cu_ue4m3((uint8_t) code);
-            const float inv = sv > 0.0f ? 1.0f / sv : 0.0f;
-
-            float err = 0.0f;
-#pragma unroll
-            for (int e = 0; e < 16; ++e) {
-                const float r = sv * 0.5f * (float) gk_cu_e2m1_value(gk_cu_f2e2m1(v[e] * inv));
-                const float d = r - v[e];
-
-                err = fmaf(d, d, err);
-            }
-
-            if (err < best_err) {
-                best_err  = err;
-                best_code = code;
-            }
-        }
-
-        if (amax <= 0.0f) {
-            best_code = 0;
-            zeroed++;
-        }
-
-        const float sv  = 2.0f * gk_cu_ue4m3((uint8_t) best_code);
-        const float inv = sv > 0.0f ? 1.0f / sv : 0.0f;
-
-        sc |= (uint32_t) best_code << (8 * sub);
-
-        // Into gk's own nvfp4 nibble order, not k order: a byte holds elements
-        // `j` and `j + 8` of its sixteen, low nibble first. That is how the
-        // weight side is stored and how the tile stages it, and the tile
-        // relies on the two agreeing - see the staging comment in
-        // `gk_cu_k_mul_mat_mma_fp4`.
-#pragma unroll
-        for (int half = 0; half < 2; ++half) {
-            uint32_t packed = 0;
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int q_lo = gk_cu_f2e2m1(v[half * 4 + e]     * inv);
-                const int q_hi = gk_cu_f2e2m1(v[half * 4 + e + 8] * inv);
-
-                packed |= (uint32_t) q_lo << (8 * e);
-                packed |= (uint32_t) q_hi << (8 * e + 4);
-            }
-            blk.q[sub * 2 + half] = packed;
-        }
-
-        if (stats) {
-#pragma unroll
-            for (int e = 0; e < 16; ++e) {
-                const float r = sv * 0.5f * (float) gk_cu_e2m1_value(gk_cu_f2e2m1(v[e] * inv));
-                const double d = (double) (r - v[e]);
-
-                sq_err += d * d;
-                sq_ref += (double) v[e] * (double) v[e];
-            }
-        }
+    // Pass one: the column's amax, reduced across the block.
+    float cmax = 0.0f;
+    for (int64_t e = threadIdx.x; e < k_len; e += blockDim.x) {
+        cmax = fmaxf(cmax, fabsf(gk_cu_get(b, e, col, i2, i3)));
     }
 
-    blk.sc = sc;
-    out[t] = blk;
+    __shared__ float s_warp[GK_CUDA_BLOCK / GK_WARP_SIZE];
+    __shared__ float s_cmax;
+
+#pragma unroll
+    for (int off = GK_WARP_SIZE / 2; off > 0; off >>= 1) {
+        cmax = fmaxf(cmax, __shfl_xor_sync(0xffffffff, cmax, off));
+    }
+
+    if (threadIdx.x % GK_WARP_SIZE == 0) {
+        s_warp[threadIdx.x / GK_WARP_SIZE] = cmax;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float m = 0.0f;
+        for (int i = 0; i < (int) (blockDim.x / GK_WARP_SIZE); ++i) {
+            m = fmaxf(m, s_warp[i]);
+        }
+        s_cmax = m;
+    }
+    __syncthreads();
+
+    float cs, cs_inv;
+    gk_cu_fp4_col_scale(s_cmax, &cs, &cs_inv);
+
+    if (threadIdx.x == 0) {
+        col_scale[cid] = cs;
+    }
+
+    double sq_err = 0.0;
+    double sq_ref = 0.0;
+    int    zeroed = 0;
+    int    groups = 0;
+
+    // Pass two: one group of 64 per thread, strided over the column.
+    for (int64_t g = threadIdx.x; g < n_grp; g += blockDim.x) {
+        gk_cu_fp4blk blk;
+
+        uint32_t sc     = 0;
+        groups += 4;
+
+        // A sub-group of sixteen at a time, because that is the unit the scale
+        // covers and the search below needs all sixteen values in registers.
+        for (int sub = 0; sub < 4; ++sub) {
+            float v[16];
+            float amax = 0.0f;
+
+    #pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                v[e] = gk_cu_get(b, g * 64 + sub * 16 + e, col, i2, i3) * cs_inv;
+                amax = fmaxf(amax, fabsf(v[e]));
+            }
+
+            // The first candidate: the smallest scale that keeps the group inside
+            // the codebook, 6 being the largest e2m1 magnitude.
+            //
+            // Clamped to the smallest non-zero ue4m3 rather than allowed to flush.
+            // Flushing looks harmless - a group whose amax is under 2^-9 is tiny -
+            // but it deletes the group outright, and on a real DiT that happened to
+            // **24% of all groups**, which is not tiny in aggregate and was the
+            // difference between a picture and noise. A clamped scale represents
+            // such a group coarsely; a zero scale represents it not at all.
+            //
+            // With the column scale above in front of it this is now the rare tail
+            // rather than the common case: it takes a group 2^16 below the column's
+            // own peak to reach the clamp.
+            int first = (int) gk_cu_f2ue4m3(amax * (1.0f / 6.0f));
+            if (first == 0 && amax > 0.0f) {
+                first = 1;
+            }
+
+            // Then four neighbours either side of it. The first candidate is the
+            // smallest scale that does not clip, which is not the same as the one
+            // that reproduces the group best: a larger scale clips the extreme
+            // value but rounds the other fifteen more finely, and with only eight
+            // codes that trade is often worth taking. Five squared-error
+            // evaluations of sixteen values each, against a matmul that will use
+            // this block thousands of times.
+            int   best_code = first;
+            float best_err  = FLT_MAX;
+
+    #pragma unroll
+            for (int i = 0; i < 5; ++i) {
+                static const int offs[5] = { 0, -1, 1, -2, 2 };
+                const int code = first + offs[i];
+
+                if (code < 1 || code > 0x7e) {
+                    continue;
+                }
+
+                const float sv  = 2.0f * gk_cu_ue4m3((uint8_t) code);
+                const float inv = sv > 0.0f ? 1.0f / sv : 0.0f;
+
+                float err = 0.0f;
+    #pragma unroll
+                for (int e = 0; e < 16; ++e) {
+                    const float r = sv * 0.5f * (float) gk_cu_e2m1_value(gk_cu_f2e2m1(v[e] * inv));
+                    const float d = r - v[e];
+
+                    err = fmaf(d, d, err);
+                }
+
+                if (err < best_err) {
+                    best_err  = err;
+                    best_code = code;
+                }
+            }
+
+            if (amax <= 0.0f) {
+                best_code = 0;
+                zeroed++;
+            }
+
+            const float sv  = 2.0f * gk_cu_ue4m3((uint8_t) best_code);
+            const float inv = sv > 0.0f ? 1.0f / sv : 0.0f;
+
+            sc |= (uint32_t) best_code << (8 * sub);
+
+            // Into gk's own nvfp4 nibble order, not k order: a byte holds elements
+            // `j` and `j + 8` of its sixteen, low nibble first. That is how the
+            // weight side is stored and how the tile stages it, and the tile
+            // relies on the two agreeing - see the staging comment in
+            // `gk_cu_k_mul_mat_mma_fp4`.
+    #pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                uint32_t packed = 0;
+    #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int q_lo = gk_cu_f2e2m1(v[half * 4 + e]     * inv);
+                    const int q_hi = gk_cu_f2e2m1(v[half * 4 + e + 8] * inv);
+
+                    packed |= (uint32_t) q_lo << (8 * e);
+                    packed |= (uint32_t) q_hi << (8 * e + 4);
+                }
+                blk.q[sub * 2 + half] = packed;
+            }
+
+            if (stats) {
+    #pragma unroll
+                for (int e = 0; e < 16; ++e) {
+                    const float r = sv * 0.5f * (float) gk_cu_e2m1_value(gk_cu_f2e2m1(v[e] * inv));
+                    const double d = (double) (r - v[e]);
+
+                    sq_err += d * d;
+                    sq_ref += (double) v[e] * (double) v[e];
+                }
+            }
+        }
+
+        blk.sc = sc;
+        out[cid * n_grp + g] = blk;
+    }
 
     if (stats) {
-        atomicAdd(&g_gk_fp4_sq_err, sq_err);
-        atomicAdd(&g_gk_fp4_sq_ref, sq_ref);
+        // Reported in the column's own units, not the rescaled ones. The ratio
+        // is what the printer shows and a common factor cancels out of it, but
+        // the two sums are also summed across columns of very different
+        // magnitudes, and there the factor does not cancel.
+        const double cs2 = (double) cs * (double) cs;
+
+        atomicAdd(&g_gk_fp4_sq_err, sq_err * cs2);
+        atomicAdd(&g_gk_fp4_sq_ref, sq_ref * cs2);
         atomicAdd(&g_gk_fp4_zero_groups, (unsigned long long) zeroed);
-        atomicAdd(&g_gk_fp4_groups,      (unsigned long long) 4);
+        atomicAdd(&g_gk_fp4_groups,      (unsigned long long) groups);
     }
 }
 
@@ -1213,8 +1304,8 @@ static __global__
 __launch_bounds__(WARPS_M * WARPS_N * GK_WARP_SIZE,
                   GK_CU_FP4_BPSM(WARPS_M, WARPS_N, KSTEP))
 void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
-                             const gk_cu_fp4blk * aq, int64_t n_grp,
-                             int64_t r2, int64_t r3) {
+                             const gk_cu_fp4blk * aq, const float * col_scale,
+                             int64_t n_grp, int64_t r2, int64_t r3) {
     constexpr int THREADS = WARPS_M * WARPS_N * GK_WARP_SIZE;
     constexpr int TILE_M  = GK_CU_MMA_TILE_M_OF(WARPS_M);
     constexpr int TILE_N  = WARPS_N * WN;
@@ -1276,6 +1367,7 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
     const int64_t n_cols = d.ne[1];
 
     const gk_cu_fp4blk * aq23 = aq + i23 * n_cols * n_grp;
+    const float *        cs23 = col_scale + i23 * n_cols;
 
     // The scale registers the hardware will read from this lane: A row
     // `group + (lane%2)*8`, B column `group`. Computed in every lane of a quad
@@ -1447,7 +1539,12 @@ void gk_cu_k_mul_mat_mma_fp4(gk_tview a, gk_tview_mut d,
                                 + tig * 2 + (i & 1);
 
                 if (m < n_rows && n < n_cols) {
-                    gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                    // The column's second-level scale, undone here. It is a
+                    // constant over the whole k reduction, so it factors out of
+                    // the sum entirely and costs one multiply per output rather
+                    // than anything in the inner loop - which is the reason the
+                    // scale is per column and not per block.
+                    gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i] * cs23[n]);
                 }
             }
         }
@@ -1520,7 +1617,7 @@ static __host__ __forceinline__ bool gk_cu_mma_nvfp4_wide(const struct gk_tensor
         }                                                                          \
         gk_cu_k_mul_mat_mma_fp4<warps_m, wn, warps_n, kstep>                       \
             <<<mgrid, thr_, smem_, stream>>>(                                      \
-                gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);         \
+                gk_cu_view(src0), gk_cu_view_mut(dst), aq, acs, n_grp, r2, r3);    \
     } while (0)
 
 // Whether a shape should take the 256x128 FP4 tile instead of the 128x128 one.
@@ -2520,18 +2617,29 @@ static bool gk_cu_mm_split_on(void) {
     return on;
 }
 
-// `GK_MM_NVFP4_FP4=0` sends nvfp4 back to the integer tile on a device that
-// has the FP4 instruction. It is how the two are A/B'd, and how a numerical
-// question about fp4 activations gets a same-binary control - the two paths
-// quantize the activation side differently, so they are the one pair here that
-// does *not* agree bit for bit.
+// `GK_MM_NVFP4_FP4=1` takes the FP4 tensor-core tile on a device that has the
+// instruction; the integer tile is the default. It is also how the two are
+// A/B'd, and how a numerical question about fp4 activations gets a same-binary
+// control - the two paths quantize the activation side differently, so they are
+// the one pair here that does *not* agree bit for bit.
+//
+// Off by default because that difference is not small and what it buys is.
+// The FP4 tile takes both operands as e2m1, so the activation side is 4 bits
+// against the integer tile's 8, and measured on MageFlow at 512x512 that is
+// 21.7 dB against the integer tile's 52.0 dB - the reference image with visible
+// noise in the flat areas, not a different image. What it wins is the matmul
+// phase, 212 ms against 325 ms over four steps, which is 1.53x of a part of a
+// step and about 6% of the step: 1.69 s of sampling against 1.80 s. Six percent
+// is not worth thirty decibels, and the tile stays here, correct and one
+// environment variable away, because the instruction is the right one to build
+// on once the activation side can be something wider than e2m1.
 static bool gk_cu_mm_fp4_stats_on(void) {
     static const bool on = gk_cu_env_on("GK_MM_FP4_STATS");
     return on;
 }
 
 static bool gk_cu_mm_fp4_enabled(void) {
-    static const int on = gk_cu_env_int("GK_MM_NVFP4_FP4", 1);
+    static const int on = gk_cu_env_int("GK_MM_NVFP4_FP4", 0);
     return on != 0;
 }
 
@@ -2621,9 +2729,17 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             const int64_t n_cols = dst->ne[1];
             const int64_t n_23   = dst->ne[2] * dst->ne[3];
             const int64_t n_blk  = n_grp * n_cols * n_23;
+            const int64_t n_col2 = n_cols * n_23;
+
+            // One scratch allocation for both: the blocks, then the per-column
+            // scales behind them. Two allocations would be two grow paths and
+            // the scratch keeps only one buffer.
+            const size_t aq_bytes = (size_t) n_blk * sizeof(gk_cu_fp4blk);
 
             gk_cu_fp4blk * aq = (gk_cu_fp4blk *) gk_cu_scratch_get(
-                scratch, (size_t) n_blk * sizeof(gk_cu_fp4blk), stream);
+                scratch, aq_bytes + (size_t) n_col2 * sizeof(float), stream);
+
+            float * acs = aq != NULL ? (float *) ((char *) aq + aq_bytes) : NULL;
 
             if (aq != NULL) {
                 const bool split = gk_cu_mm_split_on();
@@ -2631,9 +2747,12 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 const std::chrono::steady_clock::time_point q0 =
                     std::chrono::steady_clock::now();
 
-                gk_cu_k_quantize_act_fp4<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
-                                           GK_CUDA_BLOCK, 0, stream>>>(
-                    gk_cu_view(src1), aq, n_grp, n_cols, n_blk,
+                // One block per column: the column scale is a reduction over
+                // the whole column, so a thread that owns only one group of
+                // sixty-four cannot compute it.
+                gk_cu_k_quantize_act_fp4<<<(unsigned) n_col2, GK_CUDA_BLOCK,
+                                           0, stream>>>(
+                    gk_cu_view(src1), aq, acs, n_grp, n_cols,
                     gk_cu_mm_fp4_stats_on());
 
                 if (split) {
