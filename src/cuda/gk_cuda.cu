@@ -408,7 +408,7 @@ static gk_backend_buffer_type_t gk_cuda_backend_buft(gk_backend_t backend) {
 // f16 weights, 2880x4096" is.
 // --------------------------------------------------------------------------
 
-#define GK_CU_PROF_MAX 512
+#define GK_CU_PROF_MAX 4096
 
 struct gk_cu_prof_row {
     char   key[96];

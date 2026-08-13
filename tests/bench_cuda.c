@@ -379,6 +379,39 @@ DIT_H3(proj,  5376, 21504)   // the 21504-row projection
 DIT_H3(ffdn, 14336,  5376)   // feed-forward out - the long-k shape
 DIT_H3(ffo,   7168,  5376)   // the 7168-k projection
 
+// The MiniMax-H3 *video VAE* decoder, which is a second 36-layer transformer
+// and not the convolutional stack the name suggests: hidden 2048, 32 heads of
+// 64, 1797 tokens a tile, and 28 tiles for a 480x480x124 clip. It runs 1008
+// times per decode, so it is the same order of work as the DiT and lands on
+// entirely different kernels - f16 weights rather than nvfp4, and an
+// *unfused* attention whose two matmuls are f32 on both operands.
+//
+// The f32 pair is the point of this group. Everything else gk has tuned is a
+// quantized or f16 tile; these two land on `tile-f32`, which has no
+// tensor-core path at all, and they are what `--diffusion-fa` leaves unfused.
+static struct gk_tensor * b_vae_ffup(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16, 2048, 16384, 1797); }
+static struct gk_tensor * b_vae_ffdn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16, 8192,  2048, 1797); }
+static struct gk_tensor * b_vae_qkv (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16, 2048,  6144, 1797); }
+static struct gk_tensor * b_vae_out (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16, 2048,  2048, 1797); }
+
+// Batched over the 32 heads, which is how the graph issues them: one call per
+// layer per tile with ne[2] = 32, not 32 separate calls.
+static struct gk_tensor * mul_mat_heads(struct gk_ctx * ctx, enum gk_type type,
+                                        int64_t k, int64_t rows, int64_t cols, int64_t heads) {
+    struct gk_tensor * w = gk_new_tensor_3d(ctx, type, k, rows, heads);
+    struct gk_tensor * x = gk_new_tensor_3d(ctx, GK_TYPE_F32, k, cols, heads);
+    gk_set_name(w, "weight");
+    gk_set_name(x, "x");
+    return gk_mul_mat(ctx, w, x);
+}
+
+static struct gk_tensor * b_vae_kq (struct gk_ctx * c) { return mul_mat_heads(c, GK_TYPE_F32,   64, 1797, 1797, 32); }
+static struct gk_tensor * b_vae_kqv(struct gk_ctx * c) { return mul_mat_heads(c, GK_TYPE_F32, 1797,   64, 1797, 32); }
+
+// The same two shapes in f16, as the ceiling a tensor-core path would aim at.
+static struct gk_tensor * b_vae_kq_f16 (struct gk_ctx * c) { return mul_mat_heads(c, GK_TYPE_F16,   64, 1797, 1797, 32); }
+static struct gk_tensor * b_vae_kqv_f16(struct gk_ctx * c) { return mul_mat_heads(c, GK_TYPE_F16, 1797,   64, 1797, 32); }
+
 static struct gk_tensor * b_mm_gate_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0, N_EMBD, N_FF,    N_PREFILL); }
 static struct gk_tensor * b_mm_down_pre(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_1, N_FF,   N_EMBD,  N_PREFILL); }
 static struct gk_tensor * b_mm_f16_pre (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,  N_EMBD, N_FF,    N_PREFILL); }
@@ -762,6 +795,16 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ff out    nvfp4", "7168x5376 n=8742",   b_h3_ffo_nv,   ARENA_HUGE },
     { NULL,            "ff out    f16",   "7168x5376 n=8742",   b_h3_ffo_f16,  ARENA_HUGE },
     { NULL,            "ff out    q4_K",  "7168x5376 n=8742",   b_h3_ffo_q4k,  ARENA_HUGE },
+
+    { "MiniMax-H3 video VAE decoder matmuls (36 layers x 28 tiles a decode)",
+                       "ff up     f16",   "2048x16384 n=1797",  b_vae_ffup,    ARENA_BIG  },
+    { NULL,            "ff down   f16",   "8192x2048 n=1797",   b_vae_ffdn,    ARENA_BIG  },
+    { NULL,            "qkv       f16",   "2048x6144 n=1797",   b_vae_qkv,     ARENA_BIG  },
+    { NULL,            "out proj  f16",   "2048x2048 n=1797",   b_vae_out,     ARENA_BIG  },
+    { NULL,            "attn KQ   f32",   "64x1797 n=1797 x32", b_vae_kq,      ARENA_BIG  },
+    { NULL,            "attn KQV  f32",   "1797x64 n=1797 x32", b_vae_kqv,     ARENA_BIG  },
+    { NULL,            "attn KQ   f16",   "64x1797 n=1797 x32", b_vae_kq_f16,  ARENA_BIG  },
+    { NULL,            "attn KQV  f16",   "1797x64 n=1797 x32", b_vae_kqv_f16, ARENA_BIG  },
 
     { "matmul (prefill, 512 columns)", "ffn_gate/up q4_0", "1536x6144",   b_mm_gate_pre,  ARENA_MID   },
     { NULL,                            "ffn_down    q4_1", "6144x1536",   b_mm_down_pre,  ARENA_MID   },
