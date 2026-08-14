@@ -864,12 +864,16 @@ kernel void gk_mtl_norm(device const uchar * a [[buffer(0)]],
                         device uchar *       d [[buffer(2)]],
                         constant gk_mtl_params & p [[buffer(3)]],
                         threadgroup float * scratch [[threadgroup(0)]],
-                        uint3 tgpig [[threadgroup_position_in_grid]],
-                        uint  tpitg [[thread_position_in_threadgroup]],
-                        uint  ntg   [[threads_per_threadgroup]],
+                        uint3 tgpig  [[threadgroup_position_in_grid]],
+                        uint3 tpitg3 [[thread_position_in_threadgroup]],
+                        uint3 ntg3   [[threads_per_threadgroup]],
                         uint  tiisg [[thread_index_in_simdgroup]],
                         uint  sgitg [[simdgroup_index_in_threadgroup]],
                         uint  nsg   [[simdgroups_per_threadgroup]]) {
+    // the grid-position attributes must all be scalar or all be vectors of the
+    // same width in one kernel; tgpig is uint3, so these are too
+    const uint tpitg = tpitg3.x;
+    const uint ntg   = ntg3.x;
     const long ir = (long) tgpig.x;
     const long i1 = ir % p.dst.ne[1];
     const long i2 = (ir / p.dst.ne[1]) % p.dst.ne[2];
@@ -920,12 +924,15 @@ kernel void gk_mtl_group_norm(device const uchar * a [[buffer(0)]],
                               device uchar *       d [[buffer(2)]],
                               constant gk_mtl_params & p [[buffer(3)]],
                               threadgroup float * scratch [[threadgroup(0)]],
-                              uint3 tgpig [[threadgroup_position_in_grid]],
-                              uint  tpitg [[thread_position_in_threadgroup]],
-                              uint  ntg   [[threads_per_threadgroup]],
+                              uint3 tgpig  [[threadgroup_position_in_grid]],
+                              uint3 tpitg3 [[thread_position_in_threadgroup]],
+                              uint3 ntg3   [[threads_per_threadgroup]],
                               uint  tiisg [[thread_index_in_simdgroup]],
                               uint  sgitg [[simdgroup_index_in_threadgroup]],
                               uint  nsg   [[simdgroups_per_threadgroup]]) {
+    const uint tpitg = tpitg3.x;
+    const uint ntg   = ntg3.x;
+
     const int n_groups = p.i[0];
 
     const long unit = (long) tgpig.x;
@@ -973,12 +980,15 @@ kernel void gk_mtl_soft_max(device const uchar * a     [[buffer(0)]],
                             constant gk_mtl_params & p [[buffer(3)]],
                             device const float * sinks [[buffer(4)]],
                             threadgroup float * scratch [[threadgroup(0)]],
-                            uint3 tgpig [[threadgroup_position_in_grid]],
-                            uint  tpitg [[thread_position_in_threadgroup]],
-                            uint  ntg   [[threads_per_threadgroup]],
+                            uint3 tgpig  [[threadgroup_position_in_grid]],
+                            uint3 tpitg3 [[thread_position_in_threadgroup]],
+                            uint3 ntg3   [[threads_per_threadgroup]],
                             uint  tiisg [[thread_index_in_simdgroup]],
                             uint  sgitg [[simdgroup_index_in_threadgroup]],
                             uint  nsg   [[simdgroups_per_threadgroup]]) {
+    const uint tpitg = tpitg3.x;
+    const uint ntg   = ntg3.x;
+
     const long ir = (long) tgpig.x;
     const long i1 = ir % p.dst.ne[1];
     const long i2 = (ir / p.dst.ne[1]) % p.dst.ne[2];
@@ -1063,12 +1073,15 @@ kernel void gk_mtl_sum_rows(device const uchar * a [[buffer(0)]],
                             device uchar *       d [[buffer(2)]],
                             constant gk_mtl_params & p [[buffer(3)]],
                             threadgroup float * scratch [[threadgroup(0)]],
-                            uint3 tgpig [[threadgroup_position_in_grid]],
-                            uint  tpitg [[thread_position_in_threadgroup]],
-                            uint  ntg   [[threads_per_threadgroup]],
+                            uint3 tgpig  [[threadgroup_position_in_grid]],
+                            uint3 tpitg3 [[thread_position_in_threadgroup]],
+                            uint3 ntg3   [[threads_per_threadgroup]],
                             uint  tiisg [[thread_index_in_simdgroup]],
                             uint  sgitg [[simdgroup_index_in_threadgroup]],
                             uint  nsg   [[simdgroups_per_threadgroup]]) {
+    const uint tpitg = tpitg3.x;
+    const uint ntg   = ntg3.x;
+
     const long ir = (long) tgpig.x;
     const long i1 = ir % p.dst.ne[1];
     const long i2 = (ir / p.dst.ne[1]) % p.dst.ne[2];
@@ -1226,12 +1239,15 @@ kernel void gk_mtl_mul_mat(device const uchar * a [[buffer(0)]],
                            device uchar *       d [[buffer(2)]],
                            constant gk_mtl_params & p [[buffer(3)]],
                            threadgroup float * scratch [[threadgroup(0)]],
-                           uint3 tgpig [[threadgroup_position_in_grid]],
-                           uint  tpitg [[thread_position_in_threadgroup]],
-                           uint  ntg   [[threads_per_threadgroup]],
+                           uint3 tgpig  [[threadgroup_position_in_grid]],
+                           uint3 tpitg3 [[thread_position_in_threadgroup]],
+                           uint3 ntg3   [[threads_per_threadgroup]],
                            uint  tiisg [[thread_index_in_simdgroup]],
                            uint  sgitg [[simdgroup_index_in_threadgroup]],
                            uint  nsg   [[simdgroups_per_threadgroup]]) {
+    const uint tpitg = tpitg3.x;
+    const uint ntg   = ntg3.x;
+
     const long i0  = (long) tgpig.x;
     const long c0  = (long) tgpig.y * p.i[0];
     const long i23 = (long) tgpig.z;
@@ -1277,12 +1293,15 @@ kernel void gk_mtl_mul_mat_id(device const uchar * as  [[buffer(0)]],
                               constant gk_mtl_params & p [[buffer(3)]],
                               device const uchar * ids [[buffer(4)]],
                               threadgroup float * scratch [[threadgroup(0)]],
-                              uint3 tgpig [[threadgroup_position_in_grid]],
-                              uint  tpitg [[thread_position_in_threadgroup]],
-                              uint  ntg   [[threads_per_threadgroup]],
+                              uint3 tgpig  [[threadgroup_position_in_grid]],
+                              uint3 tpitg3 [[thread_position_in_threadgroup]],
+                              uint3 ntg3   [[threads_per_threadgroup]],
                               uint  tiisg [[thread_index_in_simdgroup]],
                               uint  sgitg [[simdgroup_index_in_threadgroup]],
                               uint  nsg   [[simdgroups_per_threadgroup]]) {
+    const uint tpitg = tpitg3.x;
+    const uint ntg   = ntg3.x;
+
     const long i0 = (long) tgpig.x;
     const long is = (long) tgpig.y;
     const long it = (long) tgpig.z;
