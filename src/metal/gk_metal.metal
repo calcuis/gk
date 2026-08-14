@@ -42,6 +42,7 @@ using namespace metal;
 #define GKT_I64    27
 #define GKT_BF16   30
 #define GKT_MXFP4  39
+#define GKT_NVFP4  40
 
 #define GK_QK 256
 
@@ -92,6 +93,20 @@ static inline float gk_mtl_e8m0_half(uchar e) {
     return as_type<float>(0x00200000u << e);
 }
 
+// UE4M3 scale, halved like E8M0 above (the e2m1 table is doubled). 0x7f is
+// the NaN slot and decodes as zero.
+static inline float gk_mtl_ue4m3_half(uchar v) {
+    if (v == 0 || v == 0x7f) {
+        return 0.0f;
+    }
+    const uint e = (v >> 3) & 0xfu;
+    const uint m = v & 0x7u;
+    if (e == 0) {
+        return (float) m * (1.0f / 512.0f) * 0.5f; // subnormal: m * 2^-9, halved
+    }
+    return as_type<float>(((e + 120u) << 23) | (m << 20)) * 0.5f;
+}
+
 constant char gk_mtl_iq4_values[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
@@ -105,6 +120,8 @@ static inline int gk_mtl_blck_size(int type) {
         case GKT_Q4_0: case GKT_Q4_1: case GKT_Q5_0: case GKT_Q5_1:
         case GKT_Q8_0: case GKT_IQ4_NL: case GKT_MXFP4:
             return 32;
+        case GKT_NVFP4:
+            return 64;
         case GKT_Q2_K: case GKT_Q3_K: case GKT_Q4_K: case GKT_Q5_K:
         case GKT_Q6_K: case GKT_IQ4_XS:
             return GK_QK;
@@ -126,6 +143,7 @@ static inline int gk_mtl_type_size(int type) {
         case GKT_Q5_1:   return 24;
         case GKT_Q8_0:   return 34;
         case GKT_MXFP4:  return 17;
+        case GKT_NVFP4:  return 36;
         case GKT_Q2_K:   return 4 + GK_QK / 16 + GK_QK / 4;
         case GKT_Q3_K:   return 2 + GK_QK / 4 + GK_QK / 8 + 12;
         case GKT_Q4_K:   return 4 + 12 + GK_QK / 2;
@@ -203,6 +221,16 @@ static float gk_mtl_block_elem(device const uchar * b, int type, int j) {
             const float d = gk_mtl_e8m0_half(b[0]);
             device const uchar * qs = b + 1;
             const int code = j < 16 ? (qs[j] & 0xf) : (qs[j - 16] >> 4);
+            return d * (float) gk_mtl_e2m1_values[code];
+        }
+        case GKT_NVFP4: {
+            // 64 elements in four groups of 16; one UE4M3 scale per group,
+            // nibble halving per group rather than per block
+            const int s = j / 16;
+            const int r = j % 16;
+            const float d = gk_mtl_ue4m3_half(b[s]);
+            device const uchar * qs = b + 4 + s * 8;
+            const int code = r < 8 ? (qs[r] & 0xf) : (qs[r - 8] >> 4);
             return d * (float) gk_mtl_e2m1_values[code];
         }
         case GKT_Q2_K: {
@@ -360,10 +388,11 @@ static float gk_mtl_get(device const uchar * base, constant gk_mtl_tview & t,
         default: break;
     }
 
-    const int blck = gk_mtl_blck_size(t.type);
-    const int tsz  = gk_mtl_type_size(t.type);
+    // every block size is a power of two, and the GPU has no integer divide
+    const int shift = ctz((uint) gk_mtl_blck_size(t.type));
+    const int tsz   = gk_mtl_type_size(t.type);
 
-    return gk_mtl_block_elem(row + (i0 / blck) * tsz, t.type, (int) (i0 % blck));
+    return gk_mtl_block_elem(row + (i0 >> shift) * tsz, t.type, (int) (i0 & ((1 << shift) - 1)));
 }
 
 static void gk_mtl_set(device uchar * base, constant gk_mtl_tview & t,
@@ -811,6 +840,54 @@ kernel void gk_mtl_pad(device const uchar * a [[buffer(0)]],
                       : 0.0f);
 }
 
+// im2col: one thread per destination element. i[0..5] = s0,s1,p0,p1,d0,d1,
+// i[6] = is_2D. src0 is the conv kernel and contributes only its shape; the
+// image is src1 and is always f32.
+kernel void gk_mtl_im2col(device const uchar * a [[buffer(0)]],
+                          device const uchar * b [[buffer(1)]],
+                          device uchar *       d [[buffer(2)]],
+                          constant gk_mtl_params & p [[buffer(3)]],
+                          uint tid [[thread_position_in_grid]]) {
+    const long k = (long) tid;
+    if (k >= p.n) {
+        return;
+    }
+
+    const gk_mtl_idx x = gk_mtl_decompose(k, p.dst);
+
+    const bool is_2d = p.i[6] != 0;
+
+    const long KW = p.src0.ne[0];
+    const long KH = is_2d ? p.src0.ne[1] : 1;
+
+    // x.i0 is iic * (KH*KW) + ikh * KW + ikw, matching the CPU's cell layout
+    const long iic = x.i0 / (KH * KW);
+    const long r   = x.i0 % (KH * KW);
+    const long ikh = r / KW;
+    const long ikw = r % KW;
+
+    const long iow = x.i1;
+    const long ioh = is_2d ? x.i2 : 0;
+    const long in  = is_2d ? x.i3 : x.i2;
+
+    const long iiw = iow * p.i[0] + ikw * p.i[4] - p.i[2];
+    const long iih = ioh * p.i[1] + ikh * p.i[5] - p.i[3];
+
+    const long IW = p.src1.ne[0];
+    const long IH = is_2d ? p.src1.ne[1] : 1;
+
+    float v = 0.0f;
+    if (iih >= 0 && iih < IH && iiw >= 0 && iiw < IW) {
+        const long ofs = in  * (is_2d ? p.src1.nb[3] : p.src1.nb[2])
+                       + iic * (is_2d ? p.src1.nb[2] : p.src1.nb[1])
+                       + iih * (is_2d ? p.src1.nb[1] : 0)
+                       + iiw * p.src1.nb[0];
+        v = *(device const float *) (b + ofs);
+    }
+
+    gk_mtl_set(d, p.dst, x.i0, x.i1, x.i2, x.i3, v);
+}
+
 // --------------------------------------------------------------------------
 // row-wise kernels
 //
@@ -1230,7 +1307,45 @@ kernel void gk_mtl_rope_passthrough(device const uchar * a [[buffer(0)]],
 // activation columns: the weight row is read once and used NC times, which is
 // the reuse that makes a quantized matmul memory-bound rather than
 // decode-bound. i[0] carries NC.
+//
+// The k-loops read through gk_mtl_row_elem rather than gk_mtl_get: the row
+// address is computed once outside the loop, and the within-row math is
+// 32-bit shifts and masks. The GPU has no integer divide - a 64-bit divide
+// by a runtime block size costs more than the multiply it feeds, and
+// gk_mtl_get would pay it on every element.
 // --------------------------------------------------------------------------
+
+// Per-row read state, resolved once per row outside the k-loop.
+struct gk_mtl_row_view {
+    device const uchar * row;
+    int type;
+    int nb0;    // element stride for the float types
+    int shift;  // log2(block size) for the quantized types
+    int tsz;    // block byte size for the quantized types
+};
+
+static gk_mtl_row_view gk_mtl_row_view_make(device const uchar * base,
+                                            constant gk_mtl_tview & t,
+                                            long i1, long i2, long i3) {
+    gk_mtl_row_view v;
+    v.row   = base + i1 * t.nb[1] + i2 * t.nb[2] + i3 * t.nb[3];
+    v.type  = t.type;
+    v.nb0   = (int) t.nb[0];
+    v.shift = ctz((uint) gk_mtl_blck_size(t.type));
+    v.tsz   = gk_mtl_type_size(t.type);
+    return v;
+}
+
+static inline float gk_mtl_row_elem(const thread gk_mtl_row_view & v, int kk) {
+    switch (v.type) {
+        case GKT_F32:  return *(device const float *) (v.row + kk * v.nb0);
+        case GKT_F16:  return (float) *(device const half *) (v.row + kk * v.nb0);
+        case GKT_BF16: return gk_mtl_bf2f(*(device const ushort *) (v.row + kk * v.nb0));
+        default:
+            return gk_mtl_block_elem(v.row + (kk >> v.shift) * v.tsz, v.type,
+                                     kk & ((1 << v.shift) - 1));
+    }
+}
 
 #define GK_MTL_MM_NC 4
 
@@ -1261,18 +1376,25 @@ kernel void gk_mtl_mul_mat(device const uchar * a [[buffer(0)]],
     const long a2 = i2 / r2;
     const long a3 = i3 / r3;
 
-    const long k_len = p.src0.ne[0];
+    const int k_len = (int) p.src0.ne[0];
+
+    const gk_mtl_row_view arow = gk_mtl_row_view_make(a, p.src0, i0, a2, a3);
+
+    // A column past ne[1] is clamped to a valid row: its reads are in-bounds
+    // garbage and its accumulator is never written back.
+    gk_mtl_row_view brow[GK_MTL_MM_NC];
+    for (int j = 0; j < p.i[0]; ++j) {
+        const long col = c0 + j < p.dst.ne[1] ? c0 + j : p.dst.ne[1] - 1;
+        brow[j] = gk_mtl_row_view_make(b, p.src1, col, i2, i3);
+    }
 
     float acc[GK_MTL_MM_NC] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
-    for (long kk = tpitg; kk < k_len; kk += ntg) {
-        const float av = gk_mtl_get(a, p.src0, kk, i0, a2, a3);
+    for (int kk = (int) tpitg; kk < k_len; kk += (int) ntg) {
+        const float av = gk_mtl_row_elem(arow, kk);
 
         for (int j = 0; j < p.i[0]; ++j) {
-            const long col = c0 + j;
-            if (col < p.dst.ne[1]) {
-                acc[j] += av * gk_mtl_get(b, p.src1, kk, col, i2, i3);
-            }
+            acc[j] += av * gk_mtl_row_elem(brow[j], kk);
         }
     }
 
@@ -1284,6 +1406,107 @@ kernel void gk_mtl_mul_mat(device const uchar * a [[buffer(0)]],
         if (tpitg == 0 && col < p.dst.ne[1]) {
             gk_mtl_set(d, p.dst, i0, col, i2, i3, total);
         }
+    }
+}
+
+// Tiled matmul for wide destinations. One threadgroup owns a 32x32 output
+// tile; the operands stream through threadgroup memory in K-slabs of 16, and
+// each thread holds a 2x2 block of accumulators. The staging is the point:
+// the row-per-threadgroup kernel below re-reads the activation columns once
+// per output row, which makes a diffusion step bandwidth-bound by a factor of
+// the tile width. Quantized operands are decoded once, on the way into the
+// tile.
+#define GK_MTL_MM_TILE 32
+#define GK_MTL_MM_SLAB 16
+
+kernel void gk_mtl_mul_mat_tiled(device const uchar * a [[buffer(0)]],
+                                 device const uchar * b [[buffer(1)]],
+                                 device uchar *       d [[buffer(2)]],
+                                 constant gk_mtl_params & p [[buffer(3)]],
+                                 threadgroup float * tile [[threadgroup(0)]],
+                                 uint3 tgpig  [[threadgroup_position_in_grid]],
+                                 uint3 tpitg3 [[thread_position_in_threadgroup]]) {
+    const int t  = (int) tpitg3.x;   // 256 threads, laid out 16x16
+    const int tx = t & 15;
+    const int ty = t >> 4;
+
+    const long row0 = (long) tgpig.x * GK_MTL_MM_TILE;
+    const long col0 = (long) tgpig.y * GK_MTL_MM_TILE;
+    const long i23  = (long) tgpig.z;
+
+    const long i2 = i23 % p.dst.ne[2];
+    const long i3 = i23 / p.dst.ne[2];
+
+    const long r2 = p.src1.ne[2] / p.src0.ne[2];
+    const long r3 = p.src1.ne[3] / p.src0.ne[3];
+
+    const long a2 = i2 / r2;
+    const long a3 = i3 / r3;
+
+    const long M = p.dst.ne[0];
+    const long N = p.dst.ne[1];
+    const int  K = (int) p.src0.ne[0];
+
+    threadgroup float * ta = tile;                                    // [SLAB][TILE]
+    threadgroup float * tb = tile + GK_MTL_MM_TILE * GK_MTL_MM_SLAB;  // [SLAB][TILE]
+
+    // Each thread stages the same tile row / column every slab, at two k
+    // positions; the row views can therefore be resolved once. An
+    // out-of-range row is staged as zeros and its accumulators never stored.
+    const int  rs = t & (GK_MTL_MM_TILE - 1);
+    const int  ks = t >> 5;   // this thread fills k slots ks and ks + 8
+
+    const long ar = row0 + rs;
+    const long bc = col0 + rs;
+    const bool a_ok = ar < M;
+    const bool b_ok = bc < N;
+
+    const gk_mtl_row_view av = gk_mtl_row_view_make(a, p.src0, a_ok ? ar : 0, a2, a3);
+    const gk_mtl_row_view bv = gk_mtl_row_view_make(b, p.src1, b_ok ? bc : 0, i2, i3);
+
+    const int r0 = ty * 2;   // this thread's 2x2 block within the tile
+    const int c0 = tx * 2;
+
+    float acc00 = 0.0f, acc01 = 0.0f, acc10 = 0.0f, acc11 = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += GK_MTL_MM_SLAB) {
+        const int k1 = k0 + ks;
+        const int k2 = k0 + ks + 8;
+
+        ta[ ks      * GK_MTL_MM_TILE + rs] = a_ok && k1 < K ? gk_mtl_row_elem(av, k1) : 0.0f;
+        ta[(ks + 8) * GK_MTL_MM_TILE + rs] = a_ok && k2 < K ? gk_mtl_row_elem(av, k2) : 0.0f;
+        tb[ ks      * GK_MTL_MM_TILE + rs] = b_ok && k1 < K ? gk_mtl_row_elem(bv, k1) : 0.0f;
+        tb[(ks + 8) * GK_MTL_MM_TILE + rs] = b_ok && k2 < K ? gk_mtl_row_elem(bv, k2) : 0.0f;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int kk = 0; kk < GK_MTL_MM_SLAB; ++kk) {
+            const float a0 = ta[kk * GK_MTL_MM_TILE + r0];
+            const float a1 = ta[kk * GK_MTL_MM_TILE + r0 + 1];
+            const float b0 = tb[kk * GK_MTL_MM_TILE + c0];
+            const float b1 = tb[kk * GK_MTL_MM_TILE + c0 + 1];
+
+            acc00 += a0 * b0; acc01 += a0 * b1;
+            acc10 += a1 * b0; acc11 += a1 * b1;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const long orow0 = row0 + r0;
+    const long ocol0 = col0 + c0;
+
+    if (orow0 < M && ocol0 < N) {
+        gk_mtl_set(d, p.dst, orow0, ocol0, i2, i3, acc00);
+    }
+    if (orow0 < M && ocol0 + 1 < N) {
+        gk_mtl_set(d, p.dst, orow0, ocol0 + 1, i2, i3, acc01);
+    }
+    if (orow0 + 1 < M && ocol0 < N) {
+        gk_mtl_set(d, p.dst, orow0 + 1, ocol0, i2, i3, acc10);
+    }
+    if (orow0 + 1 < M && ocol0 + 1 < N) {
+        gk_mtl_set(d, p.dst, orow0 + 1, ocol0 + 1, i2, i3, acc11);
     }
 }
 
@@ -1308,10 +1531,14 @@ kernel void gk_mtl_mul_mat_id(device const uchar * as  [[buffer(0)]],
 
     const int expert = *(device const int *) (ids + it * p.src2.nb[1] + is * p.src2.nb[0]);
 
+    const gk_mtl_row_view arow = gk_mtl_row_view_make(as, p.src0, i0, (long) expert, 0);
+    const gk_mtl_row_view brow = gk_mtl_row_view_make(b,  p.src1, 0, it, 0);
+
+    const int k_len = (int) p.src0.ne[0];
+
     float acc = 0.0f;
-    for (long kk = tpitg; kk < p.src0.ne[0]; kk += ntg) {
-        acc += gk_mtl_get(as, p.src0, kk, i0, (long) expert, 0) *
-               gk_mtl_get(b,  p.src1, kk, 0, it, 0);
+    for (int kk = (int) tpitg; kk < k_len; kk += (int) ntg) {
+        acc += gk_mtl_row_elem(arow, kk) * gk_mtl_row_elem(brow, kk);
     }
 
     const float total = gk_mtl_group_sum(acc, scratch, tiisg, sgitg, nsg);
