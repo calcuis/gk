@@ -83,6 +83,7 @@ enum gk_metal_kernel {
     GK_METAL_K_ADD_ID,
     GK_METAL_K_DIAG_MASK,
     GK_METAL_K_PAD,
+    GK_METAL_K_IM2COL,
     GK_METAL_K_NORM,
     GK_METAL_K_GROUP_NORM,
     GK_METAL_K_SOFT_MAX,
@@ -90,6 +91,7 @@ enum gk_metal_kernel {
     GK_METAL_K_ROPE,
     GK_METAL_K_ROPE_PASSTHROUGH,
     GK_METAL_K_MUL_MAT,
+    GK_METAL_K_MUL_MAT_TILED,
     GK_METAL_K_MUL_MAT_ID,
     GK_METAL_K_COUNT,
 };
@@ -108,6 +110,7 @@ static const char * g_metal_kernel_names[GK_METAL_K_COUNT] = {
     "gk_mtl_add_id",
     "gk_mtl_diag_mask",
     "gk_mtl_pad",
+    "gk_mtl_im2col",
     "gk_mtl_norm",
     "gk_mtl_group_norm",
     "gk_mtl_soft_max",
@@ -115,6 +118,7 @@ static const char * g_metal_kernel_names[GK_METAL_K_COUNT] = {
     "gk_mtl_rope",
     "gk_mtl_rope_passthrough",
     "gk_mtl_mul_mat",
+    "gk_mtl_mul_mat_tiled",
     "gk_mtl_mul_mat_id",
 };
 
@@ -430,7 +434,7 @@ static bool gk_metal_type_supported(enum gk_type t) {
         case GK_TYPE_Q4_0: case GK_TYPE_Q4_1: case GK_TYPE_Q5_0: case GK_TYPE_Q5_1:
         case GK_TYPE_Q8_0: case GK_TYPE_Q2_K: case GK_TYPE_Q3_K: case GK_TYPE_Q4_K:
         case GK_TYPE_Q5_K: case GK_TYPE_Q6_K: case GK_TYPE_IQ4_NL: case GK_TYPE_IQ4_XS:
-        case GK_TYPE_MXFP4:
+        case GK_TYPE_MXFP4: case GK_TYPE_NVFP4:
             return true;
         default:
             return false;
@@ -473,6 +477,11 @@ static bool gk_metal_supports_op(const struct gk_tensor * op) {
 
         case GK_OP_SET_ROWS:
             return gk_metal_is_float(op->type) && gk_metal_is_float(op->src[0]->type);
+
+        case GK_OP_IM2COL:
+            // mirrors the CPU pass's asserts: f32 image in, f32 or f16 out
+            return (op->type == GK_TYPE_F32 || op->type == GK_TYPE_F16) &&
+                   op->src[1]->type == GK_TYPE_F32;
 
         default:
             return false;
@@ -610,6 +619,13 @@ static bool gk_metal_encode(struct gk_metal_backend_ctx * ctx,
             p.flags = gk_get_op_params_i32(node, 8) != 0 ? 1 : 0;
             break;
 
+        case GK_OP_IM2COL:
+            which = GK_METAL_K_IM2COL;
+            for (int i = 0; i < 7; ++i) { // s0, s1, p0, p1, d0, d1, is_2D
+                p.i[i] = gk_get_op_params_i32(node, i);
+            }
+            break;
+
         case GK_OP_NORM: case GK_OP_RMS_NORM: case GK_OP_L2_NORM:
             which    = GK_METAL_K_NORM;
             row_wise = true;
@@ -706,6 +722,21 @@ static bool gk_metal_encode(struct gk_metal_backend_ctx * ctx,
     gk_metal_bind(enc, dev, src2, 4);
 
     if (node->op == GK_OP_MUL_MAT) {
+        // Wide destinations take the tiled kernel; the row geometry below is
+        // only worth it for matvec-shaped outputs, where a 32-wide tile would
+        // sit mostly empty.
+        if (node->ne[1] >= 16) {
+            id<MTLComputePipelineState> tiled = ctx->pipelines[GK_METAL_K_MUL_MAT_TILED];
+            [enc setComputePipelineState:tiled];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc setThreadgroupMemoryLength:2 * 32 * 16 * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger) ((node->ne[0] + 31) / 32),
+                                                  (NSUInteger) ((node->ne[1] + 31) / 32),
+                                                  (NSUInteger) (node->ne[2] * node->ne[3]))
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            return true;
+        }
+
         p.i[0] = node->ne[1] < 4 ? 1 : 4;
 
         [enc setBytes:&p length:sizeof(p) atIndex:3];
