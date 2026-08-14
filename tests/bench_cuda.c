@@ -318,6 +318,33 @@ static struct gk_tensor * b_pre_nvfp4(struct gk_ctx * c) { return mul_mat_case(c
         return mul_mat_case(c, GK_TYPE_F16, (k), (rows), (cols));                        \
     }
 
+// The convolutions, which are a different matmul from every one above and were
+// 29% of an SD 1.x step. `ggml_conv_2d` is
+// `mul_mat(im2col[k, N*OH*OW], kernel[k, OC])`, so **both operands are f16 and
+// the big one is the activation**: 4096 rows of 8640 halves is 71 MB against a
+// 5 MB weight, the reverse of every other row in this file. k is the patch,
+// 3x3 times the input channels.
+static struct gk_tensor * conv_case(struct gk_ctx * ctx, int64_t k, int64_t pixels, int64_t oc) {
+    struct gk_tensor * im = gk_new_tensor_2d(ctx, GK_TYPE_F16, k, pixels);
+    struct gk_tensor * w  = gk_new_tensor_2d(ctx, GK_TYPE_F16, k, oc);
+    gk_set_name(im, "im2col");
+    gk_set_name(w,  "kernel");
+    return gk_mul_mat(ctx, im, w);
+}
+
+#define SD_CONV(name, k, pixels, oc)                                                     \
+    static struct gk_tensor * b_conv_##name(struct gk_ctx * c) {                         \
+        return conv_case(c, (k), (pixels), (oc));                                        \
+    }
+
+SD_CONV(l1_320,   2880, 4096, 320)    // 64x64x320, 3x3 -> 320
+SD_CONV(l1_640,   5760, 4096, 320)    // 64x64x640 (after a skip concat) -> 320
+SD_CONV(l1_960,   8640, 4096, 320)
+SD_CONV(l1_down,  5760, 4096, 640)
+SD_CONV(l2_640,   5760, 1024, 640)
+SD_CONV(l3_1280, 11520,  256, 1280)
+SD_CONV(l4_1280, 11520,   64, 1280)
+
 SD_MM(l1_attn,  320, 320,  4096)   // 64x64 level, attention projection
 SD_MM(l1_ff,    320, 2560, 4096)   // 64x64 level, feed-forward in
 SD_MM(l1_out,  1280, 320,  4096)   // 64x64 level, feed-forward out
@@ -525,6 +552,78 @@ static struct gk_tensor * b_add_pre(struct gk_ctx * ctx) {
     gk_set_name(a, "a");
     gk_set_name(b, "b");
     return gk_add(ctx, a, b);
+}
+
+// The elementwise ops a DiT's rope actually runs, at MageFlow's shapes:
+// {2, d_head/2, L, n_head} against a table that is the same over the heads.
+// Two elements to a row, so which kernel takes this is worth an order of
+// magnitude - the flat one indexes off the destination and does not care, the
+// row-mapped one gives a 256-thread block two elements of work.
+#define ROPE_L      2208
+#define ROPE_HALF   64
+#define ROPE_HEADS  24
+
+static struct gk_tensor * b_rope_mul_bcast(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, ROPE_HALF, ROPE_L, ROPE_HEADS);
+    struct gk_tensor * b = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, ROPE_HALF, ROPE_L, 1);
+    gk_set_name(a, "a");
+    gk_set_name(b, "b");
+    return gk_mul(ctx, a, b);
+}
+
+static struct gk_tensor * b_rope_add(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, ROPE_HALF, ROPE_L, ROPE_HEADS);
+    struct gk_tensor * b = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, ROPE_HALF, ROPE_L, ROPE_HEADS);
+    gk_set_name(a, "a");
+    gk_set_name(b, "b");
+    return gk_add(ctx, a, b);
+}
+
+// The same tensor with a strided innermost axis, which no flat kernel may
+// take: this is the row-mapped path against the fully general one, and where
+// the crossover between them sits decides GK_CU_ROWS_MIN.
+static struct gk_tensor * b_rope_mul_strided(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 4, ROPE_HALF, ROPE_L, ROPE_HEADS);
+    struct gk_tensor * b = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, ROPE_HALF, ROPE_L, ROPE_HEADS);
+    gk_set_name(a, "a");
+    gk_set_name(b, "b");
+    struct gk_tensor * v = gk_view_4d(ctx, a, 2, ROPE_HALF, ROPE_L, ROPE_HEADS,
+                                      a->nb[1], a->nb[2], a->nb[3], 2 * sizeof(float));
+    return gk_mul(ctx, v, b);
+}
+
+// A 64-wide row, strided the same way: a UNet residual is this shape, and at
+// 16 float4s a row it is the case either kernel could plausibly win.
+static struct gk_tensor * b_res_mul_strided(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 128, 64, 320, 4);
+    struct gk_tensor * b = gk_new_tensor_4d(ctx, GK_TYPE_F32, 64, 64, 320, 4);
+    gk_set_name(a, "a");
+    gk_set_name(b, "b");
+    struct gk_tensor * v = gk_view_4d(ctx, a, 64, 64, 320, 4,
+                                      a->nb[1], a->nb[2], a->nb[3], 64 * sizeof(float));
+    return gk_mul(ctx, v, b);
+}
+
+// Narrower still: 32 and 16 elements to a row, so eight and four float4s.
+// These bracket the crossover from above.
+static struct gk_tensor * b_narrow32_mul_strided(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 64, 128, 320, 4);
+    struct gk_tensor * b = gk_new_tensor_4d(ctx, GK_TYPE_F32, 32, 128, 320, 4);
+    gk_set_name(a, "a");
+    gk_set_name(b, "b");
+    struct gk_tensor * v = gk_view_4d(ctx, a, 32, 128, 320, 4,
+                                      a->nb[1], a->nb[2], a->nb[3], 32 * sizeof(float));
+    return gk_mul(ctx, v, b);
+}
+
+static struct gk_tensor * b_narrow16_mul_strided(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 32, 256, 320, 4);
+    struct gk_tensor * b = gk_new_tensor_4d(ctx, GK_TYPE_F32, 16, 256, 320, 4);
+    gk_set_name(a, "a");
+    gk_set_name(b, "b");
+    struct gk_tensor * v = gk_view_4d(ctx, a, 16, 256, 320, 4,
+                                      a->nb[1], a->nb[2], a->nb[3], 16 * sizeof(float));
+    return gk_mul(ctx, v, b);
 }
 
 // The embedding lookup, which reads scattered rows out of the largest tensor
@@ -755,6 +854,15 @@ static const struct bench_case g_cases[] = {
     { NULL,            "mxfp4",             " 5.0 MB",       b_pre_mxfp4, ARENA_MID },
     { NULL,            "nvfp4",             " 5.0 MB",       b_pre_nvfp4, ARENA_MID },
 
+    { "SD UNet convolutions (im2col GEMM, f16 x f16; ggml's cuBLAS time in the last column)",
+                       "l1  3x3 320->320",  "k=2880  n=4096x320",  b_conv_l1_320,  ARENA_BIG },
+    { NULL,            "l1  3x3 640->320",  "k=5760  n=4096x320",  b_conv_l1_640,  ARENA_BIG },
+    { NULL,            "l1  3x3 960->320",  "k=8640  n=4096x320",  b_conv_l1_960,  ARENA_BIG },
+    { NULL,            "l1  3x3 640->640",  "k=5760  n=4096x640",  b_conv_l1_down, ARENA_BIG },
+    { NULL,            "l2  3x3 640->640",  "k=5760  n=1024x640",  b_conv_l2_640,  ARENA_BIG },
+    { NULL,            "l3  3x3 1280->1280","k=11520 n=256x1280",  b_conv_l3_1280, ARENA_BIG },
+    { NULL,            "l4  3x3 1280->1280","k=11520 n=64x1280",   b_conv_l4_1280, ARENA_BIG },
+
     { "SD UNet matmuls (nvfp4 against its f16 ceiling)",
                        "l1 attn  nvfp4", "320x320 n=4096",    b_sd_l1_attn_nv,  ARENA_MID },
     { NULL,            "l1 attn  f16",   "320x320 n=4096",    b_sd_l1_attn_f16, ARENA_MID },
@@ -829,6 +937,14 @@ static const struct bench_case g_cases[] = {
     { NULL,                    "silu     prefill", "6144x512",   b_silu_pre,     ARENA_SMALL },
     { NULL,                    "add      prefill", "1536x512",   b_add_pre,      ARENA_SMALL },
     { NULL,                    "get_rows q4_K",    "1536x512",   b_get_rows_pre, ARENA_BIG   },
+
+    { "rope-shaped elementwise (2-element rows)",
+                    "mul  bcast over heads", "2x64x2208x24",  b_rope_mul_bcast,   ARENA_BIG },
+    { NULL,         "add  same shape",       "2x64x2208x24",  b_rope_add,         ARENA_BIG },
+    { NULL,         "mul  strided rows",     "2x64x2208x24",  b_rope_mul_strided, ARENA_BIG },
+    { NULL,         "mul  strided rows",     "64x64x320x4",   b_res_mul_strided,  ARENA_BIG },
+    { NULL,         "mul  strided rows",     "32x128x320x4",  b_narrow32_mul_strided, ARENA_BIG },
+    { NULL,         "mul  strided rows",     "16x256x320x4",  b_narrow16_mul_strided, ARENA_BIG },
 
     { "sort and select", "top_k   moe",   "128x512 k=8",  b_top_k_moe,   ARENA_SMALL },
     { NULL,              "top_k   4096",  "4096 k=40",    b_top_k_4k,    ARENA_SMALL },

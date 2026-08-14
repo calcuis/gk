@@ -724,6 +724,43 @@ static struct gk_tensor * build_mul_broadcast(struct gk_ctx * ctx, struct gk_ten
     return gk_mul(ctx, in[0], in[1]);
 }
 
+// The rope broadcast: an activation of {2, d_head/2, L, n_head} times a table
+// that is the same over the heads. Both operands are contiguous and the second
+// agrees with the first over every dimension but the outermost, so its flat
+// index is the destination's modulo its own length - the shape that used to
+// fall through to a row-mapped kernel with two elements in a row.
+static struct gk_tensor * build_mul_wrap_outer(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, 64, 37, 5);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, 64, 37, 1);
+    *n_in = 2;
+    return gk_mul(ctx, in[0], in[1]);
+}
+
+// The same wrap over the two outermost dimensions, and with a length that is
+// not a whole number of float4s - so the scalar kernel takes it and the divisor
+// is in elements.
+static struct gk_tensor * build_add_wrap_odd(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 3, 5, 4, 2);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 3, 5, 1, 1);
+    *n_in = 2;
+    return gk_add(ctx, in[0], in[1]);
+}
+
+// A two-element row that is *not* contiguous, so neither the flat kernel nor
+// the row-mapped one may take it: the fully general kernel has to, and this is
+// the case that says so.
+static struct gk_tensor * build_mul_short_rows_strided(struct gk_ctx * ctx,
+                                                       struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 4, 64, 37, 5);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, 64, 37, 5);
+    *n_in = 2;
+
+    struct gk_tensor * v = gk_view_4d(ctx, in[0], 2, 64, 37, 5,
+                                      in[0]->nb[1], in[0]->nb[2], in[0]->nb[3],
+                                      2 * sizeof(float));
+    return gk_mul(ctx, v, in[1]);
+}
+
 // cont of a permuted view: the attention stacks do this between every
 // projection, and it is where a kernel that assumes contiguity shows up.
 static struct gk_tensor * build_cont_permuted(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
@@ -1925,6 +1962,9 @@ int main(void) {
     failures += run_op(gpu, "gelu",           build_gelu);
     failures += run_op(gpu, "add broadcast",  build_add_broadcast);
     failures += run_op(gpu, "mul broadcast",  build_mul_broadcast);
+    failures += run_op(gpu, "mul wrap outer", build_mul_wrap_outer);
+    failures += run_op(gpu, "add wrap odd",   build_add_wrap_odd);
+    failures += run_op(gpu, "mul short rows", build_mul_short_rows_strided);
     failures += run_op(gpu, "cont permuted",  build_cont_permuted);
     failures += run_op(gpu, "mul_mat permut", build_mul_mat_permuted);
     failures += run_op(gpu, "mul_mat wide",   build_mul_mat_wide);
