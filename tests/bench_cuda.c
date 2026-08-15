@@ -289,6 +289,71 @@ static struct gk_tensor * b_dec_q6_K (struct gk_ctx * c) { return mul_mat_case(c
 static struct gk_tensor * b_dec_mxfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_MXFP4, N_EMBD, N_FF, N_DECODE); }
 static struct gk_tensor * b_dec_nvfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, N_EMBD, N_FF, N_DECODE); }
 
+// The lattice formats, which decode through a codebook gather rather than
+// arithmetic on the bits. They are the ones a 2-bit model is built from, and
+// the question this row answers is what that gather costs against a format
+// whose decode is a shift and a multiply.
+static struct gk_tensor * b_dec_iq2_xxs(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_XXS, N_EMBD, N_FF, N_DECODE); }
+static struct gk_tensor * b_dec_iq2_s  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   N_EMBD, N_FF, N_DECODE); }
+static struct gk_tensor * b_dec_iq3_xxs(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, N_EMBD, N_FF, N_DECODE); }
+static struct gk_tensor * b_dec_iq3_s  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_S,   N_EMBD, N_FF, N_DECODE); }
+
+// The same question at a 30B model's FFN width. The row above is small enough
+// that every format lands on the launch-latency floor and the bandwidth column
+// says nothing; this one moves enough bytes for the kernel to be the cost.
+#define N_EMBD_30B 6656
+#define N_FF_30B  19968
+static struct gk_tensor * b_dec30_f16    (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,     N_EMBD_30B, N_FF_30B, N_DECODE); }
+static struct gk_tensor * b_dec30_q4_K   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_K,    N_EMBD_30B, N_FF_30B, N_DECODE); }
+static struct gk_tensor * b_dec30_iq2_xxs(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_XXS, N_EMBD_30B, N_FF_30B, N_DECODE); }
+static struct gk_tensor * b_dec30_iq2_s  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   N_EMBD_30B, N_FF_30B, N_DECODE); }
+static struct gk_tensor * b_dec30_iq3_xxs(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, N_EMBD_30B, N_FF_30B, N_DECODE); }
+static struct gk_tensor * b_dec30_iq3_s  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_S,   N_EMBD_30B, N_FF_30B, N_DECODE); }
+static struct gk_tensor * b_dec30_q6_K   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q6_K,    N_EMBD_30B, N_FF_30B, N_DECODE); }
+
+// The lm_head of a 30B model with a 202k vocabulary, which is one matmul per
+// generated token and the single largest read in the graph.
+static struct gk_tensor * b_lm_q6_K(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q6_K, 6656, 202048, 1); }
+
+// The same weights against four activation columns instead of one.
+//
+// Four is what speculative decoding makes every one of these shapes: the
+// target verifies the drafted block in a single pass, so a run with a draft
+// never sees a one-column matmul again. The weights are read once either way,
+// so the pair of rows should differ by almost nothing - a fourth column adds
+// an accumulator, not a pass over memory. Where it does not, the extra columns
+// are being paid for in decode work or in indexing, and the model loses more
+// on the wider verification pass than the draft wins back.
+//
+// The formats are muse-glimmer-30b-iq2_xxs's, taken from a profile rather than
+// picked: attn_k is q5_K, attn_v and ffn_down iq3_xxs, ffn_gate/up iq2_s,
+// attn_q iq2_xxs, attn_out iq3_s, and the lm_head q6_K over a 202k vocabulary.
+// attn_k/v are also the two shapes narrow enough to miss the integer path, so
+// they measure the float mat-vec where the rest measure the integer one.
+static struct gk_tensor * b_ver1_gate(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   6656, 19968,      1); }
+static struct gk_tensor * b_ver4_gate(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   6656, 19968,      4); }
+static struct gk_tensor * b_ver1_down(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, 19968, 6656,      1); }
+static struct gk_tensor * b_ver4_down(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, 19968, 6656,      4); }
+static struct gk_tensor * b_ver1_q   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_XXS, 6656,  4096,      1); }
+static struct gk_tensor * b_ver4_q   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_XXS, 6656,  4096,      4); }
+static struct gk_tensor * b_ver1_o   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_S,   4096,  6656,      1); }
+static struct gk_tensor * b_ver4_o   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_S,   4096,  6656,      4); }
+static struct gk_tensor * b_ver1_k   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q5_K,    6656,   256,      1); }
+static struct gk_tensor * b_ver4_k   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q5_K,    6656,   256,      4); }
+static struct gk_tensor * b_ver1_v   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, 6656,   256,      1); }
+static struct gk_tensor * b_ver4_v   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, 6656,   256,      4); }
+static struct gk_tensor * b_ver4_lm  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q6_K,    6656, 202048,     4); }
+
+// The three nvfp4 mat-vecs a DFlash draft runs, taken from a profile of one
+// rather than invented: the KV projections, the encoder's fusion matrix over
+// five concatenated target layers, and an FFN matmul as the control. In that
+// profile the first two ran at a thousandth of the third's bandwidth, so the
+// shapes are here rather than a round number.
+static struct gk_tensor * b_dft_kv  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4,  6656,  1024, 4); }
+static struct gk_tensor * b_dft_fc  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, 33280,  6656, 4); }
+static struct gk_tensor * b_dft_ffn (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4,  6656, 19968, 4); }
+static struct gk_tensor * b_dft_o   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4,  4096,  6656, 4); }
+
 // The same sweep at a batch, which is the regime a diffusion transformer runs
 // in: hundreds of tokens per matmul, never one. It is a different kernel from
 // the decode sweep above - the tiled one - so a format can be fine in one and
@@ -300,6 +365,8 @@ static struct gk_tensor * b_pre_q4_0 (struct gk_ctx * c) { return mul_mat_case(c
 static struct gk_tensor * b_pre_q4_K (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_K,  N_EMBD, N_FF, N_PREFILL); }
 static struct gk_tensor * b_pre_mxfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_MXFP4, N_EMBD, N_FF, N_PREFILL); }
 static struct gk_tensor * b_pre_nvfp4(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, N_EMBD, N_FF, N_PREFILL); }
+static struct gk_tensor * b_pre_iq2_xxs(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_XXS, N_EMBD, N_FF, N_PREFILL); }
+static struct gk_tensor * b_pre_iq2_s  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   N_EMBD, N_FF, N_PREFILL); }
 
 // The six matmuls a SD 1.x UNet actually spends its time in, taken from a
 // profile of a generation rather than invented. They are not the shapes above:
@@ -845,6 +912,42 @@ static const struct bench_case g_cases[] = {
     { NULL,            "q6_K",              " 7.7 MB",       b_dec_q6_K,  ARENA_SMALL },
     { NULL,            "mxfp4",             " 5.0 MB",       b_dec_mxfp4, ARENA_SMALL },
     { NULL,            "nvfp4",             " 5.0 MB",       b_dec_nvfp4, ARENA_SMALL },
+    { NULL,            "iq2_xxs",           " 2.4 MB",       b_dec_iq2_xxs, ARENA_SMALL },
+    { NULL,            "iq2_s",             " 3.0 MB",       b_dec_iq2_s,   ARENA_SMALL },
+    { NULL,            "iq3_xxs",           " 3.6 MB",       b_dec_iq3_xxs, ARENA_SMALL },
+    { NULL,            "iq3_s",             " 4.1 MB",       b_dec_iq3_s,   ARENA_SMALL },
+
+    { "decoder cost at a 30B FFN width (6656x19968, 1 column)",
+                       "f16   (no decode)", "266 MB",        b_dec30_f16,     ARENA_BIG },
+    { NULL,            "q4_K",              " 74 MB",        b_dec30_q4_K,    ARENA_BIG },
+    { NULL,            "iq2_xxs",           " 34 MB",        b_dec30_iq2_xxs, ARENA_BIG },
+    { NULL,            "iq2_s",             " 42 MB",        b_dec30_iq2_s,   ARENA_BIG },
+    { NULL,            "iq3_xxs",           " 50 MB",        b_dec30_iq3_xxs, ARENA_BIG },
+    { NULL,            "iq3_s",             " 56 MB",        b_dec30_iq3_s,   ARENA_BIG },
+    { NULL,            "q6_K",              "109 MB",        b_dec30_q6_K,    ARENA_BIG },
+    { NULL,            "q6_K lm_head 202k", "1.1 GB",        b_lm_q6_K,       ARENA_BIG },
+
+    { "a 30B decode, verified 4 tokens at a time (speculative) against 1",
+                       "ffn_gate iq2_s   x1", " 42 MB",       b_ver1_gate, ARENA_BIG },
+    { NULL,            "ffn_gate iq2_s   x4", " 42 MB",       b_ver4_gate, ARENA_BIG },
+    { NULL,            "ffn_down iq3_xxs x1", " 50 MB",       b_ver1_down, ARENA_BIG },
+    { NULL,            "ffn_down iq3_xxs x4", " 50 MB",       b_ver4_down, ARENA_BIG },
+    { NULL,            "attn_q   iq2_xxs x1", "  8 MB",       b_ver1_q,    ARENA_BIG },
+    { NULL,            "attn_q   iq2_xxs x4", "  8 MB",       b_ver4_q,    ARENA_BIG },
+    { NULL,            "attn_out iq3_s   x1", " 12 MB",       b_ver1_o,    ARENA_BIG },
+    { NULL,            "attn_out iq3_s   x4", " 12 MB",       b_ver4_o,    ARENA_BIG },
+    { NULL,            "attn_k   q5_K    x1", "1.2 MB",       b_ver1_k,    ARENA_BIG },
+    { NULL,            "attn_k   q5_K    x4", "1.2 MB",       b_ver4_k,    ARENA_BIG },
+    { NULL,            "attn_v   iq3_xxs x1", "0.6 MB",       b_ver1_v,    ARENA_BIG },
+    { NULL,            "attn_v   iq3_xxs x4", "0.6 MB",       b_ver4_v,    ARENA_BIG },
+    { NULL,            "lm_head  q6_K    x1", "1.1 GB",       b_lm_q6_K,   ARENA_BIG },
+    { NULL,            "lm_head  q6_K    x4", "1.1 GB",       b_ver4_lm,   ARENA_BIG },
+
+    { "a DFlash draft's nvfp4 mat-vecs (4 columns)",
+                       "kv    6656->1024",  "  3.8 MB",      b_dft_kv,  ARENA_BIG },
+    { NULL,            "o     4096->6656",  " 15.3 MB",      b_dft_o,   ARENA_BIG },
+    { NULL,            "fc   33280->6656",  "124.6 MB",      b_dft_fc,  ARENA_BIG },
+    { NULL,            "ffn   6656->19968", " 74.8 MB",      b_dft_ffn, ARENA_BIG },
 
     { "decoder cost at a batch (1536x6144, 512 columns)",
                        "f16   (no decode)", "18.9 MB",       b_pre_f16,   ARENA_MID },
@@ -853,6 +956,8 @@ static const struct bench_case g_cases[] = {
     { NULL,            "q4_K",              " 5.3 MB",       b_pre_q4_K,  ARENA_MID },
     { NULL,            "mxfp4",             " 5.0 MB",       b_pre_mxfp4, ARENA_MID },
     { NULL,            "nvfp4",             " 5.0 MB",       b_pre_nvfp4, ARENA_MID },
+    { NULL,            "iq2_xxs",           " 2.4 MB",       b_pre_iq2_xxs, ARENA_MID },
+    { NULL,            "iq2_s",             " 3.0 MB",       b_pre_iq2_s,   ARENA_MID },
 
     { "SD UNet convolutions (im2col GEMM, f16 x f16; ggml's cuBLAS time in the last column)",
                        "l1  3x3 320->320",  "k=2880  n=4096x320",  b_conv_l1_320,  ARENA_BIG },

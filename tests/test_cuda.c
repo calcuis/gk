@@ -24,6 +24,9 @@ static const enum gk_type g_weight_types[] = {
     GK_TYPE_Q4_0, GK_TYPE_Q4_1, GK_TYPE_Q5_0, GK_TYPE_Q5_1, GK_TYPE_Q8_0,
     GK_TYPE_Q2_K, GK_TYPE_Q3_K, GK_TYPE_Q4_K, GK_TYPE_Q5_K, GK_TYPE_Q6_K,
     GK_TYPE_IQ4_NL, GK_TYPE_IQ4_XS,
+    GK_TYPE_IQ1_S, GK_TYPE_IQ1_M,
+    GK_TYPE_IQ2_XXS, GK_TYPE_IQ2_XS, GK_TYPE_IQ2_S,
+    GK_TYPE_IQ3_XXS, GK_TYPE_IQ3_S,
     GK_TYPE_TQ1_0, GK_TYPE_TQ2_0,
     GK_TYPE_MXFP4, GK_TYPE_NVFP4, GK_TYPE_Q1_0, GK_TYPE_Q2_0,
 };
@@ -211,20 +214,30 @@ static int run_type(gk_backend_t gpu, enum gk_type weight_type) {
 
     int bad = 0;
     float max_abs = 0.0f;
+    int64_t i_worst = 0;
+    float worst_over = 0.0f;
     for (int64_t i = 0; i < no; ++i) {
         const float diff = fabsf(got[i] - expected[i]);
         if (diff > max_abs) {
             max_abs = diff;
         }
-        if (!(diff <= 5e-3f + 5e-3f * fabsf(expected[i]))) {
+        const float tol = 5e-3f + 5e-3f * fabsf(expected[i]);
+        if (!(diff <= tol)) {
             bad++;
+            // by how much the element misses its own tolerance, which is what
+            // picks the element worth printing - the largest absolute error
+            // usually belongs to the largest output and is within tolerance
+            if (diff - tol > worst_over) {
+                worst_over = diff - tol;
+                i_worst    = i;
+            }
         }
     }
 
     printf("  %-8s %3lld outputs, max abs error %.8g, %d mismatches\n",
            gk_type_name(weight_type), (long long) no, max_abs, bad);
     if (bad != 0) {
-        for (int64_t i = 0; i < no && i < 4; ++i) {
+        for (int64_t i = i_worst; i < no && i < i_worst + 4; ++i) {
             const int64_t row = i % gpu_w->ne[1];
             const int64_t col = i / gpu_w->ne[1];
             float scalar = 0.0f;
@@ -848,6 +861,229 @@ static struct gk_tensor * build_mmv_q8_0(struct gk_ctx * ctx, struct gk_tensor *
 
 static struct gk_tensor * build_mmv_q4_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 512, 700, 3);
+}
+
+// The lattice formats, against a reference that is exact.
+//
+// Two things make this harness different from `run_op_tol`, and both are
+// forced by the formats.
+//
+// The weights are not encoded from floats. iq2_xxs, iq2_xs and iq1_s want an
+// importance matrix (qz_quantize_requires_imatrix) and this test has none; run
+// without one, the iq2_xxs encoder reconstructs weights up to 1e7 with
+// thousands of non-finite values among them, and every comparison downstream
+// then measures the encoder rather than the kernel. So the block payload is
+// filled with pseudo-random bytes instead - every index, sign mask and
+// sub-scale in these formats is a bit field with no invalid values - and only
+// the block's f16 scale, which is its first two bytes in every format this
+// runs on, is overwritten with something sane. The result is a weight row that exercises
+// the whole codebook rather than the corner of it a fitted encode picks.
+//
+// The reference is the host decoder dotted in double, not gk's CPU matmul: the
+// CPU dots these against Q8_K activations, one scale per 256, and carries an
+// error of its own about the size of the one being looked for. Activations are
+// drawn so the device's own activation quantizer reproduces them exactly -
+// that quantizer is `d = amax/127, q = rint(v/d)` per 32 values, so values in
+// {-1, 0, +1} with at least one non-zero per group come back as themselves.
+// Both operands are then exact and the only thing between the device and the
+// reference is the order f32 adds things up in.
+static int run_lattice_exact(gk_backend_t gpu, const char * name, enum gk_type type,
+                             int64_t k, int64_t m, int64_t n) {
+    struct gk_ctx * ctx = gk_init((struct gk_init_params) {
+        .mem_size = 1u << 20, .mem_buffer = NULL, .no_alloc = true,
+    });
+    struct gk_tensor * w   = gk_new_tensor_2d(ctx, type,        k, m);
+    struct gk_tensor * x   = gk_new_tensor_2d(ctx, GK_TYPE_F32, k, n);
+    struct gk_tensor * out = gk_mul_mat(ctx, w, x);
+    gk_set_output(out);
+
+    struct gk_cgraph * graph = gk_new_graph(ctx);
+    gk_build_forward_expand(graph, out);
+
+    if (!gk_backend_supports_op(gpu, out)) {
+        printf("  %-14s FAIL: the backend declines the op\n", name);
+        gk_free(ctx);
+        return 1;
+    }
+
+    struct gk_gallocr * alloc = gk_gallocr_new(gk_backend_get_default_buffer_type(gpu));
+    if (alloc == NULL || !gk_gallocr_alloc_graph(alloc, graph)) {
+        printf("  %-14s FAIL: could not allocate the device graph\n", name);
+        gk_free(ctx);
+        return 1;
+    }
+
+    const int64_t nw = k * m;
+    const int64_t nx = k * n;
+    const int64_t no = m * n;
+
+    float * decoded = (float *) malloc((size_t) nw * sizeof(float));
+    float * xf      = (float *) malloc((size_t) nx * sizeof(float));
+    float * got     = (float *) malloc((size_t) no * sizeof(float));
+    void  * enc     = malloc(gk_nbytes(w));
+    double * ref    = (double *) malloc((size_t) no * sizeof(double));
+
+    if (decoded == NULL || xf == NULL || got == NULL || enc == NULL || ref == NULL) {
+        return 1;
+    }
+
+    for (int64_t i = 0; i < nx; ++i) {
+        const float v = input_value((int) (i + 7919));
+        xf[i] = v > 0.25f ? 1.0f : (v < -0.25f ? -1.0f : 0.0f);
+    }
+    // one saturating value per 32, so every group's amax is exactly 1
+    for (int64_t i = 0; i < nx; i += 32) {
+        xf[i] = 1.0f;
+    }
+
+    // Random payload, fixed scale. The scale is the block's leading f16 in
+    // every format this runs on; a random one would be a random power of two
+    // and the dot would then be decided by whichever block drew the largest.
+    const size_t   enc_bytes = gk_nbytes(w);
+    const size_t   blk_bytes = gk_row_size(type, gk_blck_size(type));
+    uint8_t      * eb        = (uint8_t *) enc;
+    uint32_t       rng       = 0x9e3779b9u;
+    for (size_t i = 0; i < enc_bytes; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        eb[i] = (uint8_t) (rng >> 24);
+    }
+    for (size_t off = 0; off + blk_bytes <= enc_bytes; off += blk_bytes) {
+        const uint16_t d_bits = 0x2E66; // 0.05 in f16
+        memcpy(eb + off, &d_bits, sizeof(d_bits));
+    }
+
+    const struct gk_type_traits * tr = gk_get_type_traits(type);
+    tr->to_float(enc, decoded, nw);
+
+    gk_backend_tensor_set(w, enc, 0, gk_nbytes(w));
+    gk_backend_tensor_set(x, xf, 0, (size_t) nx * sizeof(float));
+
+    if (gk_backend_graph_compute(gpu, graph) != GK_STATUS_SUCCESS) {
+        printf("  %-14s FAIL: the device graph failed\n", name);
+        return 1;
+    }
+    gk_backend_synchronize(gpu);
+    gk_backend_tensor_get(out, got, 0, (size_t) no * sizeof(float));
+
+    double sum_sq = 0.0;
+    for (int64_t col = 0; col < n; ++col) {
+        for (int64_t row = 0; row < m; ++row) {
+            double precise = 0.0;
+            for (int64_t kk = 0; kk < k; ++kk) {
+                precise += (double) decoded[row * k + kk] * (double) xf[col * k + kk];
+            }
+            ref[col * m + row] = precise;
+            sum_sq += precise * precise;
+        }
+    }
+
+    const double rms = sqrt(sum_sq / (double) no);
+
+    int   bad     = 0;
+    float max_rel = 0.0f;
+    for (int64_t i = 0; i < no; ++i) {
+        // scaled by the output's own RMS rather than by each element, because
+        // a dot of signed data has outputs near zero and those read as huge
+        // relative errors for an absolute difference that is nothing
+        const float rel = (float) (fabs((double) got[i] - ref[i]) / (rms > 0.0 ? rms : 1.0));
+        if (rel > max_rel) {
+            max_rel = rel;
+        }
+        if (!(rel <= 1e-3f)) {
+            bad++;
+        }
+    }
+
+    printf("  %-14s %5lld outputs, max rel error %.8g, %d mismatches%s\n",
+           name, (long long) no, max_rel, bad, bad == 0 ? "" : "  FAIL");
+    if (bad != 0) {
+        float wmax = 0.0f; int nbadw = 0;
+        for (int64_t i = 0; i < nw; ++i) {
+            if (!isfinite(decoded[i])) nbadw++;
+            else if (fabsf(decoded[i]) > wmax) wmax = fabsf(decoded[i]);
+        }
+        int64_t iw = 0; float wr = 0.0f;
+        for (int64_t i = 0; i < no; ++i) {
+            const float r = (float) (fabs((double) got[i] - ref[i]) / (rms > 0.0 ? rms : 1.0));
+            if (r > wr) { wr = r; iw = i; }
+        }
+        printf("      rms %.6g  max|w| %.6g  nonfinite w %d  worst [%lld] got %.8g ref %.8g\n",
+               rms, wmax, nbadw, (long long) iw, got[iw], ref[iw]);
+    }
+
+    free(ref);
+    free(enc);
+    free(got);
+    free(xf);
+    free(decoded);
+    gk_gallocr_free(alloc);
+    gk_free(ctx);
+    return bad == 0 ? 0 : 1;
+}
+
+// The lattice formats on the integer path. Both shapes matter: the tile stages
+// a whole 32-element group per weight row, the mat-vec walks the row a group
+// at a time, and the two find the group inside a 256-element super-block by
+// different arithmetic.
+
+
+// Below GK_CU_MM_Q8_MIN_ROWS, so the same weights take the float decoder
+// instead. If this agrees and the one above does not, the difference is the
+// integer staging rather than the format's layout.
+
+static struct gk_tensor * build_mmq_iq3_xxs(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ3_XXS, 512, 700, 70);
+}
+
+static struct gk_tensor * build_mmv_iq3_xxs(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ3_XXS, 256, 576, 3);
+}
+
+// q6_K on the integer path. It cannot go through run_lattice_exact - its f16
+// scale is at the *end* of the block, not the start, so that harness cannot pin
+// its magnitude - but its encoder needs no importances, so the CPU comparison
+// is sound. Both shapes: past GK_CU_MM_Q8_MIN_ROWS for the tile and the
+// mat-vec, since q6_K's scale changes every sixteen and each drains twice.
+static struct gk_tensor * build_mmq_q6_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q6_K, 512, 700, 70);
+}
+
+static struct gk_tensor * build_mmv_q6_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q6_K, 512, 700, 1);
+}
+
+// One super-block of k, so the group-to-super-block indexing never crosses a
+// boundary; if this agrees and the wider one drifts, the drift is accumulation.
+static struct gk_tensor * build_mmv_q6_K_1sb(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q6_K, 256, 576, 3);
+}
+
+// The shapes a 30B decode actually runs, which differ from the ones above in
+// the dimension that indexes the super-block: k = 6656 is twenty-six of them,
+// where 512 is two. A group-to-super-block bug that stays inside the first
+// couple of blocks does not show up until k is this long.
+static struct gk_tensor * build_mmq_iq2_s_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ2_S, 6656, 1024, 50);
+}
+
+static struct gk_tensor * build_mmv_iq2_s_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ2_S, 6656, 1024, 1);
+}
+
+static struct gk_tensor * build_mmq_q6_K_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q6_K, 6656, 1024, 50);
+}
+
+static struct gk_tensor * build_mmv_q6_K_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q6_K, 6656, 1024, 1);
+}
+
+static struct gk_tensor * build_mmq_iq3_s(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ3_S, 512, 700, 70);
+}
+
+static struct gk_tensor * build_mmv_iq3_s(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ3_S, 512, 700, 1);
 }
 
 // Eight columns: still short of the tiled path, but past the point where the
@@ -1896,8 +2132,22 @@ int main(void) {
     int failures = 0;
     const int n_types = (int) (sizeof(g_weight_types) / sizeof(g_weight_types[0]));
     for (int i = 0; i < n_types; ++i) {
-        failures += run_decode_type(gpu, g_weight_types[i]);
-        failures += run_type(gpu, g_weight_types[i]);
+        // Both arms below encode from floats, and three of the lattice formats
+        // want an importance matrix to do that (qz_quantize_requires_imatrix).
+        // Without one their encoders produce weights the format never intended
+        // - iq2_xs and iq2_xxs emit non-finite values outright, iq1_s a dynamic
+        // range wide enough that the CPU reference lands 10% off its own scalar
+        // and double-precision references while the device matches both to
+        // seven digits. Either way the comparison would be measuring the
+        // encoder rather than the kernel. run_lattice_exact covers all three
+        // instead, on blocks built rather than fitted.
+        const enum gk_type t = g_weight_types[i];
+        if (t == GK_TYPE_IQ1_S || t == GK_TYPE_IQ2_XS || t == GK_TYPE_IQ2_XXS) {
+            continue;
+        }
+
+        failures += run_decode_type(gpu, t);
+        failures += run_type(gpu, t);
     }
 
     printf("op parity against the CPU:\n");
@@ -1997,6 +2247,51 @@ int main(void) {
     failures += run_op_tol(gpu, "mmv q8_0",      build_mmv_q8_0,     4e-2f);
     failures += run_op_tol(gpu, "mmv q4_K",      build_mmv_q4_K,     8e-2f);
     failures += run_op_tol(gpu, "mmv q4_0 nc",   build_mmv_q4_0_nc,  4e-2f);
+
+    // The lattice formats that have an integer path. iq3_xxs and iq3_s encode
+    // sanely without importances, so they can take the CPU comparison at the
+    // same loose bound as q4_K - the reference dots them against Q8_K
+    // activations, one scale per 256, while the device carries one per 32.
+    // q6_K is held at the same loose bound and for the same reason as q4_K:
+    // gk's CPU q6_K dot converts the activation side to Q8_K, one scale per
+    // 256, while the device carries one per 32.
+    failures += run_op_tol(gpu, "mmq q6_K",      build_mmq_q6_K,     8e-2f);
+    failures += run_op_tol(gpu, "mmv q6_K",      build_mmv_q6_K,     8e-2f);
+    failures += run_op_tol(gpu, "mmv q6_K 1sb",  build_mmv_q6_K_1sb, 8e-2f);
+
+    failures += run_op_tol(gpu, "mmq iq2_s deep", build_mmq_iq2_s_deep, 8e-2f);
+    failures += run_op_tol(gpu, "mmv iq2_s deep", build_mmv_iq2_s_deep, 8e-2f);
+    failures += run_op_tol(gpu, "mmq q6_K deep", build_mmq_q6_K_deep, 8e-2f);
+    failures += run_op_tol(gpu, "mmv q6_K deep", build_mmv_q6_K_deep, 8e-2f);
+
+    failures += run_op_tol(gpu, "mmq iq3_xxs",   build_mmq_iq3_xxs,  8e-2f);
+    failures += run_op_tol(gpu, "mmv iq3_xxs",   build_mmv_iq3_xxs,  8e-2f);
+    failures += run_op_tol(gpu, "mmq iq3_s",     build_mmq_iq3_s,    8e-2f);
+    failures += run_op_tol(gpu, "mmv iq3_s",     build_mmv_iq3_s,    8e-2f);
+
+    // All three against an exact reference, which is the only way iq2_xxs can
+    // be checked at all - and the shapes are chosen to reach both kernels: 700
+    // rows is past GK_CU_MM_Q8_MIN_ROWS and takes the integer path, 300 is
+    // short of it and takes the float decoder.
+    failures += run_lattice_exact(gpu, "iq2_xxs mmq",  GK_TYPE_IQ2_XXS, 512, 700, 70);
+    failures += run_lattice_exact(gpu, "iq2_xxs mmv",  GK_TYPE_IQ2_XXS, 512, 700,  1);
+    failures += run_lattice_exact(gpu, "iq2_xxs f32",  GK_TYPE_IQ2_XXS, 512, 300,  1);
+    failures += run_lattice_exact(gpu, "iq3_xxs mmq",  GK_TYPE_IQ3_XXS, 512, 700, 70);
+    failures += run_lattice_exact(gpu, "iq3_s mmq",    GK_TYPE_IQ3_S,   512, 700, 70);
+    // k = 6656 is twenty-six super-blocks, which is what a 30B model runs and
+    // what the 512-of-k cases above cannot reach.
+    failures += run_lattice_exact(gpu, "iq2_s deep",   GK_TYPE_IQ2_S,  6656, 2048, 50);
+    failures += run_lattice_exact(gpu, "iq2_s deep mv",GK_TYPE_IQ2_S,  6656, 2048,  1);
+    failures += run_lattice_exact(gpu, "iq2_s mmq",    GK_TYPE_IQ2_S,   512, 700, 70);
+    failures += run_lattice_exact(gpu, "iq2_s mmv",    GK_TYPE_IQ2_S,   512, 700,  1);
+    failures += run_lattice_exact(gpu, "iq2_s f32",    GK_TYPE_IQ2_S,   512, 300,  1);
+    failures += run_lattice_exact(gpu, "iq2_xs f32",   GK_TYPE_IQ2_XS,  512, 700, 70);
+    failures += run_lattice_exact(gpu, "iq1_s f32",    GK_TYPE_IQ1_S,   512, 700, 70);
+    // iq1_m is absent because it is the one lattice block that does not begin
+    // with its scale - it has no f16 of its own and assembles one from the top
+    // nibble of each of four scale words - so the harness above cannot pin its
+    // magnitude. Its encoder needs no importances, so the sweep's comparison
+    // against the CPU covers it.
 
     // nvfp4, and the bound here needs its reasoning spelled out because it is
     // far looser than anything else in this file and that is not slack.

@@ -2937,6 +2937,13 @@ static_assert((int) GK_TYPE_Q1_0   == GKT_Q1_0,   "type enum drifted: Q1_0");
 static_assert((int) GK_TYPE_Q2_0   == GKT_Q2_0,   "type enum drifted: Q2_0");
 static_assert((int) GK_TYPE_I32    == GKT_I32,    "type enum drifted: I32");
 static_assert((int) GK_TYPE_I64    == GKT_I64,    "type enum drifted: I64");
+static_assert((int) GK_TYPE_IQ1_S   == GKT_IQ1_S,   "type enum drifted: IQ1_S");
+static_assert((int) GK_TYPE_IQ1_M   == GKT_IQ1_M,   "type enum drifted: IQ1_M");
+static_assert((int) GK_TYPE_IQ2_XXS == GKT_IQ2_XXS, "type enum drifted: IQ2_XXS");
+static_assert((int) GK_TYPE_IQ2_XS  == GKT_IQ2_XS,  "type enum drifted: IQ2_XS");
+static_assert((int) GK_TYPE_IQ2_S   == GKT_IQ2_S,   "type enum drifted: IQ2_S");
+static_assert((int) GK_TYPE_IQ3_XXS == GKT_IQ3_XXS, "type enum drifted: IQ3_XXS");
+static_assert((int) GK_TYPE_IQ3_S   == GKT_IQ3_S,   "type enum drifted: IQ3_S");
 
 // The float types a generic kernel can read and write. Quantized destinations
 // are not among them: writing one means encoding, and encoding needs the whole

@@ -1276,9 +1276,10 @@ struct gk_sched;
 // goes to the earliest one, so a list of (GPU, CPU) offloads what it can and
 // falls back for the rest. `bufts`, when given, overrides the memory each
 // backend's tensors are allocated in - a device backend that should compute
-// out of pinned host memory is the case that needs it. `op_offload` allows
-// nodes with no placement of their own to be pulled onto a device that would
-// run them faster, at the cost of copying their operands there.
+// out of pinned host memory is the case that needs it. `op_offload` allows an
+// op whose weight the caller left in host memory to be pulled onto a device
+// that would run it faster, at the cost of copying that weight there; an op
+// with no weight is never moved, because there is nothing bounded to carry.
 GK_API struct gk_sched * gk_sched_new(gk_backend_t * backends, int n_backends);
 GK_API struct gk_sched * gk_sched_new_ext(gk_backend_t * backends,
                                           gk_backend_buffer_type_t * bufts,

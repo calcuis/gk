@@ -323,6 +323,17 @@ static int gk_sched_backend_of_buffer(const struct gk_sched * s, const struct gk
     return -1;
 }
 
+// Whether a source is a weight the caller left in host memory - the one
+// operand an offload can be asked to carry. A weight is bounded, is read many
+// times per graph, and is the thing the caller could not fit on the device;
+// everything else a node reads is either an activation, which is small, or a
+// cache, which is neither bounded nor worth moving.
+static bool gk_sched_is_host_weight(const struct gk_tensor * t) {
+    return t != NULL && t->buffer != NULL &&
+           t->buffer->usage == GK_BUFFER_USAGE_WEIGHTS &&
+           gk_backend_buffer_is_host(t->buffer);
+}
+
 // Ops that produce a view of another tensor and compute nothing. They carry a
 // view_src like an in-place op does, but they never write through it.
 static bool gk_sched_is_view_op(enum gk_op op) {
@@ -439,7 +450,18 @@ static bool gk_sched_assign(struct gk_sched * s, struct gk_cgraph * graph) {
 
         // 3. otherwise, a source that lives somewhere specific pulls the node
         //    to it - reading a large weight across a bus is the cost worth
-        //    avoiding above all others here
+        //    avoiding above all others here.
+        //
+        //    Offloading is decided here, in the same pass, because this is the
+        //    only place that knows *what* a move would have to carry. When the
+        //    source that pulled the node is a weight the caller left in host
+        //    memory, a faster backend may be worth the copy: the transfer is
+        //    bounded by that one operand, and the work it buys grows with the
+        //    batch. Asked about a node with no weight at all, the same question
+        //    has no such bound - flash attention's operands are the whole KV
+        //    cache, and moving it to a device drags the cache across the bus
+        //    once per graph, or reads it there through a pointer the device
+        //    cannot dereference.
         if (id < 0) {
             for (int k = 0; k < GK_MAX_SRC; ++k) {
                 const struct gk_tensor * src = node->src[k];
@@ -447,11 +469,23 @@ static bool gk_sched_assign(struct gk_sched * s, struct gk_cgraph * graph) {
                     continue;
                 }
                 const int sid = gk_sched_backend_of_buffer(s, src);
-                if (sid >= 0 && gk_backend_supports_op(s->backends[sid], node)) {
-                    id     = sid;
-                    pinned = true;
-                    break;
+                if (sid < 0 || !gk_backend_supports_op(s->backends[sid], node)) {
+                    continue;
                 }
+
+                id     = sid;
+                pinned = true;
+
+                if (s->op_offload && gk_sched_is_host_weight(src)) {
+                    for (int b = 0; b < sid; ++b) {
+                        if (gk_backend_supports_op(s->backends[b], node) &&
+                            gk_backend_offload_op(s->backends[b], node)) {
+                            id = b;
+                            break;
+                        }
+                    }
+                }
+                break;
             }
         }
 
@@ -484,22 +518,6 @@ static bool gk_sched_assign(struct gk_sched * s, struct gk_cgraph * graph) {
             gk_logf("gk: no backend supports op %s (node %d, %s)\n",
                     gk_op_name(node->op), i, node->name);
             return false;
-        }
-
-        // 6. offloading: a node whose placement was only a preference may be
-        //    worth moving to a higher-priority backend that wants it, even
-        //    though its operands would have to be copied there. Only the
-        //    backend itself can judge that - the balance is between one large
-        //    matmul's worth of work and one activation's worth of transfer -
-        //    so the question is asked rather than answered here.
-        if (s->op_offload && !pinned) {
-            for (int b = 0; b < id; ++b) {
-                if (gk_backend_supports_op(s->backends[b], node) &&
-                    gk_backend_offload_op(s->backends[b], node)) {
-                    id = b;
-                    break;
-                }
-            }
         }
 
         s->node_backend[i] = id;
@@ -617,16 +635,36 @@ static bool gk_sched_assign(struct gk_sched * s, struct gk_cgraph * graph) {
 // or two CPU backends - hand values to each other for nothing.
 // --------------------------------------------------------------------------
 
-// Where a value will live: its buffer if it already has one, otherwise the
-// memory the backend it was assigned to allocates from.
+// Where a value already lives, or - only if it lives nowhere yet - where its
+// placement says it will.
+//
+// The order matters and is the whole of this function. A tensor that is
+// already allocated has a buffer, and that buffer's type is the answer: it is
+// where the bytes actually are. Only an unallocated one has to be answered
+// from its placement, and `s->bufts[id]` is a poor answer to give about
+// anything else, because it is the memory that backend *allocates from* and
+// not necessarily the memory this tensor is in. A caller may hand the
+// scheduler a buft that is not the backend's own - llama gives the CPU backend
+// pinned host memory so that intermediates cross the bus faster - and then the
+// two differ for every tensor that backend did not allocate. A KV cache is the
+// case that matters: it is plain host memory, but the CPU backend's buft says
+// pinned, and pinned host memory is memory a device can address. Answering
+// from the buft hands a CUDA kernel a malloc'd pointer and the read faults.
+//
+// A view is asked about its root for the same reason: the view is unallocated
+// until the graph allocator runs, but its storage is the root's and has been
+// all along.
 static gk_backend_buffer_type_t gk_sched_buft_of(const struct gk_sched * s,
                                                  const struct gk_tensor * t,
                                                  struct gk_cgraph * graph) {
+    const struct gk_tensor * owner = t->view_src != NULL ? t->view_src : t;
+
+    if (owner->buffer != NULL) {
+        return gk_backend_buffer_get_type(owner->buffer);
+    }
     if (t->buffer != NULL) {
         return gk_backend_buffer_get_type(t->buffer);
     }
-
-    const struct gk_tensor * owner = t->view_src != NULL ? t->view_src : t;
 
     for (int i = 0; i < graph->n_nodes; ++i) {
         if (graph->nodes[i] == owner) {
@@ -639,7 +677,20 @@ static gk_backend_buffer_type_t gk_sched_buft_of(const struct gk_sched * s,
         }
     }
 
-    return NULL; // not part of this graph; treated as host memory
+    return NULL; // nothing placed it and nothing allocated it
+}
+
+// GK_STAGE_TRACE: every cross-backend source and what was decided about it.
+// The silent case is the one worth seeing - a source a backend is assumed to
+// be able to read where it lies is indistinguishable, from outside, from one
+// that was copied there.
+static bool gk_sched_stage_trace(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GK_STAGE_TRACE");
+        on = e != NULL && e[0] != '0';
+    }
+    return on != 0;
 }
 
 static bool gk_sched_grow_copies(struct gk_sched * s) {
@@ -846,9 +897,27 @@ static bool gk_sched_split(struct gk_sched * s, struct gk_cgraph * graph) {
                 continue;
             }
 
+            // An unknown buffer is staged rather than read in place. Nothing
+            // in the graph placed this value and nothing has allocated it, so
+            // the only thing known about the pointer is that somebody else
+            // owns it - and "somebody else's host pointer" is precisely what a
+            // device backend cannot dereference.
             const gk_backend_buffer_type_t buft = gk_sched_buft_of(s, src, graph);
-            if (buft == NULL || gk_backend_supports_buft(s->backends[bid], buft)) {
+            if (buft != NULL && gk_backend_supports_buft(s->backends[bid], buft)) {
+                if (gk_sched_stage_trace()) {
+                    gk_logf("gk stage: %-14s src%d %-24s buft %-10s -> %s (kept)\n",
+                            gk_op_name(node->op), k, src->name,
+                            gk_backend_buft_name(buft),
+                            gk_backend_name(s->backends[bid]));
+                }
                 continue; // this backend can read it where it is
+            }
+
+            if (gk_sched_stage_trace()) {
+                gk_logf("gk stage: %-14s src%d %-24s buft %-10s -> %s (staged)\n",
+                        gk_op_name(node->op), k, src->name,
+                        buft == NULL ? "?" : gk_backend_buft_name(buft),
+                        gk_backend_name(s->backends[bid]));
             }
 
             struct gk_tensor * stage = gk_sched_stage_for(s, src, bid, s->n_splits);

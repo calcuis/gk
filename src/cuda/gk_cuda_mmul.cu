@@ -55,6 +55,8 @@ static __host__ __forceinline__ unsigned gk_cu_blocks_1d(int64_t n, int block) {
 // are the shapes that sit below it.
 #define GK_CU_MM_Q8_MIN_ROWS 512
 
+static int gk_cu_env_int(const char * name, int def);
+
 // Whether the integer dot path applies: the format has one, the row cuts into
 // whole 32-element groups so a group never straddles two of them, and there
 // are enough rows to pay for the quantize pass.
@@ -66,11 +68,36 @@ static __host__ __forceinline__ bool gk_cuda_mm_q8_supported(int type, int64_t k
     switch (type) {
         case GK_TYPE_Q4_0: case GK_TYPE_Q4_1:
         case GK_TYPE_Q8_0: case GK_TYPE_Q4_K:
+        case GK_TYPE_IQ2_XXS: case GK_TYPE_IQ3_XXS: case GK_TYPE_IQ3_S:
             return true;
+        // `GK_MM_Q8_SPLIT=0` puts the split-scale formats back on the float
+        // decoder, which is what they used before they had an integer path.
+        // Same answer, and a tenth of the speed - it is here to take the newer
+        // kernel out of a bisect rather than to be set.
+        case GK_TYPE_Q6_K: case GK_TYPE_IQ2_S:
+            return gk_cu_env_int("GK_MM_Q8_SPLIT", 1) != 0;
         default:
             return false;
     }
 }
+
+// gk_cu_has_split_scale, on the host, for the one decision that has to be made
+// before the type becomes a template parameter.
+static __host__ __forceinline__ bool gk_cuda_mm_split_scale(int type) {
+    return type == GK_TYPE_Q6_K || type == GK_TYPE_IQ2_XS ||
+           type == GK_TYPE_IQ2_S || type == GK_TYPE_IQ1_M;
+}
+
+// This list and gk_cu_has_dp4a's are the same list seen from the two sides -
+// here the host decides to take the integer path, there the device knows how
+// to stage a group for it - so they are checked against each other rather than
+// kept in step by hand.
+static_assert(gk_cu_has_dp4a<GKT_Q4_0>()    && gk_cu_has_dp4a<GKT_Q4_1>() &&
+              gk_cu_has_dp4a<GKT_Q8_0>()    && gk_cu_has_dp4a<GKT_Q4_K>() &&
+              gk_cu_has_dp4a<GKT_IQ2_XXS>() && gk_cu_has_dp4a<GKT_IQ3_XXS>() &&
+              gk_cu_has_dp4a<GKT_IQ3_S>()   && gk_cu_has_dp4a<GKT_Q6_K>() &&
+              gk_cu_has_dp4a<GKT_IQ2_S>(),
+              "gk_cuda_mm_q8_supported offers a type gk_cu_wblk32 cannot stage");
 
 // Activation columns one pass over a weight row serves. Each column costs a
 // register accumulator and a shared-memory slot in the reduction; four is
@@ -251,6 +278,14 @@ static __global__ void gk_cu_k_mul_mat(gk_tview a, gk_tview b, gk_tview_mut d,
                 : gk_cu_get_t<ATYPE>(a, kk, i0, a2, a3);
 
 #pragma unroll
+            // Resolving the NC row addresses once outside this loop, so that
+            // gk_cu_get's three multiply-adds per element are not repaid per
+            // column, was measured and is not here: it left attn_k unchanged
+            // and cost attn_v 20%, because these shapes are 256 output rows -
+            // 64 blocks - and are waiting on latency rather than on address
+            // arithmetic. The extra live pointers cost occupancy the indexing
+            // never cost time. What this kernel wants at that width is more
+            // parallelism per row, not a cheaper index.
             for (int j = 0; j < NC; ++j) {
                 const int64_t col = c0 + j;
                 if (col < d.ne[1]) {
@@ -316,7 +351,8 @@ static __global__ void gk_cu_k_quantize_act(gk_tview b, gk_cu_q8blk * out,
 
     const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
 
-    int sum = 0;
+    int sum    = 0;
+    int sum_lo = 0;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         int packed = 0;
@@ -326,9 +362,15 @@ static __global__ void gk_cu_k_quantize_act(gk_tview b, gk_cu_q8blk * out,
             sum += q;
             packed |= (q & 0xff) << (8 * e);
         }
+        // the first four words are the group's first sixteen values, which is
+        // the span a q6_K or iq2_s scale covers
+        if (i < 4) {
+            sum_lo = sum;
+        }
         blk.q[i] = packed;
     }
-    blk.s = (float) sum;
+    blk.s  = (float) sum;
+    blk.sl = (float) sum_lo;
 
     out[t] = blk;
 }
@@ -613,11 +655,25 @@ static __global__ void gk_cu_k_mul_mat_q8(gk_tview a, gk_tview_mut d,
     const gk_cu_q8blk * aq23 = aq + i23 * d.ne[1] * n_grp;
 
     for (int64_t g = lane; g < n_grp; g += GK_WARP_SIZE) {
+        // Decode the weight group once, then dot it against each column.
+        //
+        // The reuse this kernel exists for, the same way the float one above
+        // spells it: the weight is read and unpacked once and NC accumulators
+        // take a turn against it. Calling gk_cu_vecdot32 per column instead
+        // hands the decode the same (row, g) NC times, and for the formats
+        // whose decode is a codebook gather that is most of the work - at four
+        // columns it cost between 1.7x and 2.8x the single-column pass, which
+        // is the pass speculative decoding replaces every matmul with.
+        int   codes[8];
+        float scale[2], offset[2];
+        gk_cu_wblk32<ATYPE>(a_row, g, codes, scale, offset);
+
 #pragma unroll
         for (int j = 0; j < NC; ++j) {
             const int64_t col = c0 + j;
             if (col < d.ne[1]) {
-                acc[j] += gk_cu_vecdot32<ATYPE>(a_row, g, aq23[col * n_grp + g]);
+                acc[j] += gk_cu_vecdot32_pre<ATYPE>(codes, scale, offset,
+                                                    aq23[col * n_grp + g]);
             }
         }
     }
@@ -1595,9 +1651,11 @@ static __host__ __forceinline__ bool gk_cu_mma_nvfp4_wide(const struct gk_tensor
 // per-kernel cap the first time if it wants more than the 48 KB a block gets
 // for free, and launch.
 //
-// The cap is a property of the kernel rather than of the launch, so it is
-// raised once per instantiation - `raised` is function-local static, and each
-// macro expansion is its own scope and so its own flag.
+// The cap is a property of the kernel *on a device* rather than of the launch,
+// so it is raised once per instantiation per device - `raised` is a
+// function-local static array, and each macro expansion is its own scope and so
+// its own flags. A single flag would leave every card but the first at the
+// 48 KB default, where the launch fails with "invalid argument".
 #define GK_CU_FP4_LAUNCH(warps_m, wn, warps_n, kstep)                              \
     do {                                                                           \
         constexpr int  tm_    = GK_CU_MMA_TILE_M_OF(warps_m);                      \
@@ -1606,9 +1664,11 @@ static __host__ __forceinline__ bool gk_cu_mma_nvfp4_wide(const struct gk_tensor
         constexpr size_t smem_ =                                                   \
             (size_t) GK_CU_FP4_SMEM_WORDS(tm_, tn_, kstep) * sizeof(uint32_t);     \
         if (smem_ > 48u * 1024u) {                                                 \
-            static bool raised = false;                                            \
-            if (!raised) {                                                         \
-                raised = true;                                                     \
+            static bool raised[GK_CUDA_MAX_DEVICES] = { false };                   \
+            int dev_ = 0;                                                          \
+            if (gkGetDevice(&dev_) == gkSuccess && dev_ >= 0 &&                    \
+                dev_ < GK_CUDA_MAX_DEVICES && !raised[dev_]) {                     \
+                raised[dev_] = true;                                               \
                 GK_CUDA_CHECK(gkFuncSetAttribute(                                  \
                     (const void *) gk_cu_k_mul_mat_mma_fp4<warps_m, wn,            \
                                                            warps_n, kstep>,        \
@@ -2252,10 +2312,14 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
     // columns for a fixed word reads consecutive shared addresses.
     __shared__ int   Wc[8][GK_CU_MMQ_TILE_M];
     __shared__ int   Ac[8][GK_CU_MMQ_TILE_N];
-    __shared__ float Wscale[GK_CU_MMQ_TILE_M];
-    __shared__ float Woff  [GK_CU_MMQ_TILE_M];
+    // Two of each where the format's scale covers only sixteen elements; the
+    // second slot is dead code for every other format, so it costs them
+    // nothing but the shared memory it does not allocate.
+    __shared__ float Wscale[gk_cu_has_split_scale<ATYPE>() ? 2 : 1][GK_CU_MMQ_TILE_M];
+    __shared__ float Woff  [gk_cu_has_split_scale<ATYPE>() ? 2 : 1][GK_CU_MMQ_TILE_M];
     __shared__ float Ad    [GK_CU_MMQ_TILE_N];
     __shared__ float Asum  [GK_CU_MMQ_TILE_N];
+    __shared__ float Asuml [gk_cu_has_split_scale<ATYPE>() ? GK_CU_MMQ_TILE_N : 1];
 
     const int tx  = threadIdx.x;          // 0..15, column group
     const int ty  = threadIdx.y;          // 0..15, row group
@@ -2293,7 +2357,8 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
             const int64_t m = m0 + tid;
 
             int   codes[8];
-            float sc = 0.0f, off = 0.0f;
+            float sc[2] = { 0.0f, 0.0f };
+            float off[2] = { 0.0f, 0.0f };
 
             if (m < n_rows) {
                 gk_cu_wblk32<ATYPE>((const uint8_t *) gk_cu_row(a, m, a2, a3),
@@ -2309,8 +2374,12 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
             for (int i = 0; i < 8; ++i) {
                 Wc[i][tid] = codes[i];
             }
-            Wscale[tid] = sc;
-            Woff  [tid] = off;
+            Wscale[0][tid] = sc[0];
+            Woff  [0][tid] = off[0];
+            if (gk_cu_has_split_scale<ATYPE>()) {
+                Wscale[1][tid] = sc[1];
+                Woff  [1][tid] = off[1];
+            }
         } else if (tid < GK_CU_MMQ_TILE_M + GK_CU_MMQ_TILE_N) {
             const int     slot = tid - GK_CU_MMQ_TILE_M;
             const int64_t n    = n0 + slot;
@@ -2323,6 +2392,9 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
                 }
                 Ad  [slot] = ab.d;
                 Asum[slot] = ab.s;
+                if (gk_cu_has_split_scale<ATYPE>()) {
+                    Asuml[slot] = ab.sl;
+                }
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -2330,6 +2402,9 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
                 }
                 Ad  [slot] = 0.0f;
                 Asum[slot] = 0.0f;
+                if (gk_cu_has_split_scale<ATYPE>()) {
+                    Asuml[slot] = 0.0f;
+                }
             }
         }
 
@@ -2337,12 +2412,23 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
 
         // The integer dot: eight instructions per output pair, against the
         // thirty-two a float pass would take.
-        int sumi[GK_CU_MMQ_T][GK_CU_MMQ_T];
+        //
+        // A split-scale format keeps two accumulators and drains both, because
+        // its scale changes halfway through the group. `HALVES` is a constant,
+        // so the other formats compile to exactly the single-accumulator loop
+        // that was here before.
+        constexpr int HALVES = gk_cu_has_split_scale<ATYPE>() ? 2 : 1;
+        constexpr int PER    = 8 / HALVES;
+
+        int sumi[HALVES][GK_CU_MMQ_T][GK_CU_MMQ_T];
 #pragma unroll
-        for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+        for (int h = 0; h < HALVES; ++h) {
 #pragma unroll
-            for (int j = 0; j < GK_CU_MMQ_T; ++j) {
-                sumi[i][j] = 0;
+            for (int i = 0; i < GK_CU_MMQ_T; ++i) {
+#pragma unroll
+                for (int j = 0; j < GK_CU_MMQ_T; ++j) {
+                    sumi[h][i][j] = 0;
+                }
             }
         }
 
@@ -2358,11 +2444,12 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
             for (int j = 0; j < GK_CU_MMQ_T; ++j) {
                 av[j] = Ac[e][tx * GK_CU_MMQ_T + j];
             }
+            const int h = e / PER;
 #pragma unroll
             for (int i = 0; i < GK_CU_MMQ_T; ++i) {
 #pragma unroll
                 for (int j = 0; j < GK_CU_MMQ_T; ++j) {
-                    sumi[i][j] = gk_cu_dp4a(wv[i], av[j], sumi[i][j]);
+                    sumi[h][i][j] = gk_cu_dp4a(wv[i], av[j], sumi[h][i][j]);
                 }
             }
         }
@@ -2370,13 +2457,21 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
         // The scales, once per group rather than once per element.
 #pragma unroll
         for (int i = 0; i < GK_CU_MMQ_T; ++i) {
-            const int   mi = ty * GK_CU_MMQ_T + i;
-            const float ws = Wscale[mi];
-            const float wo = Woff[mi];
+            const int mi = ty * GK_CU_MMQ_T + i;
 #pragma unroll
             for (int j = 0; j < GK_CU_MMQ_T; ++j) {
                 const int nj = tx * GK_CU_MMQ_T + j;
-                acc[i][j] += Ad[nj] * (ws * (float) sumi[i][j] + wo * Asum[nj]);
+
+                float v = Wscale[0][mi] * (float) sumi[0][i][j];
+                if (gk_cu_has_split_scale<ATYPE>()) {
+                    v += Woff  [0][mi] * Asuml[nj];
+                    v += Wscale[1][mi] * (float) sumi[HALVES - 1][i][j];
+                    v += Woff  [1][mi] * (Asum[nj] - Asuml[nj]);
+                } else {
+                    v += Woff[0][mi] * Asum[nj];
+                }
+
+                acc[i][j] += Ad[nj] * v;
             }
         }
 
@@ -2523,7 +2618,8 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
             const int64_t m = m0 + r;
 
             int   codes[8];
-            float sc = 0.0f, off = 0.0f;
+            float sc[2] = { 0.0f, 0.0f };
+            float off[2] = { 0.0f, 0.0f };
 
             if (m < n_rows) {
                 gk_cu_wblk32<ATYPE>((const uint8_t *) gk_cu_row(a, m, a2, a3),
@@ -2539,8 +2635,8 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
             for (int i = 0; i < 8; ++i) {
                 As[r][i] = codes[i];
             }
-            Wsc[r] = sc;
-            Wof[r] = off;
+            Wsc[r] = sc[0];
+            Wof[r] = off[0];
         } else if (threadIdx.x < GK_CU_MMAQ_TILE_M + GK_CU_MMAQ_TILE_N) {
             const int     c = (int) threadIdx.x - GK_CU_MMAQ_TILE_M;
             const int64_t n = n0 + c;
@@ -3166,7 +3262,12 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                                        GK_CUDA_BLOCK, 0, stream>>>(
                     gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
 
-                if (gk_cuda_mm_mma_q8_available(scratch)) {
+                // `mma.sync...k32` accumulates a whole group in one
+                // instruction, so a scale that changes halfway through it has
+                // nowhere to be applied. Those formats take the dp4a tile
+                // below, which drains twice.
+                if (gk_cuda_mm_mma_q8_available(scratch) &&
+                    !gk_cuda_mm_split_scale((int) src0->type)) {
                     dim3 mgrid;
                     mgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMAQ_TILE_M - 1) / GK_CU_MMAQ_TILE_M);
                     mgrid.y = (unsigned) ((n_cols     + GK_CU_MMAQ_TILE_N - 1) / GK_CU_MMAQ_TILE_N);
@@ -4415,6 +4516,51 @@ static int gk_cu_fa_n_split(int n_sm, int64_t rows, int64_t n_kv) {
     return n_split < 1 ? 1 : (int) n_split;
 }
 
+// GK_FA_DUMP: the operand geometry behind each distinct attention shape and
+// which of the three kernels took it, once per shape. Same reason as
+// GK_EW_DUMP: the three paths differ by an order of magnitude and by which
+// bounds they check, and a node name plus a destination extent does not say
+// which one ran.
+static __host__ void gk_cu_fa_dump(const char * path, const struct gk_tensor * dst) {
+    static const bool on = getenv("GK_FA_DUMP") != NULL && getenv("GK_FA_DUMP")[0] != '0';
+    if (!on) {
+        return;
+    }
+
+    static char seen[64][160];
+    static int  n_seen = 0;
+
+    char key[160];
+    int  off = snprintf(key, sizeof(key), "%-6s", path);
+
+    for (int s = 0; s < 5 && off < (int) sizeof(key); ++s) {
+        const struct gk_tensor * t = dst->src[s];
+        if (t == NULL) {
+            off += snprintf(key + off, sizeof(key) - off, " -");
+            continue;
+        }
+        off += snprintf(key + off, sizeof(key) - off,
+                        " %s[%lld %lld %lld %lld/%lld %lld %lld %lld]",
+                        gk_type_name(t->type),
+                        (long long) t->ne[0], (long long) t->ne[1],
+                        (long long) t->ne[2], (long long) t->ne[3],
+                        (long long) t->nb[0], (long long) t->nb[1],
+                        (long long) t->nb[2], (long long) t->nb[3]);
+    }
+
+    for (int i = 0; i < n_seen; ++i) {
+        if (strcmp(seen[i], key) == 0) {
+            return;
+        }
+    }
+    if (n_seen >= 64) {
+        return;
+    }
+    snprintf(seen[n_seen++], sizeof(seen[0]), "%s", key);
+
+    gk_logf("fa %s\n", key);
+}
+
 void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         struct gk_tensor * dst) {
     const struct gk_tensor * q     = dst->src[0];
@@ -4501,6 +4647,8 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
         // either is strided, both take the scalar path.
         const bool fam_vec = gk_cuda_fam_vec(k) && gk_cuda_fam_vec(v);
 
+        gk_cu_fa_dump(fam_vec ? "mma/v" : "mma", dst);
+
 #define GK_CU_FAM_LAUNCH(D)                                    \
         do {                                                   \
             if (fam_vec) { GK_CU_FAM_LAUNCH_V(D, true);  }     \
@@ -4546,10 +4694,15 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
         fat_smem <= (size_t) scratch->smem_max) {
 
         if (fat_smem > 48u * 1024u) {
-            // Raising the cap is per-kernel and sticky, so it is done once.
-            static bool raised = false;
-            if (!raised) {
-                raised = true;
+            // Raising the cap is per-kernel and sticky, but it is a property of
+            // the function *on the current device*, not of the function. One
+            // global flag raises it on whichever card happens to run the first
+            // wide head and leaves every other card at the 48 KB default, where
+            // the launch fails outright - "invalid argument", not a slow kernel.
+            static bool raised[GK_CUDA_MAX_DEVICES] = { false };
+            int dev = 0;
+            if (gkGetDevice(&dev) == gkSuccess && dev >= 0 && dev < GK_CUDA_MAX_DEVICES && !raised[dev]) {
+                raised[dev] = true;
                 GK_CUDA_CHECK(gkFuncSetAttribute(
                     (const void *) gk_cu_k_flash_attn_tiled,
                     gkFuncAttributeMaxDynamicSharedMemorySize, scratch->smem_max));
@@ -4557,6 +4710,8 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
         }
 
         const size_t smem = fat_smem;
+
+        gk_cu_fa_dump("tiled", dst);
 
         dim3 tgrid;
         tgrid.x = (unsigned) ((q->ne[1] + GK_CU_FAT_QROWS - 1) / GK_CU_FAT_QROWS);
@@ -4597,6 +4752,8 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
             n_split = 1;
         }
     }
+
+    gk_cu_fa_dump(n_split > 1 ? "split" : "flat", dst);
 
     dim3 grid;
     grid.x = (unsigned) rows;

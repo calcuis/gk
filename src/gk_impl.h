@@ -292,12 +292,19 @@ struct gk_backend_buffer_i {
                             struct gk_tensor * dst);
 };
 
+// The caller's tag on a buffer. gk assigns it no meaning of its own and only
+// ever asks one question of it - whether a buffer holds weights, which the
+// scheduler needs before it will consider moving an op away from them. The
+// value is the one the ggml compatibility layer writes, which is the only
+// thing that writes it.
+#define GK_BUFFER_USAGE_WEIGHTS 1
+
 struct gk_backend_buffer {
     struct gk_backend_buffer_i iface;
     gk_backend_buffer_type_t   buft;
     void *                     context;
     size_t                     size;
-    int                        usage; // caller-defined tag (weights/compute); nothing here reads it
+    int                        usage; // caller-defined tag; see GK_BUFFER_USAGE_WEIGHTS
 };
 
 struct gk_backend_i {

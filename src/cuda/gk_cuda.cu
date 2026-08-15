@@ -547,11 +547,21 @@ static void gk_cu_prof_key(const struct gk_tensor * node, char * out, size_t out
     }
 }
 
+// How many graphs to run before dumping, or 0 for "only at exit". A server does
+// not exit on demand - there is no way to send it a signal from another OS, and
+// a forced kill runs no atexit handler - so a long-running process could be
+// profiled and then never print. `GK_OP_PROFILE=N` for N > 1 dumps every N
+// graphs instead, which also makes the numbers a rate rather than a total.
+static int  g_prof_every = 0;
+static long g_prof_graphs = 0;
+
 static bool gk_cu_prof_on(void) {
     if (g_prof_enabled < 0) {
         const char * e = getenv("GK_OP_PROFILE");
         g_prof_enabled = e != NULL && e[0] != '0';
         if (g_prof_enabled) {
+            const int n = atoi(e);
+            g_prof_every = n > 1 ? n : 0;
             atexit(gk_cu_prof_dump);
         }
     }
@@ -731,6 +741,10 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
         }
     }
 
+    if (prof && g_prof_every > 0 && ++g_prof_graphs % g_prof_every == 0) {
+        gk_cu_prof_dump();
+    }
+
     if (lprof) {
         const std::chrono::steady_clock::time_point lt1 = std::chrono::steady_clock::now();
         GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
@@ -780,9 +794,13 @@ static bool gk_cuda_backend_supports_buft(gk_backend_t backend, gk_backend_buffe
 }
 
 // Whether it is worth pulling an op here that would otherwise run elsewhere.
-// The trade is one activation's worth of transfer against the op's work, so
-// the answer is yes only for the ops whose work grows with the batch: a matmul
+// The trade is one weight's worth of transfer against the op's work, so the
+// answer is yes only for the ops whose work grows with the batch: a matmul
 // over many tokens pays the copy back, an elementwise add never does.
+//
+// The scheduler only asks about a node whose weight is in host memory, which
+// is why there is no flash-attention case here. Attention has no weight; its
+// operands are the KV cache, and a cache is not a thing to move.
 static bool gk_cuda_backend_offload_op(gk_backend_t backend, const struct gk_tensor * op) {
     GK_UNUSED(backend);
 
@@ -792,8 +810,6 @@ static bool gk_cuda_backend_offload_op(gk_backend_t backend, const struct gk_ten
         case GK_OP_MUL_MAT:
         case GK_OP_MUL_MAT_ID:
             return op->src[1]->ne[1] >= min_batch;
-        case GK_OP_FLASH_ATTN_EXT:
-            return op->src[0]->ne[1] >= min_batch;
         default:
             return false;
     }

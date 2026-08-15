@@ -18,11 +18,15 @@
 // error here shows up as a wrong answer there, not as silence.
 //
 // The formats with codebooks - IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-// IQ3_S - are deliberately absent. They need their grids resident on the
-// device, and their share of published weights does not yet justify carrying
-// them; a matmul against one is reported unsupported and runs on the CPU.
+// IQ3_S - decode against a fixed grid, which gk_cuda_codebook.cuh puts in
+// device memory for them. They were left out at first because of that table;
+// what forced the issue was that leaving them out is not a slow path but a
+// different processor - supports_op declines the matmul and the scheduler
+// runs the whole row on the CPU, which on a 30B model quantized in these
+// formats is the difference between one token a second and sixty.
 
 #include "gk_cuda_vendor.h"
+#include "gk_cuda_codebook.cuh"
 
 #include <stdint.h>
 
@@ -47,8 +51,15 @@
 #define GKT_Q5_K   13
 #define GKT_Q6_K   14
 #define GKT_Q8_K   15
+#define GKT_IQ2_XXS 16
+#define GKT_IQ2_XS  17
+#define GKT_IQ3_XXS 18
+#define GKT_IQ1_S   19
 #define GKT_IQ4_NL 20
+#define GKT_IQ3_S   21
+#define GKT_IQ2_S   22
 #define GKT_IQ4_XS 23
+#define GKT_IQ1_M   29
 #define GKT_I8     24
 #define GKT_I16    25
 #define GKT_I32    26
@@ -233,6 +244,8 @@ static __device__ __host__ __forceinline__ int gk_cu_blck_size(int type) {
         case GKT_Q2_K: case GKT_Q3_K: case GKT_Q4_K: case GKT_Q5_K:
         case GKT_Q6_K: case GKT_Q8_K: case GKT_IQ4_XS:
         case GKT_TQ1_0: case GKT_TQ2_0:
+        case GKT_IQ1_S: case GKT_IQ1_M: case GKT_IQ2_XXS: case GKT_IQ2_XS:
+        case GKT_IQ2_S: case GKT_IQ3_XXS: case GKT_IQ3_S:
             return GK_QK;
         default:
             return 1;
@@ -267,6 +280,13 @@ static __device__ __host__ __forceinline__ int gk_cu_type_size(int type) {
         case GKT_Q8_K:   return 4 + GK_QK + GK_QK / 16 * 2;
         case GKT_IQ4_NL: return 2 + 16;
         case GKT_IQ4_XS: return 2 + 2 + GK_QK / 64 + GK_QK / 2;
+        case GKT_IQ1_S:  return 2 + GK_QK / 8 + GK_QK / 16;
+        case GKT_IQ1_M:  return     GK_QK / 8 + GK_QK / 16 + GK_QK / 32;
+        case GKT_IQ2_XXS:return 2 + GK_QK / 4;
+        case GKT_IQ2_XS: return 2 + GK_QK / 4 + GK_QK / 32;
+        case GKT_IQ2_S:  return 2 + GK_QK / 4 + GK_QK / 16;
+        case GKT_IQ3_XXS:return 2 + 3 * (GK_QK / 8);
+        case GKT_IQ3_S:  return 2 + 13 * (GK_QK / 32) + GK_QK / 64;
         case GKT_TQ1_0:  return 2 + GK_QK / 64 + (GK_QK - 4 * GK_QK / 64) / 5;
         case GKT_TQ2_0:  return 2 + GK_QK / 4;
         default:         return 0;
@@ -287,6 +307,8 @@ static __host__ __forceinline__ bool gk_cu_type_supported(int type) {
         case GKT_Q1_0: case GKT_Q2_0: case GKT_MXFP4: case GKT_NVFP4:
         case GKT_Q2_K: case GKT_Q3_K: case GKT_Q4_K: case GKT_Q5_K: case GKT_Q6_K:
         case GKT_IQ4_NL: case GKT_IQ4_XS: case GKT_TQ1_0: case GKT_TQ2_0:
+        case GKT_IQ1_S: case GKT_IQ1_M: case GKT_IQ2_XXS: case GKT_IQ2_XS:
+        case GKT_IQ2_S: case GKT_IQ3_XXS: case GKT_IQ3_S:
             return true;
         default:
             return false;
@@ -323,6 +345,13 @@ static __host__ __forceinline__ bool gk_cu_type_supported(int type) {
         case GKT_IQ4_XS: LAUNCH(GKT_IQ4_XS); break;                           \
         case GKT_TQ1_0:  LAUNCH(GKT_TQ1_0);  break;                           \
         case GKT_TQ2_0:  LAUNCH(GKT_TQ2_0);  break;                           \
+        case GKT_IQ1_S:  LAUNCH(GKT_IQ1_S);  break;                           \
+        case GKT_IQ1_M:  LAUNCH(GKT_IQ1_M);  break;                           \
+        case GKT_IQ2_XXS:LAUNCH(GKT_IQ2_XXS);break;                           \
+        case GKT_IQ2_XS: LAUNCH(GKT_IQ2_XS); break;                           \
+        case GKT_IQ2_S:  LAUNCH(GKT_IQ2_S);  break;                           \
+        case GKT_IQ3_XXS:LAUNCH(GKT_IQ3_XXS);break;                           \
+        case GKT_IQ3_S:  LAUNCH(GKT_IQ3_S);  break;                           \
         default:                                                              \
             /* supports_op said yes to a type with no instantiation: the two  \
                lists above have drifted. Nothing is launched, so this would   \
@@ -566,6 +595,219 @@ static __device__ __forceinline__ float gk_cu_dq_iq4_xs(const uint8_t * b, int j
     return dl * (float) gk_cu_iq4_values[code];
 }
 
+// --------------------------------------------------------------------------
+// the lattice formats
+//
+// All of them share a shape: eight consecutive weights are one entry of a
+// fixed grid, read as eight (or, for the 3-bit pair, two times four) unsigned
+// magnitudes, with a sign mask and a group scale applied on top. The grids are
+// in gk_cuda_codebook.cuh; the arithmetic is qz_decode.c's.
+//
+// A grid entry is 8 or 4 bytes at a computed index, so the load is a gather
+// and the format's cost is that gather rather than the bit unpacking around
+// it. That is why the per-element entry points below read only the byte they
+// need out of the entry instead of unpacking the whole thing: a caller walking
+// a run re-reads the same line, which L1 serves, while unpacking eight
+// magnitudes to use one would spend the registers for nothing.
+// --------------------------------------------------------------------------
+
+// A 32-bit field out of a 2-byte-aligned block. The IQ blocks are 2-byte
+// aligned only - iq2_xxs is 66 bytes - so a 4-byte load off qs is misaligned
+// for every other block.
+static __device__ __forceinline__ uint32_t gk_cu_u32_b2(const uint8_t * p) {
+    const uint16_t * p16 = (const uint16_t *) p;
+    return (uint32_t) p16[0] | ((uint32_t) p16[1] << 16);
+}
+
+// The eighth sign bit is implied: the mask always has an even number of set
+// bits, so it is the parity of the seven that are stored.
+static __device__ __forceinline__ uint8_t gk_cu_sign_mask(uint8_t low7) {
+    uint8_t m = (uint8_t) (low7 & 0x7f);
+    uint8_t p = m;
+    p ^= (uint8_t) (p >> 4);
+    p ^= (uint8_t) (p >> 2);
+    p ^= (uint8_t) (p >> 1);
+    return (uint8_t) ((p & 1) ? (m | 0x80) : m);
+}
+
+// One magnitude out of a grid entry, signed by bit `i` of the mask.
+static __device__ __forceinline__ float gk_cu_grid_val(uint64_t entry, int i, uint8_t signs, float dl) {
+    const float v = dl * (float) ((uint8_t) (entry >> (8 * i)));
+    return (signs >> i) & 1 ? -v : v;
+}
+
+static __device__ __forceinline__ float gk_cu_dq_iq2_xxs(const uint8_t * b, int j) {
+    const float d = gk_cu_h2f(b);
+
+    const int g = j / 32;   // 32-element group
+    const int r = j % 32;
+    const int s = r / 8;    // grid entry within the group
+    const int i = r % 8;
+
+    const uint8_t * qs = b + 2 + 8 * g;
+    const uint32_t  w0 = gk_cu_u32_b2(qs);
+    const uint32_t  w1 = gk_cu_u32_b2(qs + 4);
+
+    // the group scale is the top nibble of the second word
+    const float dl = d * (0.5f + (float) (w1 >> 28)) * 0.25f;
+
+    const int     idx   = (int) ((w0 >> (8 * s)) & 0xff);
+    const uint8_t signs = gk_cu_sign_mask((uint8_t) ((w1 >> (7 * s)) & 127));
+
+    return gk_cu_grid_val(gk_cu_grid_iq2_xxs[idx], i, signs, dl);
+}
+
+static __device__ __forceinline__ float gk_cu_dq_iq2_xs(const uint8_t * b, int j) {
+    const float d = gk_cu_h2f(b);
+
+    const int g = j / 32;
+    const int r = j % 32;
+    const int s = r / 8;
+    const int i = r % 8;
+
+    const uint8_t * scales = b + 2 + GK_QK / 4;
+    const uint16_t  q      = ((const uint16_t *) (b + 2))[4 * g + s];
+
+    // one nibble per 16 elements, so the two halves of the group differ
+    const int   sc = (s / 2) ? (scales[g] >> 4) : (scales[g] & 0xf);
+    const float dl = d * (0.5f + (float) sc) * 0.25f;
+
+    const uint8_t signs = gk_cu_sign_mask((uint8_t) (q >> 9));
+
+    return gk_cu_grid_val(gk_cu_grid_iq2_xs[q & 511], i, signs, dl);
+}
+
+static __device__ __forceinline__ float gk_cu_dq_iq2_s(const uint8_t * b, int j) {
+    const float d = gk_cu_h2f(b);
+
+    const int g = j / 32;
+    const int r = j % 32;
+    const int s = r / 8;
+    const int i = r % 8;
+
+    const uint8_t * qs     = b + 2;                   // indices, then sign masks
+    const uint8_t * signs  = qs + GK_QK / 8;
+    const uint8_t * qh     = b + 2 + GK_QK / 4;
+    const uint8_t * scales = qh + GK_QK / 32;
+
+    const int   sc = (s / 2) ? (scales[g] >> 4) : (scales[g] & 0xf);
+    const float dl = d * (0.5f + (float) sc) * 0.25f;
+
+    // two more index bits per grid entry live in qh
+    const int idx = qs[4 * g + s] | (((qh[g] >> (2 * s)) & 3) << 8);
+
+    return gk_cu_grid_val(gk_cu_grid_iq2_s[idx], i, signs[4 * g + s], dl);
+}
+
+static __device__ __forceinline__ float gk_cu_dq_iq3_xxs(const uint8_t * b, int j) {
+    const float d = gk_cu_h2f(b);
+
+    const int g = j / 32;
+    const int r = j % 32;
+    const int s = r / 8;
+    const int i = r % 8;
+
+    const uint8_t * qs   = b + 2;
+    const uint8_t * tail = qs + GK_QK / 4;
+
+    const uint32_t w  = gk_cu_u32_b2(tail + 4 * g);
+    const float    dl = d * (0.5f + (float) (w >> 28)) * 0.5f;
+
+    // eight weights are two four-element entries, the second signed by the
+    // top half of the same mask
+    const uint8_t signs = gk_cu_sign_mask((uint8_t) ((w >> (7 * s)) & 127));
+    const int     half  = i / 4;
+    const uint32_t e    = gk_cu_grid_iq3_xxs[qs[8 * g + 2 * s + half]];
+
+    const float v = dl * (float) ((uint8_t) (e >> (8 * (i % 4))));
+    return (signs >> i) & 1 ? -v : v;
+}
+
+static __device__ __forceinline__ float gk_cu_dq_iq3_s(const uint8_t * b, int j) {
+    const float d = gk_cu_h2f(b);
+
+    const int g = j / 32;
+    const int r = j % 32;
+    const int s = r / 8;
+    const int i = r % 8;
+
+    const uint8_t * qs     = b + 2;
+    const uint8_t * qh     = qs + GK_QK / 4;
+    const uint8_t * signs  = qh + GK_QK / 32;
+    const uint8_t * scales = signs + GK_QK / 8;
+
+    // one 4-bit scale per two groups, and no 0.5 offset: the scale is odd
+    const int   sc = (scales[g / 2] >> (4 * (g % 2))) & 0xf;
+    const float dl = d * (float) (1 + 2 * sc);
+
+    const int half = i / 4;
+    const int idx  = qs[8 * g + 2 * s + half] |
+                     (((qh[g] >> (2 * s + half)) & 1) << 8);
+    const uint32_t e = gk_cu_grid_iq3_s[idx];
+
+    const float v = dl * (float) ((uint8_t) (e >> (8 * (i % 4))));
+    return (signs[4 * g + s] >> i) & 1 ? -v : v;
+}
+
+// The 1-bit pair store signed ternary patterns rather than magnitudes, so
+// there is no sign mask - what the block carries instead is a shared offset,
+// applied before the scale, whose sign is one bit of the header.
+#define GK_CU_IQ1_DELTA 0.125f
+
+static __device__ __forceinline__ float gk_cu_dq_iq1_s(const uint8_t * b, int j) {
+    const float d = gk_cu_h2f(b);
+
+    const int g = j / 32;
+    const int r = j % 32;
+    const int s = r / 8;
+    const int i = r % 8;
+
+    const uint8_t  * qs = b + 2;
+    const uint16_t * qh = (const uint16_t *) (qs + GK_QK / 8);
+
+    const uint16_t h     = qh[g];
+    const float    dl    = d * (float) (2 * ((h >> 12) & 7) + 1);
+    const float    delta = (h & 0x8000) ? -GK_CU_IQ1_DELTA : GK_CU_IQ1_DELTA;
+
+    const int      idx = qs[4 * g + s] | (int) (((h >> (3 * s)) & 7) << 8);
+    const uint64_t e   = gk_cu_grid_iq1[idx];
+
+    const int8_t v = (int8_t) ((uint8_t) (e >> (8 * i)));
+    return dl * ((float) v + delta);
+}
+
+static __device__ __forceinline__ float gk_cu_dq_iq1_m(const uint8_t * b, int j) {
+    const uint8_t * qs     = b;
+    const uint8_t * qh     = b + GK_QK / 8;
+    const uint8_t * scales = qh + GK_QK / 16;
+
+    const int g = j / 32;
+    const int r = j % 32;
+    const int s = r / 8;
+    const int i = r % 8;
+
+    // no delta of its own: it is spread over the top nibble of each scale word
+    uint16_t sc[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
+        sc[w] = (uint16_t) ((uint16_t) scales[2 * w] | ((uint16_t) scales[2 * w + 1] << 8));
+    }
+    const uint16_t dh = (uint16_t) ((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                    ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+    const float d = gk_cu_h2f((const uint8_t *) &dh);
+
+    // two 3-bit scales per group of 32, one per half
+    const int   shift = 6 * (g % 2) + ((s < 2) ? 0 : 3);
+    const float dl    = d * (float) (2 * ((sc[g / 2] >> shift) & 7) + 1);
+
+    const uint8_t h     = qh[2 * g + s / 2];
+    const int     idx   = qs[4 * g + s] | (int) (((h >> (4 * (s % 2))) & 7) << 8);
+    const float   delta = (h & (0x08u << (4 * (s % 2)))) ? -GK_CU_IQ1_DELTA : GK_CU_IQ1_DELTA;
+
+    const int8_t v = (int8_t) ((uint8_t) (gk_cu_grid_iq1[idx] >> (8 * i)));
+    return dl * ((float) v + delta);
+}
+
 static __device__ __forceinline__ float gk_cu_dq_tq1_0(const uint8_t * b, int j) {
     const uint8_t * qs = b;
     const uint8_t * qh = b + (GK_QK - 4 * GK_QK / 64) / 5;
@@ -638,6 +880,7 @@ static __device__ __forceinline__ float gk_cu_dq_tq2_0(const uint8_t * b, int j)
 struct gk_cu_q8blk {
     float   d;    // value ~= d * code
     float   s;    // sum of the 32 codes
+    float   sl;   // sum of the first 16, for a weight whose offset changes there
     int32_t q[8]; // the codes, four to a word
 };
 
@@ -680,6 +923,24 @@ static __device__ __forceinline__ int gk_cu_dp4a(int a, int b, int c) {
 #endif
 }
 
+// Four unsigned magnitudes, negated where the low four bits of `signs` say so,
+// as one int8x4 operand. `-x` on a byte lane is `(x ^ 0xff) + 1`, so the whole
+// fragment is one xor and one masked add rather than four branches - which is
+// what makes a lattice entry cost about as much to stage as a nibble field.
+//
+// The add is per-byte only because no magnitude is zero: negating a zero lane
+// would produce 0x100 and carry into its neighbour. Every grid this is used
+// for has a smallest entry of 1 (iq3_s), 4 (iq3_xxs) or 8 (iq2_*), which is
+// what makes the cheap form correct here and not in general.
+static __device__ __forceinline__ int gk_cu_signed_bytes(uint32_t mags, uint8_t signs) {
+    const uint32_t neg = ((uint32_t) (signs & 1)      ) |
+                         ((uint32_t) (signs & 2) <<  7) |
+                         ((uint32_t) (signs & 4) << 14) |
+                         ((uint32_t) (signs & 8) << 21);
+    const uint32_t msk = neg * 0xffu;
+    return (int) ((mags ^ msk) + neg);
+}
+
 // Four packed bytes as an int, read as two 16-bit halves.
 //
 // A direct 32-bit load would be wrong: a q4_0 block is 18 bytes, so every
@@ -691,10 +952,39 @@ static __device__ __forceinline__ int gk_cu_int_b2(const uint8_t * p, int i32) {
 }
 
 // Whether this format has an integer dot below. The rest keep the float path.
+// Whether the format's scale covers only sixteen elements, so a 32-element
+// group needs two of them and the dot has to be drained twice.
+//
+// This is the whole reason q6_K and the 2-bit lattice pair were on the float
+// path while formats half their bit width were not: `gk_cu_wblk32` promised one
+// scale per group and they cannot keep it. The cost of admitting them is one
+// extra multiply-add per group per output, against a decode that was running at
+// a twentieth of the card's bandwidth.
 template <int TYPE>
-static __device__ __host__ __forceinline__ bool gk_cu_has_dp4a() {
+static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_split_scale() {
+    return TYPE == GKT_Q6_K   || TYPE == GKT_IQ2_XS ||
+           TYPE == GKT_IQ2_S  || TYPE == GKT_IQ1_M;
+}
+
+template <int TYPE>
+static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_dp4a() {
     return TYPE == GKT_Q4_0 || TYPE == GKT_Q4_1 ||
-           TYPE == GKT_Q8_0 || TYPE == GKT_Q4_K;
+           TYPE == GKT_Q8_0 || TYPE == GKT_Q4_K ||
+           // A scale per sixteen rather than per thirty-two; see
+           // gk_cu_has_split_scale.
+           TYPE == GKT_Q6_K || TYPE == GKT_IQ2_S ||
+           // The lattice formats whose scale covers a whole 32-element group.
+           // Their magnitudes are small integers (43 at the largest, 62 for
+           // iq3_xxs) and the sign mask is a negation, so a grid entry *is* an
+           // int8 fragment once the signs are folded in - which is what this
+           // path wants and what the float decoder was throwing away.
+           //
+           // iq2_xs, iq2_s and iq1_m are the ones missing: their scale changes
+           // every sixteen elements, and one scale per group is the contract
+           // gk_cu_wblk32 has with the kernels that call it. iq1_s is missing
+           // for a different reason - its values carry a per-group offset that
+           // is not an integer, so folding it into the codes is not available.
+           TYPE == GKT_IQ2_XXS || TYPE == GKT_IQ3_XXS || TYPE == GKT_IQ3_S;
 }
 
 // One 32-element group of a weight row, as integer codes plus the two floats
@@ -716,7 +1006,7 @@ static __device__ __host__ __forceinline__ bool gk_cu_has_dp4a() {
 template <int TYPE>
 static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t g,
                                                     int (&codes)[8],
-                                                    float & scale, float & offset) {
+                                                    float (&scale)[2], float (&offset)[2]) {
     if (TYPE == GKT_Q4_0 || TYPE == GKT_Q4_1) {
         const int       stride = TYPE == GKT_Q4_0 ? 18 : 20;
         const int       hdr    = TYPE == GKT_Q4_0 ?  2 :  4;
@@ -733,8 +1023,8 @@ static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t
         }
 
         const float d = gk_cu_h2f(blk);
-        scale  = d;
-        offset = TYPE == GKT_Q4_0 ? -8.0f * d : gk_cu_h2f(blk + 2);
+        scale [0] = scale [1] = d;
+        offset[0] = offset[1] = TYPE == GKT_Q4_0 ? -8.0f * d : gk_cu_h2f(blk + 2);
         return;
     }
 
@@ -747,8 +1037,8 @@ static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t
             codes[i] = gk_cu_int_b2(qs, i);
         }
 
-        scale  = gk_cu_h2f(blk);
-        offset = 0.0f;
+        scale [0] = scale [1] = gk_cu_h2f(blk);
+        offset[0] = offset[1] = 0.0f;
         return;
     }
 
@@ -769,8 +1059,148 @@ static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t
             codes[i] = (gk_cu_int_b2(qs, i) >> shift) & 0x0F0F0F0F;
         }
 
-        scale  =  gk_cu_h2f(blk)     * (float) sc;
-        offset = -gk_cu_h2f(blk + 2) * (float) mn;
+        scale [0] = scale [1] =  gk_cu_h2f(blk)     * (float) sc;
+        offset[0] = offset[1] = -gk_cu_h2f(blk + 2) * (float) mn;
+        return;
+    }
+
+    if (TYPE == GKT_IQ2_XXS) {
+        // 32 elements are four eight-magnitude grid entries; the group's scale
+        // and its four sign masks are the second of the two header words.
+        const uint8_t * blk = row + (g / 8) * (2 + GK_QK / 4);
+        const int       sub = (int) (g % 8);
+        const uint8_t * qs  = blk + 2 + 8 * sub;
+
+        const uint32_t w0 = gk_cu_u32_b2(qs);
+        const uint32_t w1 = gk_cu_u32_b2(qs + 4);
+
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const uint64_t ent   = gk_cu_grid_iq2_xxs[(w0 >> (8 * e)) & 0xff];
+            const uint8_t  signs = gk_cu_sign_mask((uint8_t) ((w1 >> (7 * e)) & 127));
+
+            codes[2 * e + 0] = gk_cu_signed_bytes((uint32_t) (ent >>  0), signs);
+            codes[2 * e + 1] = gk_cu_signed_bytes((uint32_t) (ent >> 32), (uint8_t) (signs >> 4));
+        }
+
+        scale [0] = scale [1] = gk_cu_h2f(blk) * (0.5f + (float) (w1 >> 28)) * 0.25f;
+        offset[0] = offset[1] = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_IQ3_XXS) {
+        // 32 elements are eight four-magnitude entries, so an entry is exactly
+        // one dp4a operand. Two entries share a sign mask, low nibble first.
+        const uint8_t * blk  = row + (g / 8) * (2 + 3 * (GK_QK / 8));
+        const int       sub  = (int) (g % 8);
+        const uint8_t * qs   = blk + 2 + 8 * sub;
+        const uint32_t  w    = gk_cu_u32_b2(blk + 2 + GK_QK / 4 + 4 * sub);
+
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const uint8_t signs = gk_cu_sign_mask((uint8_t) ((w >> (7 * e)) & 127));
+
+            codes[2 * e + 0] = gk_cu_signed_bytes(gk_cu_grid_iq3_xxs[qs[2 * e + 0]], signs);
+            codes[2 * e + 1] = gk_cu_signed_bytes(gk_cu_grid_iq3_xxs[qs[2 * e + 1]], (uint8_t) (signs >> 4));
+        }
+
+        scale [0] = scale [1] = gk_cu_h2f(blk) * (0.5f + (float) (w >> 28)) * 0.5f;
+        offset[0] = offset[1] = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_IQ3_S) {
+        // As iq3_xxs, but the ninth index bit is in qh, the signs have a byte
+        // of their own per eight, and the scale covers sixty-four elements -
+        // which is still constant across a group, so it fits here.
+        const uint8_t * blk    = row + (g / 8) * (2 + 13 * (GK_QK / 32) + GK_QK / 64);
+        const int       sub    = (int) (g % 8);
+        const uint8_t * qs     = blk + 2 + 8 * sub;
+        const uint8_t * qh     = blk + 2 + GK_QK / 4;
+        const uint8_t * signs  = qh + GK_QK / 32;
+        const uint8_t * scales = signs + GK_QK / 8;
+
+        const uint8_t h = qh[sub];
+
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const uint8_t sg = signs[4 * sub + e];
+            const int     i0 = qs[2 * e + 0] | (((h >> (2 * e + 0)) & 1) << 8);
+            const int     i1 = qs[2 * e + 1] | (((h >> (2 * e + 1)) & 1) << 8);
+
+            codes[2 * e + 0] = gk_cu_signed_bytes(gk_cu_grid_iq3_s[i0], sg);
+            codes[2 * e + 1] = gk_cu_signed_bytes(gk_cu_grid_iq3_s[i1], (uint8_t) (sg >> 4));
+        }
+
+        const int sc = (scales[sub / 2] >> (4 * (sub % 2))) & 0xf;
+        scale [0] = scale [1] = gk_cu_h2f(blk) * (float) (1 + 2 * sc);
+        offset[0] = offset[1] = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_Q6_K) {
+        // Eight groups to a super-block. Within a group the low nibble or the
+        // high one of `ql`, plus two bits of `qh`, and which of the two it is
+        // depends on the group - so a group's thirty-two elements are four
+        // consecutive `ql` bytes and four consecutive `qh` bytes at a time,
+        // which is what makes them a dp4a operand without any shuffling.
+        //
+        // The codes are left as the raw 0..63 rather than centred: the -32 is
+        // the offset term, exactly as q4_0's -8 is.
+        const uint8_t * blk = row + (g / 8) * (2 + GK_QK / 16 + 3 * GK_QK / 4);
+        const int       sub = (int) (g % 8);
+
+        const int half  = sub / 4;
+        const int which = sub % 4;
+
+        const uint8_t * ql = blk + half * 64 + ((which & 1) ? 32 : 0);
+        const uint8_t * qh = blk + GK_QK / 2 + half * 32;
+        const int8_t  * sc = (const int8_t *) (blk + GK_QK / 2 + GK_QK / 4) + half * 8;
+
+        const int nib = (which >= 2) ? 4 : 0;
+        const int hsh = 2 * which;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int lw = gk_cu_int_b2(ql, i);
+            const int hw = gk_cu_int_b2(qh, i);
+            codes[i] = ((lw >> nib) & 0x0F0F0F0F) | (((hw >> hsh) & 0x03030303) << 4);
+        }
+
+        const float d = gk_cu_h2f(blk + GK_QK / 2 + GK_QK / 4 + GK_QK / 16);
+
+        scale [0] = d * (float) sc[2 * which + 0];
+        scale [1] = d * (float) sc[2 * which + 1];
+        offset[0] = -32.0f * scale[0];
+        offset[1] = -32.0f * scale[1];
+        return;
+    }
+
+    if (TYPE == GKT_IQ2_S) {
+        // Four eight-magnitude grid entries to a group, a sign byte each, and
+        // a scale nibble per sixteen - so the two halves of the group differ.
+        const uint8_t * blk = row + (g / 8) * (2 + GK_QK / 4 + GK_QK / 16);
+        const int       sub = (int) (g % 8);
+
+        const uint8_t * qs     = blk + 2;
+        const uint8_t * signs  = qs + GK_QK / 8;
+        const uint8_t * qh     = blk + 2 + GK_QK / 4;
+        const uint8_t * scales = qh + GK_QK / 32;
+
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int idx = qs[4 * sub + e] | (((qh[sub] >> (2 * e)) & 3) << 8);
+            const uint64_t ent = gk_cu_grid_iq2_s[idx];
+            const uint8_t  sg  = signs[4 * sub + e];
+
+            codes[2 * e + 0] = gk_cu_signed_bytes((uint32_t) (ent >>  0), sg);
+            codes[2 * e + 1] = gk_cu_signed_bytes((uint32_t) (ent >> 32), (uint8_t) (sg >> 4));
+        }
+
+        const float d = gk_cu_h2f(blk);
+        scale [0] = d * (0.5f + (float) (scales[sub] & 0xf)) * 0.25f;
+        scale [1] = d * (0.5f + (float) (scales[sub] >>  4)) * 0.25f;
+        offset[0] = offset[1] = 0.0f;
         return;
     }
 
@@ -779,8 +1209,47 @@ static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t
     for (int i = 0; i < 8; ++i) {
         codes[i] = 0;
     }
-    scale  = 0.0f;
-    offset = 0.0f;
+    scale [0] = scale [1] = 0.0f;
+    offset[0] = offset[1] = 0.0f;
+}
+
+// The dot of an *already decoded* 32-element weight group against one
+// quantized activation block.
+//
+// Split out of gk_cu_vecdot32 for the same reason gk_cu_blk_elem_t is split
+// out of the per-element read: the decode costs the same whether the group is
+// dotted against one activation column or four, and a caller with several
+// columns should pay it once. Four columns is not a corner case - it is what
+// speculative decoding makes every matmul in the model, so the entry point
+// that re-decodes per column is the one on the hot path.
+template <int TYPE>
+static __device__ __forceinline__ float gk_cu_vecdot32_pre(const int (&codes)[8],
+                                                           const float (&scale)[2],
+                                                           const float (&offset)[2],
+                                                           const gk_cu_q8blk & ab) {
+    if (gk_cu_has_split_scale<TYPE>()) {
+        // Two accumulators rather than one, drained with the scale that
+        // covers each half. The first four words are the group's first
+        // sixteen elements, which is exactly the span such a scale covers.
+        int lo = 0;
+        int hi = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            lo = gk_cu_dp4a(codes[i],     ab.q[i],     lo);
+            hi = gk_cu_dp4a(codes[i + 4], ab.q[i + 4], hi);
+        }
+
+        return ab.d * (scale[0] * (float) lo + offset[0] * ab.sl +
+                       scale[1] * (float) hi + offset[1] * (ab.s - ab.sl));
+    }
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sumi = gk_cu_dp4a(codes[i], ab.q[i], sumi);
+    }
+
+    return ab.d * (scale[0] * (float) sumi + offset[0] * ab.s);
 }
 
 // The dot of one 32-element group of a weight row against one quantized
@@ -790,16 +1259,10 @@ template <int TYPE>
 static __device__ __forceinline__ float gk_cu_vecdot32(const uint8_t * row, int64_t g,
                                                        const gk_cu_q8blk & ab) {
     int   codes[8];
-    float scale, offset;
+    float scale[2], offset[2];
     gk_cu_wblk32<TYPE>(row, g, codes, scale, offset);
 
-    int sumi = 0;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        sumi = gk_cu_dp4a(codes[i], ab.q[i], sumi);
-    }
-
-    return ab.d * (scale * (float) sumi + offset * ab.s);
+    return gk_cu_vecdot32_pre<TYPE>(codes, scale, offset, ab);
 }
 
 // One element of an already-located block.
@@ -830,6 +1293,13 @@ static __device__ __forceinline__ float gk_cu_blk_elem_t(const uint8_t * b, int 
         case GKT_IQ4_XS: return gk_cu_dq_iq4_xs(b, j);
         case GKT_TQ1_0:  return gk_cu_dq_tq1_0 (b, j);
         case GKT_TQ2_0:  return gk_cu_dq_tq2_0 (b, j);
+        case GKT_IQ1_S:  return gk_cu_dq_iq1_s (b, j);
+        case GKT_IQ1_M:  return gk_cu_dq_iq1_m (b, j);
+        case GKT_IQ2_XXS:return gk_cu_dq_iq2_xxs(b, j);
+        case GKT_IQ2_XS: return gk_cu_dq_iq2_xs(b, j);
+        case GKT_IQ2_S:  return gk_cu_dq_iq2_s (b, j);
+        case GKT_IQ3_XXS:return gk_cu_dq_iq3_xxs(b, j);
+        case GKT_IQ3_S:  return gk_cu_dq_iq3_s (b, j);
         default:         return 0.0f; // unreachable: supports_op filtered it
     }
 }
@@ -970,6 +1440,13 @@ static __device__ __forceinline__ float gk_cu_row_elem_t(const void * row, int64
         case GKT_IQ4_XS: return gk_cu_dq_iq4_xs(b, j);
         case GKT_TQ1_0:  return gk_cu_dq_tq1_0 (b, j);
         case GKT_TQ2_0:  return gk_cu_dq_tq2_0 (b, j);
+        case GKT_IQ1_S:  return gk_cu_dq_iq1_s (b, j);
+        case GKT_IQ1_M:  return gk_cu_dq_iq1_m (b, j);
+        case GKT_IQ2_XXS:return gk_cu_dq_iq2_xxs(b, j);
+        case GKT_IQ2_XS: return gk_cu_dq_iq2_xs(b, j);
+        case GKT_IQ2_S:  return gk_cu_dq_iq2_s (b, j);
+        case GKT_IQ3_XXS:return gk_cu_dq_iq3_xxs(b, j);
+        case GKT_IQ3_S:  return gk_cu_dq_iq3_s (b, j);
         default:         return 0.0f; // unreachable: supports_op filtered it
     }
 }
@@ -1013,6 +1490,13 @@ static __device__ __forceinline__ float gk_cu_row_elem(const void * row, int typ
         case GKT_IQ4_XS: return gk_cu_dq_iq4_xs(b, j);
         case GKT_TQ1_0:  return gk_cu_dq_tq1_0 (b, j);
         case GKT_TQ2_0:  return gk_cu_dq_tq2_0 (b, j);
+        case GKT_IQ1_S:  return gk_cu_dq_iq1_s (b, j);
+        case GKT_IQ1_M:  return gk_cu_dq_iq1_m (b, j);
+        case GKT_IQ2_XXS:return gk_cu_dq_iq2_xxs(b, j);
+        case GKT_IQ2_XS: return gk_cu_dq_iq2_xs(b, j);
+        case GKT_IQ2_S:  return gk_cu_dq_iq2_s (b, j);
+        case GKT_IQ3_XXS:return gk_cu_dq_iq3_xxs(b, j);
+        case GKT_IQ3_S:  return gk_cu_dq_iq3_s (b, j);
         default:         return 0.0f; // unreachable: supports_op filtered it
     }
 }
