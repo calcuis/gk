@@ -963,7 +963,11 @@ static __device__ __forceinline__ int gk_cu_int_b2(const uint8_t * p, int i32) {
 template <int TYPE>
 static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_split_scale() {
     return TYPE == GKT_Q6_K   || TYPE == GKT_IQ2_XS ||
-           TYPE == GKT_IQ2_S  || TYPE == GKT_IQ1_M;
+           TYPE == GKT_IQ2_S  || TYPE == GKT_IQ1_M  ||
+           // A 4-bit scale *and* a 4-bit minimum per sixteen elements.
+           TYPE == GKT_Q2_K   ||
+           // A ue4m3 scale per sixteen.
+           TYPE == GKT_NVFP4;
 }
 
 template <int TYPE>
@@ -984,7 +988,18 @@ static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_dp4a() {
            // gk_cu_wblk32 has with the kernels that call it. iq1_s is missing
            // for a different reason - its values carry a per-group offset that
            // is not an integer, so folding it into the codes is not available.
-           TYPE == GKT_IQ2_XXS || TYPE == GKT_IQ3_XXS || TYPE == GKT_IQ3_S;
+           TYPE == GKT_IQ2_XXS || TYPE == GKT_IQ3_XXS || TYPE == GKT_IQ3_S ||
+           // q5_K is q4_K plus a high-bit plane, exactly as q6_K's codes are
+           // its nibbles plus two bits of qh; q2_K rides the split-scale
+           // mechanism because its scale *and* minimum change per sixteen.
+           TYPE == GKT_Q5_K || TYPE == GKT_Q2_K ||
+           // The fp4 pair. Their e2m1 codebook is nonlinear, but gk's doubled
+           // decode table (see gk_cu_e2m1_value) makes every magnitude an
+           // integer no larger than twelve, so a signed code *is* an int8
+           // fragment and the halved scale puts the product back in units.
+           // mxfp4's e8m0 scale covers a whole group; nvfp4's ue4m3 scale
+           // covers sixteen, which is what the split-scale drain is for.
+           TYPE == GKT_MXFP4 || TYPE == GKT_NVFP4;
 }
 
 // One 32-element group of a weight row, as integer codes plus the two floats
@@ -1061,6 +1076,111 @@ static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t
 
         scale [0] = scale [1] =  gk_cu_h2f(blk)     * (float) sc;
         offset[0] = offset[1] = -gk_cu_h2f(blk + 2) * (float) mn;
+        return;
+    }
+
+    if (TYPE == GKT_Q5_K) {
+        // q4_K's nibbles plus a fifth bit: bit `sub` of qh byte l belongs to
+        // element l of group sub, so the plane is eight aligned words read
+        // exactly as q6_K reads its own.
+        const uint8_t * blk = row + (g / 8) * (4 + 12 + GK_QK / 8 + GK_QK / 2);
+        const int       sub = (int) (g % 8);
+
+        int sc, mn;
+        gk_cu_scale_min_6(blk + 4, sub, &sc, &mn);
+
+        const uint8_t * qh    = blk + 16;
+        const uint8_t * qs    = blk + 48 + (sub / 2) * 32;
+        const int       shift = (sub % 2) * 4;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int lw = gk_cu_int_b2(qs, i);
+            const int hw = gk_cu_int_b2(qh, i);
+            codes[i] = ((lw >> shift) & 0x0F0F0F0F) |
+                       (((hw >> sub) & 0x01010101) << 4);
+        }
+
+        scale [0] = scale [1] =  gk_cu_h2f(blk)     * (float) sc;
+        offset[0] = offset[1] = -gk_cu_h2f(blk + 2) * (float) mn;
+        return;
+    }
+
+    if (TYPE == GKT_Q2_K) {
+        // A group's thirty-two 2-bit codes are one shift of thirty-two
+        // consecutive bytes; the scale and the minimum both change at sixteen,
+        // which is why this is a split-scale format despite the simple codes.
+        const uint8_t * blk = row + (g / 8) * (GK_QK / 16 + GK_QK / 4 + 4);
+        const int       sub = (int) (g % 8);
+
+        const uint8_t * qs    = blk + GK_QK / 16 + (sub / 4) * 32;
+        const int       shift = 2 * (sub % 4);
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            codes[i] = (gk_cu_int_b2(qs, i) >> shift) & 0x03030303;
+        }
+
+        const float d    = gk_cu_h2f(blk + GK_QK / 16 + GK_QK / 4);
+        const float dmin = gk_cu_h2f(blk + GK_QK / 16 + GK_QK / 4 + 2);
+        const uint8_t s0 = blk[2 * sub + 0];
+        const uint8_t s1 = blk[2 * sub + 1];
+
+        scale [0] =  d    * (float) (s0 & 0xf);
+        scale [1] =  d    * (float) (s1 & 0xf);
+        offset[0] = -dmin * (float) (s0 >> 4);
+        offset[1] = -dmin * (float) (s1 >> 4);
+        return;
+    }
+
+    if (TYPE == GKT_MXFP4) {
+        // A 17-byte block is odd-strided, so the payload is read a byte at a
+        // time; the doubled e2m1 table folds each nibble to a signed integer
+        // no larger than twelve, and the halved e8m0 scale undoes the double.
+        const uint8_t * qs = row + g * 17 + 1;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            uint32_t w = 0;
+#pragma unroll
+            for (int b4 = 0; b4 < 4; ++b4) {
+                const int j    = 4 * i + b4;
+                const int code = j < 16 ? (qs[j] & 0xf) : (qs[j - 16] >> 4);
+                w |= ((uint32_t) (uint8_t) gk_cu_e2m1_value(code)) << (8 * b4);
+            }
+            codes[i] = (int) w;
+        }
+
+        scale [0] = scale [1] = gk_cu_e8m0_half(row[g * 17]);
+        offset[0] = offset[1] = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_NVFP4) {
+        // A 64-element block holds four 16-element sub-blocks, each with its
+        // own ue4m3 scale - a group is two of them, drained separately. Codes
+        // as in mxfp4: the doubled table against the halved scale.
+        const uint8_t * blk = row + (g / 2) * 36;
+        const int       s0  = (int) (g % 2) * 2;
+
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t * qs = blk + 4 + (s0 + h) * 8;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                uint32_t w = 0;
+#pragma unroll
+                for (int b4 = 0; b4 < 4; ++b4) {
+                    const int jj   = 4 * i + b4;
+                    const int code = jj < 8 ? (qs[jj] & 0xf) : (qs[jj - 8] >> 4);
+                    w |= ((uint32_t) (uint8_t) gk_cu_e2m1_value(code)) << (8 * b4);
+                }
+                codes[4 * h + i] = (int) w;
+            }
+            scale[h] = gk_cu_ue4m3(blk[s0 + h]);
+        }
+
+        offset[0] = offset[1] = 0.0f;
         return;
     }
 

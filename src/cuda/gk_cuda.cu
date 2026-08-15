@@ -788,9 +788,14 @@ static bool gk_cuda_backend_supports_op(gk_backend_t backend, const struct gk_te
 static bool gk_cuda_backend_supports_buft(gk_backend_t backend, gk_backend_buffer_type_t buft) {
     struct gk_cuda_backend_ctx * ctx = (struct gk_cuda_backend_ctx *) backend->context;
 
-    // Its own memory, and any pinned host memory - which the device can read
-    // directly, so a tensor there needs no staging.
-    return buft == &ctx->dev->buft || buft == &ctx->dev->host_buft;
+    // Its own memory only. Pinned host memory is addressable from the device,
+    // but "addressable" is not "readable at speed": a kernel that walks an
+    // operand more than once - a mat-vec re-reading the activation column per
+    // output row - multiplies every in-place read by the row count, over the
+    // bus. Declining it here makes the scheduler stage such a tensor into
+    // device memory once per graph instead; the pinning still pays for that
+    // copy's speed, which is what it is for.
+    return buft == &ctx->dev->buft;
 }
 
 // Whether it is worth pulling an op here that would otherwise run elsewhere.
@@ -938,8 +943,10 @@ static bool gk_cuda_device_supports_op(gk_device_t dev, const struct gk_tensor *
 }
 
 static bool gk_cuda_device_supports_buft(gk_device_t dev, gk_backend_buffer_type_t buft) {
+    // Own device memory only - see gk_cuda_backend_supports_buft for why
+    // pinned host memory is deliberately not claimed here.
     struct gk_cuda_device_ctx * ctx = (struct gk_cuda_device_ctx *) dev->context;
-    return buft == &ctx->buft || buft == &ctx->host_buft;
+    return buft == &ctx->buft;
 }
 
 static bool gk_cuda_device_offload_op(gk_device_t dev, const struct gk_tensor * op) {

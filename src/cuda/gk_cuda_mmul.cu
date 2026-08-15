@@ -60,14 +60,23 @@ static int gk_cu_env_int(const char * name, int def);
 // Whether the integer dot path applies: the format has one, the row cuts into
 // whole 32-element groups so a group never straddles two of them, and there
 // are enough rows to pay for the quantize pass.
+//
+// The row floor applies only to the formats whose float decode is cheap - for
+// those, below a few hundred rows the extra quantize launch is most of the
+// difference. The k-quants, the codebook formats and the fp4 pair decode at a
+// twentieth of that on the float path (a q5_K lm_head measured 110 GFLOP/s
+// against the integer path's thousands), so for them the integer path wins at
+// any row count a matmul actually has.
 static __host__ __forceinline__ bool gk_cuda_mm_q8_supported(int type, int64_t k_len,
                                                              int64_t n_rows) {
-    if (k_len % 32 != 0 || n_rows < GK_CU_MM_Q8_MIN_ROWS) {
+    if (k_len % 32 != 0) {
         return false;
     }
     switch (type) {
-        case GK_TYPE_Q4_0: case GK_TYPE_Q4_1:
-        case GK_TYPE_Q8_0: case GK_TYPE_Q4_K:
+        case GK_TYPE_Q4_0: case GK_TYPE_Q4_1: case GK_TYPE_Q8_0:
+            return n_rows >= GK_CU_MM_Q8_MIN_ROWS;
+        case GK_TYPE_Q4_K: case GK_TYPE_Q5_K: case GK_TYPE_Q2_K:
+        case GK_TYPE_MXFP4: case GK_TYPE_NVFP4:
         case GK_TYPE_IQ2_XXS: case GK_TYPE_IQ3_XXS: case GK_TYPE_IQ3_S:
             return true;
         // `GK_MM_Q8_SPLIT=0` puts the split-scale formats back on the float
@@ -85,7 +94,8 @@ static __host__ __forceinline__ bool gk_cuda_mm_q8_supported(int type, int64_t k
 // before the type becomes a template parameter.
 static __host__ __forceinline__ bool gk_cuda_mm_split_scale(int type) {
     return type == GK_TYPE_Q6_K || type == GK_TYPE_IQ2_XS ||
-           type == GK_TYPE_IQ2_S || type == GK_TYPE_IQ1_M;
+           type == GK_TYPE_IQ2_S || type == GK_TYPE_IQ1_M ||
+           type == GK_TYPE_Q2_K  || type == GK_TYPE_NVFP4;
 }
 
 // This list and gk_cu_has_dp4a's are the same list seen from the two sides -
@@ -96,7 +106,9 @@ static_assert(gk_cu_has_dp4a<GKT_Q4_0>()    && gk_cu_has_dp4a<GKT_Q4_1>() &&
               gk_cu_has_dp4a<GKT_Q8_0>()    && gk_cu_has_dp4a<GKT_Q4_K>() &&
               gk_cu_has_dp4a<GKT_IQ2_XXS>() && gk_cu_has_dp4a<GKT_IQ3_XXS>() &&
               gk_cu_has_dp4a<GKT_IQ3_S>()   && gk_cu_has_dp4a<GKT_Q6_K>() &&
-              gk_cu_has_dp4a<GKT_IQ2_S>(),
+              gk_cu_has_dp4a<GKT_IQ2_S>()   && gk_cu_has_dp4a<GKT_Q5_K>() &&
+              gk_cu_has_dp4a<GKT_Q2_K>()    && gk_cu_has_dp4a<GKT_MXFP4>() &&
+              gk_cu_has_dp4a<GKT_NVFP4>(),
               "gk_cuda_mm_q8_supported offers a type gk_cu_wblk32 cannot stage");
 
 // Activation columns one pass over a weight row serves. Each column costs a
@@ -4690,7 +4702,15 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
     // for value dimensions `lane, lane+32, ...`, and that array is sized at
     // compile time. A wider DV would fit in shared memory long before it fit
     // in the registers, and would quietly drop every dimension past the end.
-    if (q->ne[1] >= GK_CU_FAT_QR && DV <= GK_CU_FAT_MAX_D && scratch != NULL &&
+    // At least half the block's query rows, not merely one warp's worth: a
+    // block always walks the whole cache, so a speculative-decode verify pass
+    // (four rows) taken here runs one block per head with seven of eight
+    // warps idle - 32 blocks on a 170-SM part - where the split path below
+    // cuts the same cache into hundreds of blocks. Measured on a 4-row,
+    // 32-head, 256-position shape, tiled was 0.21 ms against split's tens of
+    // microseconds. Above sixteen rows the mma path has already taken every
+    // f16 cache, so this floor only routes the small-q tail.
+    if (q->ne[1] >= GK_CU_FAT_QROWS / 2 && DV <= GK_CU_FAT_MAX_D && scratch != NULL &&
         fat_smem <= (size_t) scratch->smem_max) {
 
         if (fat_smem > 48u * 1024u) {
