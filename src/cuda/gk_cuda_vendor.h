@@ -57,6 +57,22 @@
 #define gkEventRecord           hipEventRecord
 #define gkEventSynchronize      hipEventSynchronize
 #define gkEventElapsedTime      hipEventElapsedTime
+#define gkEventQuery            hipEventQuery
+
+// Stream capture and executable graphs. Relaxed mode, because capture happens
+// on a live server: other threads keep uploading tensors on their own streams
+// while this one records, and the stricter modes would fail *their* calls for
+// it. The instantiate signatures differ between the vendors (and between CUDA
+// 11 and 12), so it is wrapped rather than aliased.
+#define gkGraph_t               hipGraph_t
+#define gkGraphExec_t           hipGraphExec_t
+#define gkStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+#define gkStreamBeginCapture    hipStreamBeginCapture
+#define gkStreamEndCapture      hipStreamEndCapture
+#define gkGraphInstantiate(pe, g) hipGraphInstantiate(pe, g, NULL, NULL, 0)
+#define gkGraphLaunch           hipGraphLaunch
+#define gkGraphDestroy          hipGraphDestroy
+#define gkGraphExecDestroy      hipGraphExecDestroy
 
 #define gkSetDevice             hipSetDevice
 #define gkGetDevice             hipGetDevice
@@ -122,6 +138,20 @@
 #define gkEventRecord           cudaEventRecord
 #define gkEventSynchronize      cudaEventSynchronize
 #define gkEventElapsedTime      cudaEventElapsedTime
+#define gkEventQuery            cudaEventQuery
+
+// Stream capture and executable graphs; see the HIP block for why relaxed
+// mode and why instantiate is a wrapper. The flags spelling is the one that
+// exists on both sides of the CUDA 12 signature change.
+#define gkGraph_t               cudaGraph_t
+#define gkGraphExec_t           cudaGraphExec_t
+#define gkStreamCaptureModeRelaxed cudaStreamCaptureModeRelaxed
+#define gkStreamBeginCapture    cudaStreamBeginCapture
+#define gkStreamEndCapture      cudaStreamEndCapture
+#define gkGraphInstantiate(pe, g) cudaGraphInstantiateWithFlags(pe, g, 0)
+#define gkGraphLaunch           cudaGraphLaunch
+#define gkGraphDestroy          cudaGraphDestroy
+#define gkGraphExecDestroy      cudaGraphExecDestroy
 
 #define gkSetDevice             cudaSetDevice
 #define gkGetDevice             cudaGetDevice

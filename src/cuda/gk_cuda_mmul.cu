@@ -706,6 +706,71 @@ static __global__ void gk_cu_k_mul_mat_q8(gk_tview a, gk_tview_mut d,
     }
 }
 
+// The same dot with a whole block on one row, for the outputs too narrow to
+// fill the device a warp at a time. An attention k/v projection is 256 rows:
+// warp-per-row is 64 blocks on a card with 170 multiprocessors, and each of
+// those warps walks its groups in one long dependent chain. A block per row
+// is four times the blocks and a quarter the chain, and the price - one block
+// reduction per output instead of one warp shuffle - is paid once per row,
+// not once per group.
+template <int NC, int ATYPE>
+static __global__ void gk_cu_k_mul_mat_q8_row(gk_tview a, gk_tview_mut d,
+                                              const gk_cu_q8blk * aq, int64_t n_grp,
+                                              int64_t r2, int64_t r3) {
+    __shared__ float red[GK_CU_MM_BLOCK / GK_WARP_SIZE];
+
+    const int64_t i0  = blockIdx.x;
+    const int64_t c0  = (int64_t) blockIdx.y * NC;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    float acc[NC];
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        acc[j] = 0.0f;
+    }
+
+    const uint8_t * a_row = (const uint8_t *) gk_cu_row(a, i0, a2, a3);
+    const gk_cu_q8blk * aq23 = aq + i23 * d.ne[1] * n_grp;
+
+    for (int64_t g = threadIdx.x; g < n_grp; g += blockDim.x) {
+        int   codes[8];
+        float scale[2], offset[2];
+        gk_cu_wblk32<ATYPE>(a_row, g, codes, scale, offset);
+
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            const int64_t col = c0 + j;
+            if (col < d.ne[1]) {
+                acc[j] += gk_cu_vecdot32_pre<ATYPE>(codes, scale, offset,
+                                                    aq23[col * n_grp + g]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < NC; ++j) {
+        acc[j] = gk_cu_block_sum(acc[j], red);
+        // The reduction reads `red` after its barrier; the next one writes it.
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            const int64_t col = c0 + j;
+            if (col < d.ne[1]) {
+                gk_cu_set(d, i0, col, i2, i3, acc[j]);
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 // The tensor-core path, for nvfp4.
 //
@@ -3342,13 +3407,43 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         const int64_t n_23   = dst->ne[2] * dst->ne[3];
         const int64_t n_blk  = n_grp * n_cols * n_23;
 
+        // Read before scratch_get: it clears the claim on entry.
+        const void *   aq_src_prev  = scratch->aq_src;
+        const int64_t  aq_blk_prev  = scratch->aq_blk;
+        const int64_t  aq_grp_prev  = scratch->aq_grp;
+        const uint64_t aq_pass_prev = scratch->aq_pass;
+
         gk_cu_q8blk * aq = (gk_cu_q8blk *) gk_cu_scratch_get(
             scratch, (size_t) n_blk * sizeof(gk_cu_q8blk), stream);
 
         if (aq != NULL) {
-            gk_cu_k_quantize_act<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
-                                   GK_CUDA_BLOCK, 0, stream>>>(
-                gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
+            // The q, k and v projections dot different weights against the
+            // same activation; if the scratch still holds this exact tensor's
+            // blocks from this exact graph pass, the quantize is already done.
+            const bool aq_reuse = aq_src_prev == src1->data &&
+                                  aq_blk_prev == n_blk && aq_grp_prev == n_grp &&
+                                  aq_pass_prev == scratch->pass;
+
+            if (!aq_reuse) {
+                gk_cu_k_quantize_act<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
+                                       GK_CUDA_BLOCK, 0, stream>>>(
+                    gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
+            }
+            scratch->aq_src  = src1->data;
+            scratch->aq_blk  = n_blk;
+            scratch->aq_grp  = n_grp;
+            scratch->aq_pass = scratch->pass;
+
+            // A warp per row wants at least a few blocks per multiprocessor
+            // out of rows alone; an output narrower than that - an attention
+            // k/v projection is 256 rows - runs a whole block per row
+            // instead, trading a per-row reduction for four times the blocks
+            // and a quarter of the dependent-load chain. Only when the row is
+            // long enough to feed four warps, though: with fewer groups than
+            // threads the reduction is the whole kernel, and measured on a
+            // 2048-row, 96-group projection it gave back half the win.
+            const bool rowwise = dst->ne[0] < (int64_t) scratch->n_sm * 8 &&
+                                 n_grp >= GK_CU_MM_BLOCK;
 
             if (n_cols < GK_CU_MM_NC) {
                 grid.y = (unsigned) n_cols;
@@ -3356,20 +3451,39 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
 #define GK_CU_LAUNCH_Q8_1(T)                                               \
                 gk_cu_k_mul_mat_q8<1, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
                     gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
+#define GK_CU_LAUNCH_Q8R_1(T)                                              \
+                gk_cu_k_mul_mat_q8_row<1, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
+                    gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
 
-                g_gk_mm_path = "mv-q8";
-                GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8_1);
+                if (rowwise) {
+                    grid.x = (unsigned) dst->ne[0];
+                    g_gk_mm_path = "mv-q8r";
+                    GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8R_1);
+                } else {
+                    g_gk_mm_path = "mv-q8";
+                    GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8_1);
+                }
 #undef GK_CU_LAUNCH_Q8_1
+#undef GK_CU_LAUNCH_Q8R_1
             } else {
                 grid.y = (unsigned) ((n_cols + GK_CU_MM_NC - 1) / GK_CU_MM_NC);
 
 #define GK_CU_LAUNCH_Q8_N(T)                                               \
                 gk_cu_k_mul_mat_q8<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
                     gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
+#define GK_CU_LAUNCH_Q8R_N(T)                                              \
+                gk_cu_k_mul_mat_q8_row<GK_CU_MM_NC, T><<<grid, GK_CU_MM_BLOCK, 0, stream>>>( \
+                    gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3)
 
+                // No rowwise variant here: with four columns per pass the
+                // block pays four sequential reductions per row, and at one
+                // or two groups per thread that is the whole kernel - the
+                // speculative verify measured ~10% slower end to end on it.
+                GK_UNUSED(rowwise);
                 g_gk_mm_path = "mv-q8";
                 GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_Q8_N);
 #undef GK_CU_LAUNCH_Q8_N
+#undef GK_CU_LAUNCH_Q8R_N
             }
             return;
         }
@@ -4432,6 +4546,221 @@ static __global__ void gk_cu_k_flash_attn(gk_tview q, gk_tview k, gk_tview v,
     }
 }
 
+// The same computation with the synchronization turned inside out. The kernel
+// above pays a block reduction and three barriers at every cache position,
+// which for a decode shape - a handful of query rows, a block per row - makes
+// the whole launch latency: a 512-position slice is fifteen hundred barriers
+// deep before a single byte of V has moved. Measured on the speculative-verify
+// shape (4 rows, 32 heads, 512 positions) it ran at 240 GFLOP/s on a part
+// whose scalar units alone do fifty times that.
+//
+// Here a *lane owns a whole position*: each thread computes one full q.k dot
+// by itself, a tile of 128 scores lands in shared memory at once, and the
+// block synchronizes three times per 128 positions instead of three times per
+// position. The V pass then walks the tile with every thread owning one output
+// dimension, which makes the V reads coalesced - consecutive lanes touch
+// consecutive elements of the same value row.
+//
+// The accumulator lives in registers, striped across the block (thread t owns
+// dimensions t, t+128, ...), so there is no shared-memory accumulator to
+// rescale under a barrier; each thread rescales its own stripe when the
+// running maximum moves, once per tile.
+//
+// F16 lifts the K and V reads out of the per-element type switch: the
+// dispatch only sets it when both operands really are contiguous f16, which
+// every f16 KV cache is. Anything else - a quantized cache, an exotic stride -
+// takes the generic accessor and still keeps the barrier structure.
+template <bool F16>
+static __global__ void gk_cu_k_flash_attn_vec(gk_tview q, gk_tview k, gk_tview v,
+                                              gk_tview mask, bool has_mask,
+                                              const float * sinks, gk_tview_mut d,
+                                              float scale, float max_bias, float logit_softcap,
+                                              int64_t n_head_log2,
+                                              int64_t rk2, int64_t rk3, int64_t rv2, int64_t rv3,
+                                              float * part_vkq, float * part_ms, int n_split) {
+    constexpr int NACC = GK_CUDA_FA_MAX_DV / GK_CU_FA_BLOCK;
+
+    __shared__ float sq[GK_CUDA_FA_MAX_DK];
+    __shared__ float stile[GK_CU_FA_BLOCK];
+    __shared__ float reduce[GK_CU_FA_BLOCK / GK_WARP_SIZE];
+
+    const int64_t DK = k.ne[0];
+    const int64_t DV = v.ne[0];
+
+    const int64_t ir  = blockIdx.x;
+    const int64_t iq1 = ir % q.ne[1];
+    const int64_t iq2 = (ir / q.ne[1]) % q.ne[2];
+    const int64_t iq3 = ir / (q.ne[1] * q.ne[2]);
+
+    const int64_t n_kv = k.ne[1];
+    const int64_t per  = (n_kv + n_split - 1) / n_split;
+    const int64_t ic0  = (int64_t) blockIdx.y * per;
+    const int64_t ic1  = ic0 + per < n_kv ? ic0 + per : n_kv;
+
+    if (ic0 >= n_kv) {
+        if (part_ms != NULL && threadIdx.x == 0) {
+            const int64_t slot = (ir * n_split + blockIdx.y) * 2;
+            part_ms[slot + 0] = -INFINITY;
+            part_ms[slot + 1] = 0.0f;
+        }
+        return;
+    }
+
+    const int64_t ik2 = iq2 / rk2, ik3 = iq3 / rk3;
+    const int64_t iv2 = iq2 / rv2, iv3 = iq3 / rv3;
+
+    const float slope = gk_cu_alibi_slope(max_bias, iq2, n_head_log2);
+
+    const char * kbase = k.data + ik2 * k.nb[2] + ik3 * k.nb[3];
+    const char * vbase = v.data + iv2 * v.nb[2] + iv3 * v.nb[3];
+
+    for (int64_t i = threadIdx.x; i < DK; i += blockDim.x) {
+        sq[i] = gk_cu_get(q, i, iq1, iq2, iq3);
+    }
+
+    float acc[NACC];
+#pragma unroll
+    for (int a = 0; a < NACC; ++a) {
+        acc[a] = 0.0f;
+    }
+
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    for (int64_t t0 = ic0; t0 < ic1; t0 += GK_CU_FA_BLOCK) {
+        __syncthreads(); // sq on the first pass, last tile's stile after that
+
+        const int64_t ic = t0 + threadIdx.x;
+
+        float s = -INFINITY;
+        if (ic < ic1) {
+            float mv   = 0.0f;
+            bool  dead = false;
+            if (has_mask) {
+                mv   = slope * gk_cu_get(mask, ic, iq1, iq2 % mask.ne[2], iq3 % mask.ne[3]);
+                dead = mv == -INFINITY;
+            }
+            if (!dead) {
+                float part = 0.0f;
+                if (F16) {
+                    const __half * krow = (const __half *) (kbase + ic * k.nb[1]);
+                    int64_t i = 0;
+                    for (; i + 1 < DK; i += 2) {
+                        const float2 k2 = __half22float2(*(const __half2 *) (krow + i));
+                        part += sq[i] * k2.x + sq[i + 1] * k2.y;
+                    }
+                    for (; i < DK; ++i) {
+                        part += sq[i] * __half2float(krow[i]);
+                    }
+                } else {
+                    for (int64_t i = 0; i < DK; ++i) {
+                        part += sq[i] * gk_cu_get(k, i, ic, ik2, ik3);
+                    }
+                }
+                s = part * scale;
+                if (logit_softcap != 0.0f) {
+                    s = logit_softcap * tanhf(s);
+                }
+                s += mv;
+            }
+        }
+        stile[threadIdx.x] = s;
+        __syncthreads();
+
+        const float tile_max = gk_cu_block_max(s, reduce);
+        if (tile_max == -INFINITY) {
+            continue; // every position masked or past the slice: nothing to add
+        }
+
+        const float newM = fmaxf(M, tile_max);
+        const float ms   = M == -INFINITY ? 0.0f : __expf(M - newM);
+        S *= ms;
+#pragma unroll
+        for (int a = 0; a < NACC; ++a) {
+            acc[a] *= ms;
+        }
+        M = newM;
+
+        // Each thread exponentiates its own score in place; the barrier
+        // publishes the whole tile of weights at once.
+        stile[threadIdx.x] = s == -INFINITY ? 0.0f : __expf(s - M);
+        __syncthreads();
+
+        const int tlen = (int) (ic1 - t0 < GK_CU_FA_BLOCK ? ic1 - t0 : GK_CU_FA_BLOCK);
+        for (int j = 0; j < tlen; ++j) {
+            const float pj = stile[j];
+            if (pj == 0.0f) {
+                continue; // same value in every thread, so the branch is uniform
+            }
+            S += pj;
+
+            const int64_t jc = t0 + j;
+            if (F16) {
+                const __half * vrow = (const __half *) (vbase + jc * v.nb[1]);
+#pragma unroll
+                for (int a = 0; a < NACC; ++a) {
+                    const int64_t dim = threadIdx.x + a * GK_CU_FA_BLOCK;
+                    if (dim < DV) {
+                        acc[a] += pj * __half2float(vrow[dim]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int a = 0; a < NACC; ++a) {
+                    const int64_t dim = threadIdx.x + a * GK_CU_FA_BLOCK;
+                    if (dim < DV) {
+                        acc[a] += pj * gk_cu_get(v, dim, jc, iv2, iv3);
+                    }
+                }
+            }
+        }
+    }
+
+    // From here the shape of the hand-off matches the kernel above exactly:
+    // a slice leaves (M, S) and its unnormalised stripe for the merge; the
+    // unsplit case folds the sink in and normalizes itself.
+    if (part_vkq != NULL) {
+        const int64_t slot = ir * n_split + blockIdx.y;
+#pragma unroll
+        for (int a = 0; a < NACC; ++a) {
+            const int64_t dim = threadIdx.x + a * GK_CU_FA_BLOCK;
+            if (dim < DV) {
+                part_vkq[slot * DV + dim] = acc[a];
+            }
+        }
+        if (threadIdx.x == 0) {
+            part_ms[slot * 2 + 0] = M;
+            part_ms[slot * 2 + 1] = S;
+        }
+        return;
+    }
+
+    if (sinks != NULL) {
+        const float sk = sinks[iq2];
+        if (sk > M) {
+            const float ms = M == -INFINITY ? 0.0f : __expf(M - sk);
+            M = sk;
+            S = S * ms + 1.0f;
+#pragma unroll
+            for (int a = 0; a < NACC; ++a) {
+                acc[a] *= ms;
+            }
+        } else {
+            S += __expf(sk - M);
+        }
+    }
+
+    const float inv = S == 0.0f ? 0.0f : 1.0f / S;
+
+#pragma unroll
+    for (int a = 0; a < NACC; ++a) {
+        const int64_t dim = threadIdx.x + a * GK_CU_FA_BLOCK;
+        if (dim < DV) {
+            gk_cu_set(d, dim, iq2, iq1, iq3, acc[a] * inv);
+        }
+    }
+}
+
 // Merges the slices of one query row.
 //
 // Each slice arrived with its accumulator relative to its own maximum, so the
@@ -4773,21 +5102,48 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
         }
     }
 
-    gk_cu_fa_dump(n_split > 1 ? "split" : "flat", dst);
-
     dim3 grid;
     grid.x = (unsigned) rows;
     grid.y = (unsigned) n_split;
     grid.z = 1;
 
-    gk_cu_k_flash_attn<<<grid, GK_CU_FA_BLOCK, 0, stream>>>(
-        gk_cu_view(q), gk_cu_view(k), gk_cu_view(v),
-        mask ? gk_cu_view(mask) : gk_cu_view(q), mask != NULL,
-        sinks ? (const float *) sinks->data : NULL,
-        gk_cu_view_mut(dst), scale, max_bias, logit_softcap, n_head_log2,
-        q->ne[2] / k->ne[2], q->ne[3] / k->ne[3],
-        q->ne[2] / v->ne[2], q->ne[3] / v->ne[3],
-        part_vkq, part_ms, n_split);
+    // The lane-per-position kernel unless the environment asks for the old
+    // one; its f16 instantiation additionally wants both cache operands
+    // element-contiguous, which is how every f16 KV cache is laid out.
+    static const char * fa_vec_env = getenv("GK_FA_VEC");
+    const bool fa_vec = !(fa_vec_env != NULL && fa_vec_env[0] == '0');
+    const bool fa_f16 = (int) k->type == GK_TYPE_F16 && (int) v->type == GK_TYPE_F16 &&
+                        k->nb[0] == sizeof(__half) && v->nb[0] == sizeof(__half);
+
+    if (fa_vec) {
+        gk_cu_fa_dump(n_split > 1 ? (fa_f16 ? "split-vec/f16" : "split-vec")
+                                  : (fa_f16 ? "flat-vec/f16"  : "flat-vec"), dst);
+
+#define GK_CU_FA_VEC_LAUNCH(F16)                                                    \
+        gk_cu_k_flash_attn_vec<F16><<<grid, GK_CU_FA_BLOCK, 0, stream>>>(           \
+            gk_cu_view(q), gk_cu_view(k), gk_cu_view(v),                            \
+            mask ? gk_cu_view(mask) : gk_cu_view(q), mask != NULL,                  \
+            sinks ? (const float *) sinks->data : NULL,                             \
+            gk_cu_view_mut(dst), scale, max_bias, logit_softcap, n_head_log2,       \
+            q->ne[2] / k->ne[2], q->ne[3] / k->ne[3],                               \
+            q->ne[2] / v->ne[2], q->ne[3] / v->ne[3],                               \
+            part_vkq, part_ms, n_split)
+
+        if (fa_f16) { GK_CU_FA_VEC_LAUNCH(true);  }
+        else        { GK_CU_FA_VEC_LAUNCH(false); }
+#undef GK_CU_FA_VEC_LAUNCH
+    } else {
+        gk_cu_fa_dump(n_split > 1 ? "split" : "flat", dst);
+
+        gk_cu_k_flash_attn<<<grid, GK_CU_FA_BLOCK, 0, stream>>>(
+            gk_cu_view(q), gk_cu_view(k), gk_cu_view(v),
+            mask ? gk_cu_view(mask) : gk_cu_view(q), mask != NULL,
+            sinks ? (const float *) sinks->data : NULL,
+            gk_cu_view_mut(dst), scale, max_bias, logit_softcap, n_head_log2,
+            q->ne[2] / k->ne[2], q->ne[3] / k->ne[3],
+            q->ne[2] / v->ne[2], q->ne[3] / v->ne[3],
+            part_vkq, part_ms, n_split);
+    }
 
     if (n_split > 1) {
         // One block per row again, and the merge is the only thing that writes

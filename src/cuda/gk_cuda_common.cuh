@@ -350,6 +350,25 @@ struct gk_cuda_scratch {
     int    n_sm;   // multiprocessors on this device
     int    cc;     // compute capability, major*10 + minor
     int    smem_max; // dynamic shared memory a block may opt in to, bytes
+
+    // Bumped every time `ptr` moves. A captured graph bakes the scratch
+    // pointer into its kernel launches, so a replay after a grow would read
+    // memory that has been freed; the graph cache compares this against the
+    // value it saw at capture and re-captures instead.
+    uint64_t gen;
+
+    // What the scratch currently holds, when that is a quantized activation.
+    // The q/k/v projections - and gate/up - dot different weights against the
+    // *same* activation, so the second and third quantize of it are the first
+    // one's answer recomputed. A match on all four fields skips the pass; any
+    // other scratch user clears `aq_src` on entry (see gk_cu_scratch_get) and
+    // the invariant holds by construction. `aq_pass` ties the claim to one
+    // graph execution, because the same address holds new numbers next token.
+    const void * aq_src;
+    int64_t      aq_blk;
+    int64_t      aq_grp;
+    uint64_t     aq_pass;
+    uint64_t     pass;   // bumped by the backend at every graph_compute
 };
 
 // Returns a buffer of at least `bytes`, or NULL if the device has no room.
@@ -374,11 +393,17 @@ static __host__ __forceinline__ void * gk_cu_scratch_get(struct gk_cuda_scratch 
                                                          size_t bytes, gkStream_t stream) {
     g_gk_scratch_stats.calls++;
 
+    // Whoever asked may write the buffer, so any quantized activation in it
+    // is spoken for. The one caller that wants to keep it reads the aq fields
+    // *before* calling and re-asserts them after.
+    s->aq_src = NULL;
+
     if (s->ptr != NULL && s->size >= bytes) {
         return s->ptr;
     }
 
     g_gk_scratch_stats.grows++;
+    s->gen++;
     const std::chrono::steady_clock::time_point t_grow0 = std::chrono::steady_clock::now();
 
     if (s->ptr != NULL) {

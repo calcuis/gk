@@ -363,11 +363,469 @@ static const struct gk_backend_buffer_type_i g_cuda_host_buft_iface = {
 // the backend
 // --------------------------------------------------------------------------
 
+struct gk_cu_graph_cache;
+
 struct gk_cuda_backend_ctx {
     struct gk_cuda_device_ctx * dev;
     gkStream_t                  stream;
     struct gk_cuda_scratch      scratch;
+    struct gk_cu_graph_cache *  graphs; // captured-graph cache; NULL until first used
 };
+
+// --------------------------------------------------------------------------
+// captured graphs
+//
+// A decode step is a few hundred tiny kernels, and on Windows every launch is
+// a WDDM submission; the launches cost more than the math. But the server's
+// decode graph is byte-identical from one token to the next - the KV cache is
+// written through set_rows with the row indices as a graph *input*, and the
+// attention shapes are padded to a 256-token window - so the same launches,
+// with the same pointers and the same geometry, repeat for hundreds of calls.
+// That is the one situation CUDA graphs are for: record the launches once,
+// then replay the whole step as a single submission.
+//
+// The contract is exact repetition, checked, not assumed. Every node's data
+// pointer, geometry, op params and operand pointers are recorded; a graph
+// replays only when all of them match what was captured. The first sighting
+// of a topology just records it; the second executes through stream capture
+// and keeps the instantiated graph; from the third on, one launch. Anything
+// that breaks the match - a prompt of a different length, the 256-token
+// window rolling over, the scratch buffer moving - falls back to plain
+// launches and re-records, which is never wrong, only slower.
+//
+// GK_CUDA_GRAPHS=0 turns it off. GK_CUDA_GRAPH_LOG=1 says what it is doing
+// and, more usefully, *why* a graph did not replay - the first node that
+// failed the comparison and which of its facts moved.
+// --------------------------------------------------------------------------
+
+#define GK_CU_GRAPH_CACHE     8   // distinct topologies kept per backend
+#define GK_CU_GRAPH_MIN_NODES 8   // below this, capture overhead beats the win
+
+// How many operands get their full geometry recorded. Operand *pointers* are
+// recorded for all of them; shapes matter for the first few (flash attention
+// reads the KV length from src1/src2's extents while its own shape holds
+// still, so a dst-only record would replay a stale attention span).
+#define GK_CU_GRAPH_SRC_SHAPES 4
+
+struct gk_cu_node_props {
+    void *  data;
+    int32_t op;
+    int32_t type;
+    int32_t flags;
+    int32_t n_src;
+    int64_t ne[GK_MAX_DIMS];
+    size_t  nb[GK_MAX_DIMS];
+    int32_t op_params[GK_MAX_OP_PARAMS / sizeof(int32_t)];
+    void *  src_data[GK_MAX_SRC];
+    int32_t src_type[GK_MAX_SRC];
+    int64_t src_ne[GK_CU_GRAPH_SRC_SHAPES][GK_MAX_DIMS];
+    size_t  src_nb[GK_CU_GRAPH_SRC_SHAPES][GK_MAX_DIMS];
+};
+
+static void gk_cu_node_props_fill(struct gk_cu_node_props * p, const struct gk_tensor * t) {
+    // memset first so the padding and the unused slots compare equal.
+    memset(p, 0, sizeof(*p));
+
+    p->data  = t->data;
+    p->op    = (int32_t) t->op;
+    p->type  = (int32_t) t->type;
+    p->flags = t->flags;
+
+    memcpy(p->ne, t->ne, sizeof(p->ne));
+    memcpy(p->nb, t->nb, sizeof(p->nb));
+    memcpy(p->op_params, t->op_params, sizeof(p->op_params));
+
+    for (int s = 0; s < GK_MAX_SRC; ++s) {
+        const struct gk_tensor * src = t->src[s];
+        if (src == NULL) {
+            continue;
+        }
+        p->n_src       = s + 1;
+        p->src_data[s] = src->data;
+        p->src_type[s] = (int32_t) src->type;
+        if (s < GK_CU_GRAPH_SRC_SHAPES) {
+            memcpy(p->src_ne[s], src->ne, sizeof(p->src_ne[s]));
+            memcpy(p->src_nb[s], src->nb, sizeof(p->src_nb[s]));
+        }
+    }
+}
+
+struct gk_cu_graph_entry {
+    std::vector<gk_cu_node_props> props;
+    gkGraphExec_t exec   = NULL;
+    uint64_t      gen    = 0;     // scratch generation the capture baked in
+    uint64_t      tick   = 0;     // last use, for eviction
+    bool          broken = false; // capture failed once; do not retry this topology
+    bool          used   = false;
+};
+
+struct gk_cu_graph_cache {
+    gk_cu_graph_entry entries[GK_CU_GRAPH_CACHE];
+    std::vector<gk_cu_node_props> staging; // this call's props, reused across calls
+    uint64_t tick = 0;
+
+    // Replay timing, GK_CUDA_GRAPH_LOG=2 only: one event pair around the
+    // graph launch, harvested on a later call once the stream has moved past
+    // it. Two events per replayed *graph* is measurement; two per node, which
+    // is what GK_LAUNCH_PROFILE=2 does, distorts what it measures.
+    gkEvent_t tev0    = NULL;
+    gkEvent_t tev1    = NULL;
+    bool      armed   = false;
+    double    dev_ms  = 0.0;
+    int64_t   dev_n   = 0;
+};
+
+// What the lookup decided for this call.
+enum gk_cu_graph_action {
+    GK_CU_GRAPH_PLAIN,   // no match (or graphs off): launch normally
+    GK_CU_GRAPH_CAPTURE, // seen once before, identical: capture while launching
+    GK_CU_GRAPH_REPLAY,  // captured and still valid: launch the graph
+};
+
+static int64_t g_graph_replays  = 0;
+static int64_t g_graph_captures = 0;
+static int64_t g_graph_breaks   = 0;
+
+static void gk_cu_graph_log_dump(void) {
+    gk_logf("gk cuda graphs: %lld replays, %lld captures, %lld broken\n",
+            (long long) g_graph_replays, (long long) g_graph_captures,
+            (long long) g_graph_breaks);
+}
+
+static int gk_cu_graph_log_level(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GK_CUDA_GRAPH_LOG");
+        on = e == NULL || e[0] == '\0' || e[0] == '0' ? 0 : (e[0] == '2' ? 2 : 1);
+        if (on) {
+            atexit(gk_cu_graph_log_dump);
+        }
+    }
+    return on;
+}
+
+static bool gk_cu_graph_log_on(void) {
+    return gk_cu_graph_log_level() != 0;
+}
+
+static bool gk_cu_graphs_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GK_CUDA_GRAPHS");
+        bool v = !(e != NULL && e[0] == '0'); // default on
+
+        // The mat-mul diagnostics synchronize inside an op, which invalidates
+        // every capture; a run that asks for them has chosen measurement.
+        const char * s1 = getenv("GK_MM_SPLIT");
+        const char * s2 = getenv("GK_MM_FP4_STATS");
+        if ((s1 != NULL && s1[0] != '\0' && s1[0] != '0') ||
+            (s2 != NULL && s2[0] != '\0' && s2[0] != '0')) {
+            v = false;
+        }
+        on = v ? 1 : 0;
+    }
+    return on != 0;
+}
+
+// Why a candidate entry failed to match, for the log: the first differing
+// node and which of its recorded facts moved.
+static void gk_cu_graph_log_mismatch(const struct gk_cu_graph_entry * e,
+                                     struct gk_cgraph * graph,
+                                     const std::vector<gk_cu_node_props> & now) {
+    static int logged = 0;
+    if (logged >= (gk_cu_graph_log_level() >= 2 ? 4096 : 16)) {
+        return; // enough to see the pattern; a rolling mismatch would flood
+    }
+
+    for (size_t i = 0; i < now.size(); ++i) {
+        const struct gk_cu_node_props * a = &e->props[i];
+        const struct gk_cu_node_props * b = &now[i];
+        if (memcmp(a, b, sizeof(*a)) == 0) {
+            continue;
+        }
+
+        const char * what =
+            a->op != b->op || a->type != b->type          ? "op/type"    :
+            a->data != b->data                            ? "data ptr"   :
+            memcmp(a->ne, b->ne, sizeof(a->ne)) != 0      ? "shape"      :
+            memcmp(a->nb, b->nb, sizeof(a->nb)) != 0      ? "strides"    :
+            memcmp(a->op_params, b->op_params,
+                   sizeof(a->op_params)) != 0             ? "op params"  :
+            memcmp(a->src_data, b->src_data,
+                   sizeof(a->src_data)) != 0              ? "src ptr"    :
+            memcmp(a->src_ne, b->src_ne,
+                   sizeof(a->src_ne)) != 0                ? "src shape"  : "src strides";
+
+        gk_logf("gk cuda graphs: no replay, node %zu (%s, op %s) changed: %s (%p -> %p)\n",
+                i, gk_graph_node(graph, (int) i)->name,
+                gk_op_name((enum gk_op) b->op), what, a->data, b->data);
+        logged++;
+        return;
+    }
+}
+
+// Records or matches this call's graph. On a full match the entry comes back
+// with the action that fits its state; on a miss the topology is recorded
+// into the least-recently-used slot and the call runs plain.
+static enum gk_cu_graph_action gk_cu_graph_lookup(struct gk_cuda_backend_ctx * ctx,
+                                                  struct gk_cgraph * graph, int n,
+                                                  struct gk_cu_graph_entry ** out) {
+    *out = NULL;
+
+    if (ctx->graphs == NULL) {
+        ctx->graphs = new gk_cu_graph_cache();
+    }
+    struct gk_cu_graph_cache * gc = ctx->graphs;
+    gc->tick++;
+
+    // The health of the whole scheme in one recurring line: if replays are
+    // not the overwhelming share, the cache is thrashing and the log above
+    // says which node keeps moving.
+    if (gk_cu_graph_log_on() && gc->tick % 1024 == 0) {
+        gk_logf("gk cuda graphs: %s: %llu lookups, %lld replays, %lld captures, %lld broken\n",
+                ctx->dev->name, (unsigned long long) gc->tick,
+                (long long) g_graph_replays, (long long) g_graph_captures,
+                (long long) g_graph_breaks);
+    }
+
+    gc->staging.resize((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        gk_cu_node_props_fill(&gc->staging[(size_t) i], gk_graph_node(graph, i));
+    }
+
+    for (int k = 0; k < GK_CU_GRAPH_CACHE; ++k) {
+        struct gk_cu_graph_entry * e = &gc->entries[k];
+        if (!e->used || e->props.size() != (size_t) n) {
+            continue;
+        }
+        if (memcmp(e->props.data(), gc->staging.data(),
+                   (size_t) n * sizeof(gk_cu_node_props)) != 0) {
+            continue; // a stale sibling; only a full miss below is worth a log line
+        }
+
+        e->tick = gc->tick;
+        *out    = e;
+
+        if (e->broken) {
+            return GK_CU_GRAPH_PLAIN;
+        }
+        if (e->exec != NULL && e->gen == ctx->scratch.gen) {
+            return GK_CU_GRAPH_REPLAY;
+        }
+        if (e->exec != NULL) {
+            // The scratch moved since the capture, so the recorded launches
+            // point into freed memory. The grow already drained the stream;
+            // the sync here is against a launch of this very graph still in
+            // flight, and costs nothing when there is none.
+            GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
+            GK_CUDA_CHECK(gkGraphExecDestroy(e->exec));
+            e->exec = NULL;
+        }
+        return GK_CU_GRAPH_CAPTURE;
+    }
+
+    // Not seen before: remember it in the stalest slot. The log names the
+    // nearest miss - the first same-length entry's first differing node - so
+    // a graph that never replays says why.
+    if (gk_cu_graph_log_on()) {
+        for (int k = 0; k < GK_CU_GRAPH_CACHE; ++k) {
+            struct gk_cu_graph_entry * e = &gc->entries[k];
+            if (e->used && e->props.size() == (size_t) n) {
+                gk_cu_graph_log_mismatch(e, graph, gc->staging);
+                break;
+            }
+        }
+    }
+
+    struct gk_cu_graph_entry * victim = &gc->entries[0];
+    for (int k = 1; k < GK_CU_GRAPH_CACHE; ++k) {
+        struct gk_cu_graph_entry * e = &gc->entries[k];
+        if (!e->used) {
+            victim = e;
+            break;
+        }
+        if (e->tick < victim->tick) {
+            victim = e;
+        }
+    }
+    if (victim->exec != NULL) {
+        GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
+        GK_CUDA_CHECK(gkGraphExecDestroy(victim->exec));
+        victim->exec = NULL;
+    }
+    victim->props  = gc->staging;
+    victim->gen    = 0;
+    victim->tick   = gc->tick;
+    victim->broken = false;
+    victim->used   = true;
+
+    return GK_CU_GRAPH_PLAIN;
+}
+
+static void gk_cu_graph_cache_free(struct gk_cuda_backend_ctx * ctx) {
+    if (ctx->graphs == NULL) {
+        return;
+    }
+    // The caller has already drained the stream.
+    for (int k = 0; k < GK_CU_GRAPH_CACHE; ++k) {
+        if (ctx->graphs->entries[k].exec != NULL) {
+            GK_CUDA_CHECK(gkGraphExecDestroy(ctx->graphs->entries[k].exec));
+        }
+    }
+    if (ctx->graphs->tev0 != NULL) { GK_CUDA_CHECK(gkEventDestroy(ctx->graphs->tev0)); }
+    if (ctx->graphs->tev1 != NULL) { GK_CUDA_CHECK(gkEventDestroy(ctx->graphs->tev1)); }
+    delete ctx->graphs;
+    ctx->graphs = NULL;
+}
+
+// The bare launch loop: every node in order, geometry errors named as they
+// happen. This is what runs when nothing is being measured - directly, under
+// stream capture, and as the fallback when a capture goes wrong.
+static enum gk_status gk_cuda_launch_nodes(struct gk_cuda_backend_ctx * ctx,
+                                           struct gk_cgraph * graph, int n) {
+    for (int i = 0; i < n; ++i) {
+        struct gk_tensor * node = gk_graph_node(graph, i);
+
+        if (!gk_cuda_compute_op(ctx->stream, &ctx->scratch, node)) {
+            gk_logf("gk %s: no kernel for op %s (node %s)\n",
+                    GK_CUDA_BACKEND_NAME, gk_op_name(node->op), node->name);
+            return GK_STATUS_NO_STORAGE;
+        }
+
+        // A launch is rejected synchronously when its geometry is wrong, so
+        // the check belongs next to the launch that caused it. It is a
+        // host-side flag read, not a synchronization.
+        const gkError_t err = gkGetLastError();
+        if (err != gkSuccess) {
+            gk_logf("gk %s: %s (node %s, op %s, ne = [%lld %lld %lld %lld])\n",
+                    GK_CUDA_BACKEND_NAME, gkGetErrorString(err),
+                    node->name, gk_op_name(node->op),
+                    (long long) node->ne[0], (long long) node->ne[1],
+                    (long long) node->ne[2], (long long) node->ne[3]);
+            return GK_STATUS_NO_STORAGE;
+        }
+    }
+    return GK_STATUS_SUCCESS;
+}
+
+// The graph-aware compute path: replay when the recorded launches still hold,
+// capture when a topology proves it repeats, plain launches otherwise.
+static enum gk_status gk_cuda_compute_graphed(struct gk_cuda_backend_ctx * ctx,
+                                              struct gk_cgraph * graph, int n) {
+    struct gk_cu_graph_entry * ge = NULL;
+    enum gk_cu_graph_action action = GK_CU_GRAPH_PLAIN;
+
+    if (gk_cu_graphs_on() && n >= GK_CU_GRAPH_MIN_NODES) {
+        action = gk_cu_graph_lookup(ctx, graph, n, &ge);
+    }
+
+    if (action == GK_CU_GRAPH_REPLAY) {
+        struct gk_cu_graph_cache * gc = ctx->graphs;
+        const bool timing = gk_cu_graph_log_level() >= 2;
+        if (timing) {
+            if (gc->armed && gkEventQuery(gc->tev1) == gkSuccess) {
+                float ms = 0.0f;
+                if (gkEventElapsedTime(&ms, gc->tev0, gc->tev1) == gkSuccess) {
+                    gc->dev_ms += ms;
+                    gc->dev_n  += 1;
+                    if (gc->dev_n % 200 == 0) {
+                        gk_logf("gk cuda graphs: %s: device %.2f ms/graph over %lld replays\n",
+                                ctx->dev->name, gc->dev_ms / (double) gc->dev_n,
+                                (long long) gc->dev_n);
+                    }
+                }
+                gc->armed = false;
+            }
+            if (!gc->armed) {
+                if (gc->tev0 == NULL && gkEventCreate(&gc->tev0) != gkSuccess) { gc->tev0 = NULL; }
+                if (gc->tev1 == NULL && gkEventCreate(&gc->tev1) != gkSuccess) { gc->tev1 = NULL; }
+                if (gc->tev0 != NULL && gc->tev1 != NULL) {
+                    GK_CUDA_CHECK(gkEventRecord(gc->tev0, ctx->stream));
+                }
+            }
+        }
+        if (gkGraphLaunch(ge->exec, ctx->stream) == gkSuccess) {
+            if (timing && !gc->armed && gc->tev0 != NULL && gc->tev1 != NULL) {
+                GK_CUDA_CHECK(gkEventRecord(gc->tev1, ctx->stream));
+                gc->armed = true;
+            }
+            g_graph_replays++;
+            return GK_STATUS_SUCCESS;
+        }
+        // A replay refusing to launch is not a reason to fail the step;
+        // plain launches always work.
+        (void) gkGetLastError();
+        GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
+        GK_CUDA_CHECK(gkGraphExecDestroy(ge->exec));
+        ge->exec   = NULL;
+        ge->broken = true;
+        g_graph_breaks++;
+        action = GK_CU_GRAPH_PLAIN;
+    }
+
+    bool capturing = false;
+    if (action == GK_CU_GRAPH_CAPTURE) {
+        capturing = gkStreamBeginCapture(ctx->stream, gkStreamCaptureModeRelaxed) == gkSuccess;
+        if (!capturing) {
+            (void) gkGetLastError();
+            ge->broken = true;
+            g_graph_breaks++;
+        }
+    }
+
+    enum gk_status status = gk_cuda_launch_nodes(ctx, graph, n);
+
+    if (capturing) {
+        gkGraph_t g = NULL;
+        const gkError_t cerr = gkStreamEndCapture(ctx->stream, &g);
+
+        if (status != GK_STATUS_SUCCESS) {
+            // The loop failed mid-capture; nothing was executed and nothing
+            // will be. Fail the graph exactly as the plain path would.
+            if (g != NULL) {
+                GK_CUDA_CHECK(gkGraphDestroy(g));
+            }
+            ge->broken = true;
+            g_graph_breaks++;
+            return status;
+        }
+
+        gkGraphExec_t exec = NULL;
+        if (cerr == gkSuccess && g != NULL &&
+            gkGraphInstantiate(&exec, g) == gkSuccess && exec != NULL) {
+            ge->exec = exec;
+            ge->gen  = ctx->scratch.gen;
+            g_graph_captures++;
+            if (gk_cu_graph_log_on()) {
+                gk_logf("gk cuda graphs: captured %d nodes on %s\n", n, ctx->dev->name);
+            }
+        } else {
+            // An op synchronized or allocated mid-capture. Remember that this
+            // topology cannot be captured rather than paying the failed
+            // attempt again every round.
+            (void) gkGetLastError();
+            ge->broken = true;
+            g_graph_breaks++;
+            if (gk_cu_graph_log_on()) {
+                gk_logf("gk cuda graphs: capture failed (%s), staying on plain launches\n",
+                        cerr != gkSuccess ? gkGetErrorString(cerr) : "instantiate");
+            }
+        }
+        if (g != NULL) {
+            GK_CUDA_CHECK(gkGraphDestroy(g));
+        }
+
+        // Captured launches never executed: the work of this call still has
+        // to happen. Replay the fresh graph, or launch plain if it broke.
+        if (ge->exec != NULL && gkGraphLaunch(ge->exec, ctx->stream) == gkSuccess) {
+            g_graph_replays++;
+            return GK_STATUS_SUCCESS;
+        }
+        return gk_cuda_launch_nodes(ctx, graph, n);
+    }
+
+    return status;
+}
 
 static const char * gk_cuda_backend_name(gk_backend_t backend) {
     return ((struct gk_cuda_backend_ctx *) backend->context)->dev->name;
@@ -379,6 +837,7 @@ static void gk_cuda_backend_free(gk_backend_t backend) {
         GK_CUDA_CHECK(gkSetDevice(ctx->dev->index));
         GK_CUDA_CHECK(gkStreamSynchronize(ctx->stream));
         // After the wait, so nothing is still reading it.
+        gk_cu_graph_cache_free(ctx);
         if (ctx->scratch.ptr != NULL) {
             GK_CUDA_CHECK(gkFree(ctx->scratch.ptr));
         }
@@ -676,10 +1135,22 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
     const int  n    = gk_graph_n_nodes(graph);
     const bool prof = gk_cu_prof_on();
 
+    // A new execution: whatever activation the scratch held belongs to the
+    // previous graph's numbers.
+    ctx->scratch.pass++;
+
     // Deliberately not `prof`: the per-node profile synchronizes around every
     // launch, which is exactly the overlap this measurement is about. The two
     // are mutually exclusive and the launch one wins.
     const bool lprof = !prof && gk_cu_launch_prof_on();
+
+    // The unmeasured run - which is every production run - goes through the
+    // graph cache. The profiled paths below cannot: both synchronize inside
+    // the loop, which is meaningless under capture and worse under replay,
+    // where there are no per-node launches to measure at all.
+    if (!prof && !lprof) {
+        return gk_cuda_compute_graphed(ctx, graph, n);
+    }
 
     std::chrono::steady_clock::time_point lt0;
     const bool lev = lprof && g_launch_events;
@@ -754,6 +1225,12 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
         g_launch_wait_ms += std::chrono::duration<double, std::milli>(lt2 - lt1).count();
         g_launch_nodes   += n;
         g_launch_graphs  += 1;
+
+        // A server dies by taskkill, which skips atexit; a periodic dump is
+        // the only way the numbers ever reach the log there.
+        if (g_launch_graphs % 200 == 0) {
+            gk_cu_launch_prof_dump();
+        }
 
         if (lev && g_launch_events && n > 0) {
             // The stream is already drained, so every event has a timestamp.
@@ -899,8 +1376,15 @@ static gk_backend_t gk_cuda_device_init_backend(gk_device_t dev) {
     }
 
     ctx->dev          = d;
+    ctx->graphs       = NULL;
     ctx->scratch.ptr  = NULL;
     ctx->scratch.size = 0;
+    ctx->scratch.gen  = 0;
+    ctx->scratch.aq_src  = NULL;
+    ctx->scratch.aq_blk  = 0;
+    ctx->scratch.aq_grp  = 0;
+    ctx->scratch.aq_pass = 0;
+    ctx->scratch.pass    = 0;
     ctx->scratch.n_sm = d->n_sm;
     ctx->scratch.cc   = d->cc;
     ctx->scratch.smem_max = d->smem_max;
