@@ -818,6 +818,123 @@ static __global__ void gk_cu_k_norm(gk_tview a, gk_tview_mut d, int kind, float 
     }
 }
 
+// rms_norm and the weight multiply that always follows it, in one launch.
+// A transformer runs this pair four to six times per layer, and at decode
+// batch sizes both kernels are launch latency, not work: the pair costs two
+// fixed overheads for arithmetic that fits comfortably in one. The math is
+// the sequential pair's exactly, save one rounding: (x*scale)*w becomes
+// x*scale*w in a single expression.
+static __global__ void gk_cu_k_rms_norm_mul_f(const float * __restrict__ a,
+                                              const float * __restrict__ w,
+                                              float * __restrict__ d,
+                                              int64_t n4, float eps) {
+    __shared__ float scratch[GK_CU_NORM_BLOCK / GK_WARP_SIZE];
+
+    a += blockIdx.x * n4 * 4;
+    d += blockIdx.x * n4 * 4;
+
+    float sumsq = 0.0f;
+    for (int64_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = ((const float4 *) a)[i];
+        sumsq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    const float total = gk_cu_block_sum(sumsq, scratch);
+    const float scale = rsqrtf(total / (float) (n4 * 4) + eps);
+
+    for (int64_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v  = ((const float4 *) a)[i];
+        const float4 wv = ((const float4 *) w)[i];
+        ((float4 *) d)[i] = make_float4(v.x * scale * wv.x, v.y * scale * wv.y,
+                                        v.z * scale * wv.z, v.w * scale * wv.w);
+    }
+}
+
+// The residual step and the norm that reads it, in one launch. Unlike the
+// pair below, the add's output cannot be elided - it *is* the residual
+// stream, read again at the end of the block - so the kernel writes both
+// destinations: the sum, and the normalized-and-weighted sum.
+//
+// Everything here is flat float4 over contiguous f32 - the fusion plan only
+// approves that layout - because the first cut of these kernels went through
+// the generic per-element accessor and *lost* to the pairs they replaced:
+// six type switches and four-axis index math per element cost more than the
+// launch they saved. The weight is one row, shared by every block.
+//
+// No __restrict__ on the sum: the allocator is free to place it over one of
+// the addends, and the second pass reads the sum back rather than
+// recomputing it for exactly that reason. Each thread rereads only elements
+// it wrote itself, so the passes need no barrier between them.
+static __global__ void gk_cu_k_add_rms_norm_mul_f(const float * a, const float * b,
+                                                  const float * __restrict__ w,
+                                                  float * da, float * __restrict__ dm,
+                                                  int64_t n4, float eps) {
+    __shared__ float scratch[GK_CU_NORM_BLOCK / GK_WARP_SIZE];
+
+    a  += blockIdx.x * n4 * 4;
+    b  += blockIdx.x * n4 * 4;
+    da += blockIdx.x * n4 * 4;
+    dm += blockIdx.x * n4 * 4;
+
+    float sumsq = 0.0f;
+    for (int64_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 va = ((const float4 *) a)[i];
+        const float4 vb = ((const float4 *) b)[i];
+        const float4 s  = make_float4(va.x + vb.x, va.y + vb.y, va.z + vb.z, va.w + vb.w);
+        ((float4 *) da)[i] = s;
+        sumsq += s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w;
+    }
+    const float total = gk_cu_block_sum(sumsq, scratch);
+    const float scale = rsqrtf(total / (float) (n4 * 4) + eps);
+
+    for (int64_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 s  = ((const float4 *) da)[i];
+        const float4 wv = ((const float4 *) w)[i];
+        ((float4 *) dm)[i] = make_float4(s.x * scale * wv.x, s.y * scale * wv.y,
+                                         s.z * scale * wv.z, s.w * scale * wv.w);
+    }
+}
+
+void gk_cuda_fused_add_rms_mul(gkStream_t stream, const struct gk_tensor * add,
+                               const struct gk_tensor * norm, const struct gk_tensor * mul) {
+    const struct gk_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+    const int64_t rows = mul->ne[1] * mul->ne[2] * mul->ne[3];
+
+    if (rows <= 0 || mul->ne[0] <= 0) {
+        return; // zero-extent graphs are legal; zero-block launches are not
+    }
+
+    gk_cu_k_add_rms_norm_mul_f<<<(int) rows, GK_CU_NORM_BLOCK, 0, stream>>>(
+        (const float *) add->src[0]->data, (const float *) add->src[1]->data,
+        (const float *) w->data,
+        (float *) add->data, (float *) mul->data,
+        mul->ne[0] / 4, gk_get_op_params_f32(norm, 0));
+}
+
+// The backend's launch loop calls this for a (rms_norm, mul) pair its fusion
+// plan approved; the plan already checked ops, adjacency, single use and
+// shapes, so this only has to launch. `norm` supplies the input and eps,
+// `mul` supplies the weight and the destination; the norm's own output is
+// never written.
+void gk_cuda_fused_rms_mul(gkStream_t stream, const struct gk_tensor * norm,
+                           const struct gk_tensor * mul) {
+    const struct gk_tensor * a = norm->src[0];
+    const struct gk_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+    const int64_t rows = mul->ne[1] * mul->ne[2] * mul->ne[3];
+
+    // A zero-extent pair is a legal graph (the final norm over zero selected
+    // output rows, during warmup) and on a GPU an illegal launch, not a
+    // no-op; the per-op path has the same guard in its dispatcher.
+    if (rows <= 0 || mul->ne[0] <= 0) {
+        return;
+    }
+
+    gk_cu_k_rms_norm_mul_f<<<(int) rows, GK_CU_NORM_BLOCK, 0, stream>>>(
+        (const float *) a->data, (const float *) w->data, (float *) mul->data,
+        mul->ne[0] / 4, gk_get_op_params_f32(norm, 0));
+}
+
 // Group norm's statistic spans a group of channels and their whole spatial
 // extent, so the unit of work is a group rather than a row.
 // A group of a contiguous f32 tensor is a contiguous span: the groups partition

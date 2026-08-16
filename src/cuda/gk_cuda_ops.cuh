@@ -72,5 +72,15 @@ const char * gk_cuda_mm_last_path(void);
 void gk_cuda_fp4_stats(double * sq_err, double * sq_ref,
                        unsigned long long * zero_groups, unsigned long long * groups);
 void gk_cuda_mul_mat_id(gkStream_t stream, struct gk_tensor * dst);
+
+// Launches the fused (rms_norm, mul) pair the backend's fusion plan
+// approved: one kernel, writing only the mul's destination.
+void gk_cuda_fused_rms_mul(gkStream_t stream, const struct gk_tensor * norm,
+                           const struct gk_tensor * mul);
+
+// The three-op residual chain (add, rms_norm, mul): one kernel writing both
+// the add's and the mul's destinations.
+void gk_cuda_fused_add_rms_mul(gkStream_t stream, const struct gk_tensor * add,
+                               const struct gk_tensor * norm, const struct gk_tensor * mul);
 void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         struct gk_tensor * dst);

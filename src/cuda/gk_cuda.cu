@@ -27,7 +27,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <chrono>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 // Device memory is handed out in multiples of this. Coalesced loads want their
@@ -457,6 +460,28 @@ struct gk_cu_graph_entry {
     uint64_t      tick   = 0;     // last use, for eviction
     bool          broken = false; // capture failed once; do not retry this topology
     bool          used   = false;
+
+    // GK_CUDA_GRAPH_PROF only: event-record nodes captured *into* the graph
+    // every bucket_size launches, so a replay times itself. The events are
+    // re-recorded by every replay; the harvest on the next call reads the
+    // previous replay's timestamps. A few dozen events per graph is cheap
+    // enough to leave running; a pair per node (GK_LAUNCH_PROFILE=2) is not.
+    std::vector<gkEvent_t>   pev;
+    std::vector<double>      pms;    // accumulated ms per bucket
+    std::vector<std::string> plabel; // first node of each bucket, for the dump
+    int64_t                  pn = 0; // replays accumulated
+
+    void prof_reset() {
+        for (size_t i = 0; i < pev.size(); ++i) {
+            if (pev[i] != NULL) {
+                GK_CUDA_CHECK(gkEventDestroy(pev[i]));
+            }
+        }
+        pev.clear();
+        pms.clear();
+        plabel.clear();
+        pn = 0;
+    }
 };
 
 struct gk_cu_graph_cache {
@@ -653,6 +678,7 @@ static enum gk_cu_graph_action gk_cu_graph_lookup(struct gk_cuda_backend_ctx * c
         GK_CUDA_CHECK(gkGraphExecDestroy(victim->exec));
         victim->exec = NULL;
     }
+    victim->prof_reset();
     victim->props  = gc->staging;
     victim->gen    = 0;
     victim->tick   = gc->tick;
@@ -671,6 +697,7 @@ static void gk_cu_graph_cache_free(struct gk_cuda_backend_ctx * ctx) {
         if (ctx->graphs->entries[k].exec != NULL) {
             GK_CUDA_CHECK(gkGraphExecDestroy(ctx->graphs->entries[k].exec));
         }
+        ctx->graphs->entries[k].prof_reset();
     }
     if (ctx->graphs->tev0 != NULL) { GK_CUDA_CHECK(gkEventDestroy(ctx->graphs->tev0)); }
     if (ctx->graphs->tev1 != NULL) { GK_CUDA_CHECK(gkEventDestroy(ctx->graphs->tev1)); }
@@ -678,34 +705,289 @@ static void gk_cu_graph_cache_free(struct gk_cuda_backend_ctx * ctx) {
     ctx->graphs = NULL;
 }
 
-// The bare launch loop: every node in order, geometry errors named as they
-// happen. This is what runs when nothing is being measured - directly, under
-// stream capture, and as the fallback when a capture goes wrong.
-static enum gk_status gk_cuda_launch_nodes(struct gk_cuda_backend_ctx * ctx,
-                                           struct gk_cgraph * graph, int n) {
-    for (int i = 0; i < n; ++i) {
-        struct gk_tensor * node = gk_graph_node(graph, i);
+// One node: launch, and name a geometry rejection as it happens. The error
+// check is a host-side flag read, not a synchronization.
+static inline enum gk_status gk_cuda_launch_one(struct gk_cuda_backend_ctx * ctx,
+                                                struct gk_tensor * node) {
+    if (!gk_cuda_compute_op(ctx->stream, &ctx->scratch, node)) {
+        gk_logf("gk %s: no kernel for op %s (node %s)\n",
+                GK_CUDA_BACKEND_NAME, gk_op_name(node->op), node->name);
+        return GK_STATUS_NO_STORAGE;
+    }
 
-        if (!gk_cuda_compute_op(ctx->stream, &ctx->scratch, node)) {
-            gk_logf("gk %s: no kernel for op %s (node %s)\n",
-                    GK_CUDA_BACKEND_NAME, gk_op_name(node->op), node->name);
-            return GK_STATUS_NO_STORAGE;
-        }
-
-        // A launch is rejected synchronously when its geometry is wrong, so
-        // the check belongs next to the launch that caused it. It is a
-        // host-side flag read, not a synchronization.
-        const gkError_t err = gkGetLastError();
-        if (err != gkSuccess) {
-            gk_logf("gk %s: %s (node %s, op %s, ne = [%lld %lld %lld %lld])\n",
-                    GK_CUDA_BACKEND_NAME, gkGetErrorString(err),
-                    node->name, gk_op_name(node->op),
-                    (long long) node->ne[0], (long long) node->ne[1],
-                    (long long) node->ne[2], (long long) node->ne[3]);
-            return GK_STATUS_NO_STORAGE;
-        }
+    const gkError_t err = gkGetLastError();
+    if (err != gkSuccess) {
+        gk_logf("gk %s: %s (node %s, op %s, ne = [%lld %lld %lld %lld])\n",
+                GK_CUDA_BACKEND_NAME, gkGetErrorString(err),
+                node->name, gk_op_name(node->op),
+                (long long) node->ne[0], (long long) node->ne[1],
+                (long long) node->ne[2], (long long) node->ne[3]);
+        return GK_STATUS_NO_STORAGE;
     }
     return GK_STATUS_SUCCESS;
+}
+
+// --------------------------------------------------------------------------
+// fusion plan
+//
+// On this driver a kernel costs ~5-8 us of fixed replay latency whatever it
+// computes, so at decode shapes a transformer's (rms_norm, mul-by-weight)
+// pair - four to six of them per layer - is two overheads for one kernel's
+// worth of math. The plan marks each such pair; the launch loops below run
+// the fused kernel at the head and skip the tail.
+//
+// The conditions are checked here, once per launching pass, so the launcher
+// itself has nothing to decide: the mul must directly follow its norm,
+// consume it as one operand, be the norm's *only* consumer in this graph,
+// match its shape, and the norm must not be something the outside reads.
+// GK_CUDA_FUSE=0 turns the whole thing off.
+// --------------------------------------------------------------------------
+
+#define GK_CU_FUSE_NONE  0
+#define GK_CU_FUSE_HEAD  1 // fused (rms_norm, mul): covers this node and the next
+#define GK_CU_FUSE_SKIP  2 // covered by an earlier node's fused launch
+#define GK_CU_FUSE_HEAD3 3 // fused (add, rms_norm, mul): covers three nodes
+
+static bool gk_cu_fuse_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GK_CUDA_FUSE");
+        on = !(e != NULL && e[0] == '0');
+    }
+    return on != 0;
+}
+
+// Contiguous f32 with a vectorizable row: the only layout the fused kernels
+// speak. Anything else is launched unfused rather than fused slowly - the
+// first cut fused everything through the generic accessor and lost ~5% to
+// the very pairs it replaced.
+static bool gk_cu_fuse_flat(const struct gk_tensor * t) {
+    return t != NULL && (int) t->type == GK_TYPE_F32 && gk_is_contiguous(t) &&
+           t->ne[0] % 4 == 0;
+}
+
+// The norm weight: one contiguous f32 row matching the normed extent.
+static bool gk_cu_fuse_weight(const struct gk_tensor * w, int64_t ne0) {
+    return gk_cu_fuse_flat(w) && w->ne[0] == ne0 &&
+           w->ne[1] == 1 && w->ne[2] == 1 && w->ne[3] == 1;
+}
+
+static void gk_cu_fuse_plan(struct gk_cgraph * graph, int n, std::vector<uint8_t> & tag) {
+    tag.assign((size_t) n, GK_CU_FUSE_NONE);
+
+    if (!gk_cu_fuse_on()) {
+        return;
+    }
+
+    std::unordered_map<const struct gk_tensor *, int> uses;
+    uses.reserve((size_t) n * 2);
+    for (int i = 0; i < n; ++i) {
+        const struct gk_tensor * node = gk_graph_node(graph, i);
+        for (int s = 0; s < GK_MAX_SRC && node->src[s] != NULL; ++s) {
+            uses[node->src[s]]++;
+        }
+    }
+
+    for (int i = 0; i + 1 < n; ++i) {
+        struct gk_tensor * a = gk_graph_node(graph, i);
+        struct gk_tensor * b = gk_graph_node(graph, i + 1);
+
+        // The residual chain: add, then the norm that reads the sum, then
+        // the norm's weight. The add's output is still written - it is the
+        // residual stream and has other readers - so only the *norm's*
+        // consumers constrain anything.
+        if (i + 2 < n && a->op == GK_OP_ADD && b->op == GK_OP_RMS_NORM &&
+            b->src[0] == a) {
+            struct gk_tensor * c = gk_graph_node(graph, i + 2);
+
+            const bool same_abc =
+                b->ne[0] == a->ne[0] && b->ne[1] == a->ne[1] &&
+                b->ne[2] == a->ne[2] && b->ne[3] == a->ne[3] &&
+                c->ne[0] == a->ne[0] && c->ne[1] == a->ne[1] &&
+                c->ne[2] == a->ne[2] && c->ne[3] == a->ne[3];
+            const bool add_elementwise = // no broadcast: a residual never has one
+                a->src[0] != NULL && a->src[1] != NULL &&
+                a->src[0]->ne[0] == a->ne[0] && a->src[0]->ne[1] == a->ne[1] &&
+                a->src[0]->ne[2] == a->ne[2] && a->src[0]->ne[3] == a->ne[3] &&
+                a->src[1]->ne[0] == a->ne[0] && a->src[1]->ne[1] == a->ne[1] &&
+                a->src[1]->ne[2] == a->ne[2] && a->src[1]->ne[3] == a->ne[3];
+
+            if (c->op == GK_OP_MUL && (c->src[0] == b || c->src[1] == b) &&
+                uses[b] == 1 &&
+                (b->flags & (GK_TENSOR_FLAG_OUTPUT | GK_TENSOR_FLAG_INPUT)) == 0 &&
+                same_abc && add_elementwise &&
+                gk_cu_fuse_flat(a) && gk_cu_fuse_flat(c) &&
+                gk_cu_fuse_flat(a->src[0]) && gk_cu_fuse_flat(a->src[1]) &&
+                gk_cu_fuse_weight(c->src[0] == b ? c->src[1] : c->src[0], c->ne[0]) &&
+                (int) b->type == GK_TYPE_F32) {
+                tag[(size_t) i]     = GK_CU_FUSE_HEAD3;
+                tag[(size_t) i + 1] = GK_CU_FUSE_SKIP;
+                tag[(size_t) i + 2] = GK_CU_FUSE_SKIP;
+                i += 2;
+                continue;
+            }
+        }
+
+        if (a->op != GK_OP_RMS_NORM || b->op != GK_OP_MUL) {
+            continue;
+        }
+        if (b->src[0] != a && b->src[1] != a) {
+            continue;
+        }
+        if (uses[a] != 1 || (a->flags & (GK_TENSOR_FLAG_OUTPUT | GK_TENSOR_FLAG_INPUT)) != 0) {
+            continue;
+        }
+        // The fused kernel writes b with a's row statistics, so the two must
+        // agree on every extent; a mul that broadcasts the *norm* is not
+        // this pattern.
+        if (b->ne[0] != a->ne[0] || b->ne[1] != a->ne[1] ||
+            b->ne[2] != a->ne[2] || b->ne[3] != a->ne[3]) {
+            continue;
+        }
+        if ((int) a->type != GK_TYPE_F32 ||
+            !gk_cu_fuse_flat(b) || !gk_cu_fuse_flat(a->src[0]) ||
+            !gk_cu_fuse_weight(b->src[0] == a ? b->src[1] : b->src[0], b->ne[0])) {
+            continue;
+        }
+
+        tag[(size_t) i]     = GK_CU_FUSE_HEAD;
+        tag[(size_t) i + 1] = GK_CU_FUSE_SKIP;
+        ++i; // the pair is settled; the tail cannot head another pair
+    }
+}
+
+// The shared "launch node i under the plan" step: 0, 1 or 2 following nodes
+// are folded into this launch. Returns the number of nodes consumed, or 0 on
+// failure with the status in *st.
+static inline int gk_cu_launch_planned(struct gk_cuda_backend_ctx * ctx,
+                                       struct gk_cgraph * graph, int i,
+                                       uint8_t t, enum gk_status * st) {
+    *st = GK_STATUS_SUCCESS;
+
+    if (t == GK_CU_FUSE_HEAD || t == GK_CU_FUSE_HEAD3) {
+        if (t == GK_CU_FUSE_HEAD) {
+            gk_cuda_fused_rms_mul(ctx->stream, gk_graph_node(graph, i),
+                                  gk_graph_node(graph, i + 1));
+        } else {
+            gk_cuda_fused_add_rms_mul(ctx->stream, gk_graph_node(graph, i),
+                                      gk_graph_node(graph, i + 1),
+                                      gk_graph_node(graph, i + 2));
+        }
+        const gkError_t err = gkGetLastError();
+        if (err != gkSuccess) {
+            gk_logf("gk %s: %s (fused chain at node %d)\n",
+                    GK_CUDA_BACKEND_NAME, gkGetErrorString(err), i);
+            *st = GK_STATUS_NO_STORAGE;
+            return 0;
+        }
+        return t == GK_CU_FUSE_HEAD ? 2 : 3;
+    }
+
+    *st = gk_cuda_launch_one(ctx, gk_graph_node(graph, i));
+    return *st == GK_STATUS_SUCCESS ? 1 : 0;
+}
+
+// The bare launch loop: every node in order, fused pairs as one. This is
+// what runs when nothing is being measured - directly, under stream capture,
+// and as the fallback when a capture goes wrong.
+static enum gk_status gk_cuda_launch_nodes(struct gk_cuda_backend_ctx * ctx,
+                                           struct gk_cgraph * graph, int n) {
+    std::vector<uint8_t> tag;
+    gk_cu_fuse_plan(graph, n, tag);
+
+    int i = 0;
+    while (i < n) {
+        enum gk_status st;
+        const int took = gk_cu_launch_planned(ctx, graph, i, tag[(size_t) i], &st);
+        if (took == 0) {
+            return st;
+        }
+        i += took;
+    }
+    return GK_STATUS_SUCCESS;
+}
+
+// GK_CUDA_GRAPH_PROF=N: bucket size for the replay-time profile, 0 = off.
+static int gk_cu_graph_prof_bucket(void) {
+    static int b = -1;
+    if (b < 0) {
+        const char * e = getenv("GK_CUDA_GRAPH_PROF");
+        b = 0;
+        if (e != NULL && e[0] != '\0') {
+            const long v = strtol(e, NULL, 10);
+            b = v > 0 ? (int) v : (v != 0 ? 32 : 0);
+        }
+    }
+    return b;
+}
+
+// The same loop with an event dropped every `bucket` launches, used only
+// under capture: the events become nodes of the graph and every replay
+// re-times itself. The harvest lives in the replay path.
+// A plain event record captured into a graph becomes an *internal* node:
+// executing it signals the event but leaves no timestamp, and ElapsedTime on
+// it answers cudaErrorInvalidValue. The `external` flavor is the one whose
+// replays behave like real records, timestamps included.
+static inline gkError_t gk_cu_event_record_ext(gkEvent_t ev, gkStream_t stream) {
+#if defined(GK_USE_HIP)
+    return hipEventRecord(ev, stream); // no external flavor; prof stays CUDA-only
+#else
+    return cudaEventRecordWithFlags(ev, stream, cudaEventRecordExternal);
+#endif
+}
+
+static enum gk_status gk_cuda_launch_nodes_bucketed(struct gk_cuda_backend_ctx * ctx,
+                                                    struct gk_cgraph * graph, int n,
+                                                    struct gk_cu_graph_entry * ge, int bucket) {
+    std::vector<uint8_t> tag;
+    gk_cu_fuse_plan(graph, n, tag);
+
+    GK_CUDA_CHECK(gk_cu_event_record_ext(ge->pev[0], ctx->stream));
+    int i = 0;
+    while (i < n) {
+        enum gk_status st;
+        const int took = gk_cu_launch_planned(ctx, graph, i, tag[(size_t) i], &st);
+        if (took == 0) {
+            return st;
+        }
+        // Record every boundary the fused step crossed, so the event count
+        // and indexing stay exactly the unfused loop's.
+        for (int j = i; j < i + took; ++j) {
+            if ((j + 1) % bucket == 0 || j + 1 == n) {
+                GK_CUDA_CHECK(gk_cu_event_record_ext(ge->pev[(size_t) (j / bucket) + 1], ctx->stream));
+            }
+        }
+        i += took;
+    }
+    return GK_STATUS_SUCCESS;
+}
+
+static void gk_cu_graph_prof_dump(struct gk_cuda_backend_ctx * ctx,
+                                  struct gk_cu_graph_entry * ge) {
+    const size_t nb = ge->pms.size();
+
+    double total = 0.0;
+    for (size_t k = 0; k < nb; ++k) {
+        total += ge->pms[k];
+    }
+
+    std::vector<size_t> order(nb);
+    for (size_t k = 0; k < nb; ++k) {
+        order[k] = k;
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b2) {
+        return ge->pms[a] > ge->pms[b2];
+    });
+
+    gk_logf("gk cuda graph prof: %s: %.2f ms/graph over %lld replays, hottest buckets:\n",
+            ctx->dev->name, total / (double) ge->pn, (long long) ge->pn);
+    for (size_t r = 0; r < nb && r < 20; ++r) {
+        const size_t k = order[r];
+        gk_logf("  %8.1f us  %4.1f%%  %s\n",
+                1000.0 * ge->pms[k] / (double) ge->pn,
+                total > 0.0 ? 100.0 * ge->pms[k] / total : 0.0,
+                ge->plabel[k].c_str());
+    }
 }
 
 // The graph-aware compute path: replay when the recorded launches still hold,
@@ -721,6 +1003,44 @@ static enum gk_status gk_cuda_compute_graphed(struct gk_cuda_backend_ctx * ctx,
 
     if (action == GK_CU_GRAPH_REPLAY) {
         struct gk_cu_graph_cache * gc = ctx->graphs;
+
+        // Harvest the previous replay's bucket events before this launch
+        // re-records them. The stream has been synchronized since (the
+        // engine reads the logits between tokens), so a completed last event
+        // means every timestamp is in place.
+        if (gk_cu_graph_prof_bucket() > 0 && gk_cu_graph_log_on()) {
+            static int64_t seen = 0;
+            if (++seen % 100 == 0 && !ge->pev.empty()) {
+                float ms = -1.0f;
+                const gkError_t eerr = gkEventElapsedTime(&ms, ge->pev[0], ge->pev.back());
+                gk_logf("gk cuda graph prof: guard: pev=%zu qback=%d elapsed=%d %.3f ms pn=%lld\n",
+                        ge->pev.size(), (int) gkEventQuery(ge->pev.back()),
+                        (int) eerr, ms, (long long) ge->pn);
+            }
+        }
+        // A graph-recorded event does not answer cudaEventQuery the way a
+        // stream-recorded one does; whether its timestamps are usable is
+        // asked of ElapsedTime directly. The engine synchronizes between
+        // tokens, so by the next call the previous replay has fully retired.
+        if (!ge->pev.empty()) {
+            float span = 0.0f;
+            if (gkEventElapsedTime(&span, ge->pev[0], ge->pev.back()) == gkSuccess) {
+            for (size_t k = 0; k + 1 < ge->pev.size(); ++k) {
+                float ms = 0.0f;
+                if (gkEventElapsedTime(&ms, ge->pev[k], ge->pev[k + 1]) == gkSuccess) {
+                    ge->pms[k] += ms;
+                }
+            }
+            ge->pn++;
+            // Replays spread across several sibling entries (the compute
+            // buffer rotates through a handful of base addresses), so any
+            // one entry accumulates slowly; dump early rather than never.
+            if (ge->pn % 40 == 0) {
+                gk_cu_graph_prof_dump(ctx, ge);
+            }
+            }
+        }
+
         const bool timing = gk_cu_graph_log_level() >= 2;
         if (timing) {
             if (gc->armed && gkEventQuery(gc->tev1) == gkSuccess) {
@@ -764,7 +1084,40 @@ static enum gk_status gk_cuda_compute_graphed(struct gk_cuda_backend_ctx * ctx,
     }
 
     bool capturing = false;
+    int  pbucket   = 0;
     if (action == GK_CU_GRAPH_CAPTURE) {
+        // Whatever events a previous capture recorded belong to a graph that
+        // is about to be replaced; a stale set would harvest frozen
+        // timestamps forever.
+        ge->prof_reset();
+
+        // The profile's events have to exist before capture starts; their
+        // records become nodes of the graph being recorded.
+        pbucket = gk_cu_graph_prof_bucket();
+        if (pbucket > 0) {
+            const size_t nb = (size_t) ((n + pbucket - 1) / pbucket) + 1;
+            ge->pev.assign(nb, NULL);
+            for (size_t k = 0; k < nb; ++k) {
+                if (gkEventCreate(&ge->pev[k]) != gkSuccess) {
+                    ge->pev[k] = NULL;
+                    ge->prof_reset();
+                    pbucket = 0;
+                    break;
+                }
+            }
+            if (pbucket > 0) {
+                ge->pms.assign(nb - 1, 0.0);
+                ge->plabel.resize(nb - 1);
+                for (size_t k = 0; k + 1 < nb; ++k) {
+                    const struct gk_tensor * first = gk_graph_node(graph, (int) k * pbucket);
+                    char buf[160];
+                    snprintf(buf, sizeof(buf), "nodes %5d.. %s (%s)",
+                             (int) k * pbucket, first->name, gk_op_name(first->op));
+                    ge->plabel[k] = buf;
+                }
+            }
+        }
+
         capturing = gkStreamBeginCapture(ctx->stream, gkStreamCaptureModeRelaxed) == gkSuccess;
         if (!capturing) {
             (void) gkGetLastError();
@@ -773,7 +1126,9 @@ static enum gk_status gk_cuda_compute_graphed(struct gk_cuda_backend_ctx * ctx,
         }
     }
 
-    enum gk_status status = gk_cuda_launch_nodes(ctx, graph, n);
+    enum gk_status status = capturing && pbucket > 0
+        ? gk_cuda_launch_nodes_bucketed(ctx, graph, n, ge, pbucket)
+        : gk_cuda_launch_nodes(ctx, graph, n);
 
     if (capturing) {
         gkGraph_t g = NULL;
@@ -797,7 +1152,31 @@ static enum gk_status gk_cuda_compute_graphed(struct gk_cuda_backend_ctx * ctx,
             ge->gen  = ctx->scratch.gen;
             g_graph_captures++;
             if (gk_cu_graph_log_on()) {
-                gk_logf("gk cuda graphs: captured %d nodes on %s\n", n, ctx->dev->name);
+                // How many *CUDA* nodes the capture actually produced - the
+                // kernels (views launch nothing, mat-vecs launch two) plus
+                // any profiling event nodes. Per-kernel replay cost is the
+                // graph's device time over this, not over the gk node count.
+                size_t n_cuda = 0;
+#if defined(GK_USE_HIP)
+                (void) hipGraphGetNodes(g, NULL, &n_cuda);
+#else
+                (void) cudaGraphGetNodes(g, NULL, &n_cuda);
+#endif
+                gk_logf("gk cuda graphs: captured %d gk nodes -> %zu cuda nodes on %s\n",
+                        n, n_cuda, ctx->dev->name);
+
+                // The composition, because at ~8 us of fixed cost per kernel
+                // on this driver the op mix IS the time: what to fuse or
+                // batch is read straight off this table.
+                int op_count[GK_OP_COUNT] = { 0 };
+                for (int i = 0; i < n; ++i) {
+                    op_count[(int) gk_graph_node(graph, i)->op]++;
+                }
+                for (int o = 0; o < GK_OP_COUNT; ++o) {
+                    if (op_count[o] > 0) {
+                        gk_logf("    %4d x %s\n", op_count[o], gk_op_name((enum gk_op) o));
+                    }
+                }
             }
         } else {
             // An op synchronized or allocated mid-capture. Remember that this
