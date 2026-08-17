@@ -966,6 +966,8 @@ static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_split_scale(
            TYPE == GKT_IQ2_S  || TYPE == GKT_IQ1_M  ||
            // A 4-bit scale *and* a 4-bit minimum per sixteen elements.
            TYPE == GKT_Q2_K   ||
+           // A 6-bit scale per sixteen, with the shared -4 riding the offset.
+           TYPE == GKT_Q3_K   ||
            // A ue4m3 scale per sixteen.
            TYPE == GKT_NVFP4;
 }
@@ -977,17 +979,23 @@ static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_dp4a() {
            // A scale per sixteen rather than per thirty-two; see
            // gk_cu_has_split_scale.
            TYPE == GKT_Q6_K || TYPE == GKT_IQ2_S ||
+           // q3_K's codes are three bits once the inverted high-bit plane is
+           // folded in, and its uniform -4 is an offset exactly as q4_0's -8.
+           TYPE == GKT_Q3_K ||
            // The lattice formats whose scale covers a whole 32-element group.
            // Their magnitudes are small integers (43 at the largest, 62 for
            // iq3_xxs) and the sign mask is a negation, so a grid entry *is* an
            // int8 fragment once the signs are folded in - which is what this
            // path wants and what the float decoder was throwing away.
            //
-           // iq2_xs, iq2_s and iq1_m are the ones missing: their scale changes
-           // every sixteen elements, and one scale per group is the contract
-           // gk_cu_wblk32 has with the kernels that call it. iq1_s is missing
-           // for a different reason - its values carry a per-group offset that
-           // is not an integer, so folding it into the codes is not available.
+           // iq2_xs rides the split-scale drain exactly as iq2_s does. iq1_m's
+           // per-eight delta of an eighth is not a per-16 term, but times
+           // eight every value is the integer 8*grid ± 1, and the eighth moves
+           // into the scale - so its codes are int8 fragments after all.
+           // iq1_s could ride the same trick and simply has not needed to.
+           TYPE == GKT_IQ2_XS || TYPE == GKT_IQ1_M ||
+           // A codebook of int8 values with a 6-bit scale per group.
+           TYPE == GKT_IQ4_XS ||
            TYPE == GKT_IQ2_XXS || TYPE == GKT_IQ3_XXS || TYPE == GKT_IQ3_S ||
            // q5_K is q4_K plus a high-bit plane, exactly as q6_K's codes are
            // its nibbles plus two bits of qh; q2_K rides the split-scale
@@ -1180,6 +1188,153 @@ static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t
             scale[h] = gk_cu_ue4m3(blk[s0 + h]);
         }
 
+        offset[0] = offset[1] = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_Q3_K) {
+        // A group's 2-bit codes are one shift of thirty-two consecutive qs
+        // bytes, and its high bits one shift of the thirty-two hmask bytes -
+        // stored inverted, a set bit meaning "do not subtract 4". Folding the
+        // plane in gives codes 0..7 and the uniform -4 becomes the offset.
+        const uint8_t * blk = row + (g / 8) * (GK_QK / 8 + GK_QK / 4 + 12 + 2);
+        const int       sub = (int) (g % 8);
+
+        const uint8_t * hmask  = blk;
+        const uint8_t * qs     = blk + GK_QK / 8 + (sub / 4) * 32;
+        const uint8_t * scales = blk + GK_QK / 8 + GK_QK / 4;
+
+        const int shift = 2 * (sub % 4);
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int lw = gk_cu_int_b2(qs, i);
+            const int hw = gk_cu_int_b2(hmask, i);
+            codes[i] = ((lw >> shift) & 0x03030303) |
+                       (((hw >> sub) & 0x01010101) << 2);
+        }
+
+        const float d = gk_cu_h2f(blk + GK_QK / 8 + GK_QK / 4 + 12);
+
+        // the sixteen 6-bit scales: low nibbles in the first eight bytes, high
+        // two bits packed two at a time into the last four
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int gs   = (sub / 4) * 8 + (sub % 4) * 2 + h;
+            const int low  = gs < 8 ? (scales[gs] & 0xf) : (scales[gs - 8] >> 4);
+            const int high = (scales[8 + (gs % 4)] >> (2 * (gs / 4))) & 3;
+            scale [h] = d * (float) ((low | (high << 4)) - 32);
+            offset[h] = -4.0f * scale[h];
+        }
+        return;
+    }
+
+    if (TYPE == GKT_IQ4_XS) {
+        // A codebook of sixteen int8 values with a 6-bit scale per group. The
+        // codebook lives in two 64-bit immediates rather than the __constant__
+        // table the float decoder uses: sixteen lanes looking up sixteen
+        // different indices serialize constant memory, and a register shift
+        // does not (the same lesson the e2m1 table taught at fp4).
+        const uint8_t * blk = row + (g / 8) * (4 + GK_QK / 64 + GK_QK / 2);
+        const int       sub = (int) (g % 8);
+
+        const int ls = ((blk[4 + sub / 2] >> (4 * (sub % 2))) & 0xf) |
+                       ((((uint32_t) blk[2] | ((uint32_t) blk[3] << 8)) >> (2 * sub)) & 3) << 4;
+
+        const uint8_t * qs = blk + 4 + GK_QK / 64 + sub * 16;
+
+        // {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113}, a byte each
+        const uint64_t tab_lo = 0xf6eaddcfbfad9881ull;
+        const uint64_t tab_hi = 0x7159453526190d01ull;
+
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            uint32_t w = 0;
+#pragma unroll
+            for (int b4 = 0; b4 < 4; ++b4) {
+                const int j    = 4 * i + b4;
+                const int code = j < 16 ? (qs[j] & 0xf) : (qs[j - 16] >> 4);
+                const uint64_t half = (code < 8) ? tab_lo : tab_hi;
+                w |= (uint32_t) ((uint8_t) (half >> (8 * (code % 8)))) << (8 * b4);
+            }
+            codes[i] = (int) w;
+        }
+
+        scale [0] = scale [1] = gk_cu_h2f(blk) * (float) (ls - 32);
+        offset[0] = offset[1] = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_IQ2_XS) {
+        // As iq2_s, with the grid index and sign mask sharing one 16-bit word
+        // and the scale nibble changing per sixteen.
+        const uint8_t * blk    = row + (g / 8) * (2 + GK_QK / 4 + GK_QK / 32);
+        const int       sub    = (int) (g % 8);
+        const uint8_t * scales = blk + 2 + GK_QK / 4;
+
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const uint16_t q   = ((const uint16_t *) (blk + 2))[4 * sub + e];
+            const uint64_t ent = gk_cu_grid_iq2_xs[q & 511];
+            const uint8_t  sg  = gk_cu_sign_mask((uint8_t) (q >> 9));
+
+            codes[2 * e + 0] = gk_cu_signed_bytes((uint32_t) (ent >>  0), sg);
+            codes[2 * e + 1] = gk_cu_signed_bytes((uint32_t) (ent >> 32), (uint8_t) (sg >> 4));
+        }
+
+        const float d = gk_cu_h2f(blk);
+        scale [0] = d * (0.5f + (float) (scales[sub] & 0xf)) * 0.25f;
+        scale [1] = d * (0.5f + (float) (scales[sub] >>  4)) * 0.25f;
+        offset[0] = offset[1] = 0.0f;
+        return;
+    }
+
+    if (TYPE == GKT_IQ1_M) {
+        // Ternary grid values with a per-eight delta of an eighth. Times
+        // eight, a value is the integer 8*grid ± 1, and the eighth folds into
+        // the scale - see gk_cu_dq_iq1_m for the field layout, including the
+        // block scale spread over the top nibbles of the scale words.
+        const uint8_t * blk    = row + (g / 8) * (GK_QK / 8 + GK_QK / 16 + GK_QK / 32);
+        const int       sub    = (int) (g % 8);
+        const uint8_t * qs     = blk;
+        const uint8_t * qh     = blk + GK_QK / 8;
+        const uint8_t * scales = qh + GK_QK / 16;
+
+        uint16_t sc[4];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            sc[w] = (uint16_t) ((uint16_t) scales[2 * w] | ((uint16_t) scales[2 * w + 1] << 8));
+        }
+        const uint16_t dh = (uint16_t) ((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                        ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+        const float d8 = 0.125f * gk_cu_h2f((const uint8_t *) &dh);
+
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const uint8_t h   = qh[2 * sub + e / 2];
+            const int     hs  = 4 * (e % 2);
+            const int     idx = qs[4 * sub + e] | (int) (((h >> hs) & 7) << 8);
+            const int     dlt = (h & (0x08u << hs)) ? -1 : 1;
+
+            const uint64_t ent = gk_cu_grid_iq1[idx];
+#pragma unroll
+            for (int w = 0; w < 2; ++w) {
+                uint32_t cw = 0;
+#pragma unroll
+                for (int b4 = 0; b4 < 4; ++b4) {
+                    const int8_t v = (int8_t) ((uint8_t) (ent >> (8 * (4 * w + b4))));
+                    cw |= (uint32_t) ((uint8_t) (8 * v + dlt)) << (8 * b4);
+                }
+                codes[2 * e + w] = (int) cw;
+            }
+        }
+
+        // two 3-bit scales per group, one per half
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int shift = 6 * (sub % 2) + 3 * h;
+            scale[h] = d8 * (float) (2 * ((sc[sub / 2] >> shift) & 7) + 1);
+        }
         offset[0] = offset[1] = 0.0f;
         return;
     }

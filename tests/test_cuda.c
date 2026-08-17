@@ -535,6 +535,39 @@ static struct gk_tensor * build_gdn_seqs(struct gk_ctx * ctx, struct gk_tensor *
     return gdn_common(ctx, in, n_in, 32, 2, 5, 2, true, 1);
 }
 
+// The layout the delta-net graphs actually hand in: S = 128 like Qwen3-Next,
+// and v a strided slice of the fused qkv projection rather than its own
+// tensor. Snapshots on top, so the register form's slot writes are covered at
+// full width too.
+static struct gk_tensor * build_gdn_strided(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t S = 128, H = 2, T = 5, n_seqs = 1;
+    const int64_t qkv = 3 * S * H + 32; // wider than the slices it carries
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, S, H, T, n_seqs);        // q
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, S, H, T, n_seqs);        // k
+    in[2] = gk_new_tensor_3d(ctx, GK_TYPE_F32, qkv, T, n_seqs);         // fused projection
+    in[3] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 1, H, T, n_seqs);        // gate
+    in[4] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 1, H, T, n_seqs);        // beta
+    in[5] = gk_new_tensor_4d(ctx, GK_TYPE_F32, S, S, H, n_seqs);        // state
+    *n_in = 6;
+    struct gk_tensor * v = gk_view_4d(ctx, in[2], S, H, T, n_seqs,
+        S * sizeof(float),                  // heads packed inside the slice
+        qkv * sizeof(float),                // token stride is the full projection
+        (size_t) qkv * T * sizeof(float),
+        2 * S * H * sizeof(float));         // v sits after q and k
+    return gk_gated_delta_net(ctx, in[0], in[1], v, in[3], in[4], in[5], 2);
+}
+
+// A width off every power of two, so the generic fallback kernel keeps its
+// own coverage now that the ordinary widths take the register form.
+static struct gk_tensor * build_gdn_odd(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return gdn_common(ctx, in, n_in, 48, 2, 4, 1, false, 1);
+}
+
+// The per-channel gate at the register form's full width.
+static struct gk_tensor * build_gdn_kda_wide(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return gdn_common(ctx, in, n_in, 64, 2, 5, 1, true, 1);
+}
+
 // The padding, reduction and scan kernels. The shapes here are chosen to land
 // off every boundary the implementations care about: a row that is not a
 // multiple of the scan's chunk, a pad wider than a warp, a reduction row that
@@ -949,7 +982,21 @@ static int run_lattice_exact(gk_backend_t gpu, const char * name, enum gk_type t
     }
     for (size_t off = 0; off + blk_bytes <= enc_bytes; off += blk_bytes) {
         const uint16_t d_bits = 0x2E66; // 0.05 in f16
-        memcpy(eb + off, &d_bits, sizeof(d_bits));
+        if (type == GK_TYPE_IQ1_M) {
+            // the one lattice block whose scale is not a leading f16: it is
+            // spread over the top nibble of each of the four scale words, so
+            // pin those nibbles instead
+            uint8_t * s = eb + off + 48; // past qs (32) and qh (16)
+            for (int w = 0; w < 4; ++w) {
+                const uint8_t nib = (uint8_t) ((d_bits >> (4 * w)) & 0xf);
+                s[2 * w + 1] = (uint8_t) ((s[2 * w + 1] & 0x0f) | (nib << 4));
+            }
+        } else if (type == GK_TYPE_Q3_K) {
+            // q3_K trails its f16 scale rather than leading with it
+            memcpy(eb + off + 108, &d_bits, sizeof(d_bits));
+        } else {
+            memcpy(eb + off, &d_bits, sizeof(d_bits));
+        }
     }
 
     const struct gk_type_traits * tr = gk_get_type_traits(type);
@@ -1084,6 +1131,41 @@ static struct gk_tensor * build_mmq_iq3_s(struct gk_ctx * ctx, struct gk_tensor 
 
 static struct gk_tensor * build_mmv_iq3_s(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     return mmq_case(ctx, in, n_in, GK_TYPE_IQ3_S, 512, 700, 1);
+}
+
+// q3_K and iq4_xs on the integer path. Encoders need no importances, so the
+// CPU comparison is sound; both shapes reach the tile and the mat-vec, and the
+// deep ones make the group-to-super-block indexing cross many boundaries.
+static struct gk_tensor * build_mmq_q3_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q3_K, 512, 700, 70);
+}
+
+static struct gk_tensor * build_mmv_q3_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q3_K, 512, 700, 1);
+}
+
+static struct gk_tensor * build_mmq_q3_K_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q3_K, 6656, 1024, 50);
+}
+
+static struct gk_tensor * build_mmv_q3_K_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q3_K, 6656, 1024, 1);
+}
+
+static struct gk_tensor * build_mmq_iq4_xs(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ4_XS, 512, 700, 70);
+}
+
+static struct gk_tensor * build_mmv_iq4_xs(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ4_XS, 512, 700, 1);
+}
+
+static struct gk_tensor * build_mmq_iq4_xs_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ4_XS, 6656, 1024, 50);
+}
+
+static struct gk_tensor * build_mmv_iq4_xs_deep(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_IQ4_XS, 6656, 1024, 1);
 }
 
 // Eight columns: still short of the tiled path, but past the point where the
@@ -2180,6 +2262,9 @@ int main(void) {
     failures += run_op(gpu, "gdn kda",        build_gdn_kda);
     failures += run_op(gpu, "gdn snapshots",  build_gdn_snapshots);
     failures += run_op(gpu, "gdn seqs",       build_gdn_seqs);
+    failures += run_op(gpu, "gdn strided",    build_gdn_strided);
+    failures += run_op(gpu, "gdn odd",        build_gdn_odd);
+    failures += run_op(gpu, "gdn kda wide",   build_gdn_kda_wide);
 
     printf("padding, reductions and the scan:\n");
     failures += run_op(gpu, "pad_reflect_1d", build_pad_reflect_1d);
@@ -2259,7 +2344,12 @@ int main(void) {
     failures += run_op_tol(gpu, "mmv q6_K",      build_mmv_q6_K,     8e-2f);
     failures += run_op_tol(gpu, "mmv q6_K 1sb",  build_mmv_q6_K_1sb, 8e-2f);
 
-    failures += run_op_tol(gpu, "mmq iq2_s deep", build_mmq_iq2_s_deep, 8e-2f);
+    // The deep mmq bounds are looser than the shallow ones: at k = 6656 the
+    // CPU reference's per-256 activation scales cost ~0.1 relative on outputs
+    // near zero, and the kernel's own exactness is what run_lattice_exact
+    // establishes below - these only check the encoder round-trip still lands
+    // in the right place.
+    failures += run_op_tol(gpu, "mmq iq2_s deep", build_mmq_iq2_s_deep, 2e-1f);
     failures += run_op_tol(gpu, "mmv iq2_s deep", build_mmv_iq2_s_deep, 8e-2f);
     failures += run_op_tol(gpu, "mmq q6_K deep", build_mmq_q6_K_deep, 8e-2f);
     failures += run_op_tol(gpu, "mmv q6_K deep", build_mmv_q6_K_deep, 8e-2f);
@@ -2268,6 +2358,18 @@ int main(void) {
     failures += run_op_tol(gpu, "mmv iq3_xxs",   build_mmv_iq3_xxs,  8e-2f);
     failures += run_op_tol(gpu, "mmq iq3_s",     build_mmq_iq3_s,    8e-2f);
     failures += run_op_tol(gpu, "mmv iq3_s",     build_mmv_iq3_s,    8e-2f);
+
+    // q3_K and iq4_xs at the loose bound and for the same reason as q4_K: the
+    // CPU reference dots them against Q8_K activations, one scale per 256,
+    // while the device carries one per 32.
+    failures += run_op_tol(gpu, "mmq q3_K",      build_mmq_q3_K,      8e-2f);
+    failures += run_op_tol(gpu, "mmv q3_K",      build_mmv_q3_K,      8e-2f);
+    failures += run_op_tol(gpu, "mmq q3_K deep", build_mmq_q3_K_deep, 2e-1f);
+    failures += run_op_tol(gpu, "mmv q3_K deep", build_mmv_q3_K_deep, 8e-2f);
+    failures += run_op_tol(gpu, "mmq iq4_xs",    build_mmq_iq4_xs,    8e-2f);
+    failures += run_op_tol(gpu, "mmv iq4_xs",    build_mmv_iq4_xs,    8e-2f);
+    failures += run_op_tol(gpu, "mmq iq4_xs deep", build_mmq_iq4_xs_deep, 2e-1f);
+    failures += run_op_tol(gpu, "mmv iq4_xs deep", build_mmv_iq4_xs_deep, 8e-2f);
 
     // All three against an exact reference, which is the only way iq2_xxs can
     // be checked at all - and the shapes are chosen to reach both kernels: 700
@@ -2285,13 +2387,23 @@ int main(void) {
     failures += run_lattice_exact(gpu, "iq2_s mmq",    GK_TYPE_IQ2_S,   512, 700, 70);
     failures += run_lattice_exact(gpu, "iq2_s mmv",    GK_TYPE_IQ2_S,   512, 700,  1);
     failures += run_lattice_exact(gpu, "iq2_s f32",    GK_TYPE_IQ2_S,   512, 300,  1);
-    failures += run_lattice_exact(gpu, "iq2_xs f32",   GK_TYPE_IQ2_XS,  512, 700, 70);
+    failures += run_lattice_exact(gpu, "iq2_xs mmq",   GK_TYPE_IQ2_XS,  512, 700, 70);
+    failures += run_lattice_exact(gpu, "iq2_xs mmv",   GK_TYPE_IQ2_XS,  512, 700,  1);
+    failures += run_lattice_exact(gpu, "iq2_xs deep",  GK_TYPE_IQ2_XS, 6656, 1024, 50);
+    failures += run_lattice_exact(gpu, "iq2_xs deep mv", GK_TYPE_IQ2_XS, 6656, 1024, 1);
     failures += run_lattice_exact(gpu, "iq1_s f32",    GK_TYPE_IQ1_S,   512, 700, 70);
-    // iq1_m is absent because it is the one lattice block that does not begin
-    // with its scale - it has no f16 of its own and assembles one from the top
-    // nibble of each of four scale words - so the harness above cannot pin its
-    // magnitude. Its encoder needs no importances, so the sweep's comparison
-    // against the CPU covers it.
+    // iq1_m's scale is not a leading f16 - it is assembled from the top nibble
+    // of each of four scale words, which the harness pins specially.
+    failures += run_lattice_exact(gpu, "iq1_m mmq",    GK_TYPE_IQ1_M,   512, 700, 70);
+    failures += run_lattice_exact(gpu, "iq1_m mmv",    GK_TYPE_IQ1_M,   512, 700,  1);
+    failures += run_lattice_exact(gpu, "iq1_m deep",   GK_TYPE_IQ1_M,  6656, 1024, 50);
+    failures += run_lattice_exact(gpu, "iq1_m deep mv", GK_TYPE_IQ1_M, 6656, 1024, 1);
+    // q3_K and iq4_xs against the exact reference too - the deep run_op_tol
+    // cases above cannot separate kernel drift from the CPU reference's own.
+    failures += run_lattice_exact(gpu, "q3_K exact",    GK_TYPE_Q3_K,   6656, 1024, 50);
+    failures += run_lattice_exact(gpu, "q3_K exact mv", GK_TYPE_Q3_K,   6656, 1024,  1);
+    failures += run_lattice_exact(gpu, "iq4_xs exact",  GK_TYPE_IQ4_XS, 6656, 1024, 50);
+    failures += run_lattice_exact(gpu, "iq4_xs exact mv", GK_TYPE_IQ4_XS, 6656, 1024, 1);
 
     // nvfp4, and the bound here needs its reasoning spelled out because it is
     // far looser than anything else in this file and that is not slack.

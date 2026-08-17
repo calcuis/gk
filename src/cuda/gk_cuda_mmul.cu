@@ -76,8 +76,10 @@ static __host__ __forceinline__ bool gk_cuda_mm_q8_supported(int type, int64_t k
         case GK_TYPE_Q4_0: case GK_TYPE_Q4_1: case GK_TYPE_Q8_0:
             return n_rows >= GK_CU_MM_Q8_MIN_ROWS;
         case GK_TYPE_Q4_K: case GK_TYPE_Q5_K: case GK_TYPE_Q2_K:
+        case GK_TYPE_Q3_K: case GK_TYPE_IQ4_XS:
         case GK_TYPE_MXFP4: case GK_TYPE_NVFP4:
         case GK_TYPE_IQ2_XXS: case GK_TYPE_IQ3_XXS: case GK_TYPE_IQ3_S:
+        case GK_TYPE_IQ2_XS: case GK_TYPE_IQ1_M:
             return true;
         // `GK_MM_Q8_SPLIT=0` puts the split-scale formats back on the float
         // decoder, which is what they used before they had an integer path.
@@ -95,7 +97,8 @@ static __host__ __forceinline__ bool gk_cuda_mm_q8_supported(int type, int64_t k
 static __host__ __forceinline__ bool gk_cuda_mm_split_scale(int type) {
     return type == GK_TYPE_Q6_K || type == GK_TYPE_IQ2_XS ||
            type == GK_TYPE_IQ2_S || type == GK_TYPE_IQ1_M ||
-           type == GK_TYPE_Q2_K  || type == GK_TYPE_NVFP4;
+           type == GK_TYPE_Q2_K  || type == GK_TYPE_Q3_K  ||
+           type == GK_TYPE_NVFP4;
 }
 
 // This list and gk_cu_has_dp4a's are the same list seen from the two sides -
@@ -108,7 +111,9 @@ static_assert(gk_cu_has_dp4a<GKT_Q4_0>()    && gk_cu_has_dp4a<GKT_Q4_1>() &&
               gk_cu_has_dp4a<GKT_IQ3_S>()   && gk_cu_has_dp4a<GKT_Q6_K>() &&
               gk_cu_has_dp4a<GKT_IQ2_S>()   && gk_cu_has_dp4a<GKT_Q5_K>() &&
               gk_cu_has_dp4a<GKT_Q2_K>()    && gk_cu_has_dp4a<GKT_MXFP4>() &&
-              gk_cu_has_dp4a<GKT_NVFP4>(),
+              gk_cu_has_dp4a<GKT_NVFP4>()   && gk_cu_has_dp4a<GKT_Q3_K>() &&
+              gk_cu_has_dp4a<GKT_IQ4_XS>()  && gk_cu_has_dp4a<GKT_IQ2_XS>() &&
+              gk_cu_has_dp4a<GKT_IQ1_M>(),
               "gk_cuda_mm_q8_supported offers a type gk_cu_wblk32 cannot stage");
 
 // Activation columns one pass over a weight row serves. Each column costs a

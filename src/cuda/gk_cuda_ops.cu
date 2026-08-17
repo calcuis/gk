@@ -2818,9 +2818,137 @@ static __global__ void gk_cu_k_rwkv_wkv7(const float * r_in, const float * w_in,
     }
 }
 
-// The gated delta rule. One block per (head, sequence); a warp owns row j of
-// the working state, which the layout stores transposed - row j holds column j
-// of the state.
+// The gated delta rule, register-resident form for the head widths models
+// actually ship (16..128, powers of two). A warp owns one column of the state
+// and keeps its S values in registers across the whole token loop, so the
+// only global traffic per token is the five input rows and the output - the
+// generic kernel below instead walks the working state through global memory
+// four times per token, which is where its time goes.
+//
+// The state layout stays transposed, as everywhere else in this op: row col
+// of the stored state holds column col of the mathematical one, so a warp's
+// lanes spread along i and both reductions are shuffles. For S below the
+// hardware warp the shuffles are width-limited so two columns sharing a
+// hardware warp cannot mix.
+//
+// Grid (H, n_seqs, S / GK_CU_GDN_WARPS); block (min(S, warp), GK_CU_GDN_WARPS).
+#define GK_CU_GDN_WARPS 4
+
+template <int width>
+static __device__ __forceinline__ float gk_cu_warp_sum_w(float x) {
+#pragma unroll
+    for (int offset = width / 2; offset > 0; offset >>= 1) {
+#if defined(GK_USE_HIP)
+        x += __shfl_xor(x, offset, width);
+#else
+        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+#endif
+    }
+    return x;
+}
+
+template <int S_v, bool kda>
+static __global__ void
+__launch_bounds__((S_v < GK_WARP_SIZE ? S_v : GK_WARP_SIZE) * GK_CU_GDN_WARPS, 2)
+gk_cu_k_gated_delta_net_col(gk_tview q, gk_tview k_t, gk_tview v,
+                            gk_tview g, gk_tview beta,
+                            const float * s_in, int64_t s_in_stride3,
+                            float * attn_base, float * state_base,
+                            int64_t H, int64_t n_tokens,
+                            int64_t snap_elems, int64_t K,
+                            int64_t rq3, int64_t rk3, float scale) {
+    constexpr int WS  = S_v < GK_WARP_SIZE ? S_v : GK_WARP_SIZE;
+    constexpr int RPL = S_v / WS; // rows of the column per lane
+
+    const int64_t iv1 = blockIdx.x; // head
+    const int64_t iv3 = blockIdx.y; // sequence
+    const int    lane = threadIdx.x;
+    const int     col = blockIdx.z * GK_CU_GDN_WARPS + threadIdx.y;
+
+    const int64_t iq1 = iv1 % q.ne[1];
+    const int64_t ik1 = iv1 % k_t.ne[1];
+    const int64_t iq3 = iv3 / rq3;
+    const int64_t ik3 = iv3 / rk3;
+
+    // The handed-in state, indexed the way the CPU pass indexes it: flat
+    // within a sequence, with only the sequence axis carrying a stride.
+    const float * s0    = s_in + iv3 * s_in_stride3 + (iv1 * S_v + col) * S_v;
+    float *       snap0 = state_base + (iv3 * H + iv1) * S_v * S_v + (int64_t) col * S_v;
+    float *       attn  = attn_base + (iv3 * n_tokens * H + iv1) * S_v;
+
+    float s_reg[RPL];
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        s_reg[r] = s0[r * WS + lane];
+    }
+
+    if (n_tokens == 0) {
+        // the generic kernel's copy-through: slot 0 carries s0 unchanged
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            snap0[r * WS + lane] = s_reg[r];
+        }
+        return;
+    }
+
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const float * q_d = (const float *) (q.data   + iq3 * q.nb[3]    + t * q.nb[2]    + iq1 * q.nb[1]);
+        const float * k_d = (const float *) (k_t.data + ik3 * k_t.nb[3]  + t * k_t.nb[2]  + ik1 * k_t.nb[1]);
+        const float * v_d = (const float *) (v.data   + iv3 * v.nb[3]    + t * v.nb[2]    + iv1 * v.nb[1]);
+        const float * g_d = (const float *) (g.data   + iv3 * g.nb[3]    + t * g.nb[2]    + iv1 * g.nb[1]);
+
+        const float beta_v = *(const float *) (beta.data + iv3 * beta.nb[3] + t * beta.nb[2] + iv1 * beta.nb[1]);
+
+        float k_reg[RPL];
+        float q_reg[RPL];
+        float w_reg[RPL];
+        const float dg = kda ? 0.0f : expf(g_d[0]);
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            const int i = r * WS + lane;
+            k_reg[r] = k_d[i];
+            q_reg[r] = q_d[i];
+            w_reg[r] = kda ? expf(g_d[i]) : dg;
+        }
+
+        // decay, then how far the state's prediction of v misses
+        float part = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            s_reg[r] *= w_reg[r];
+            part += s_reg[r] * k_reg[r];
+        }
+        const float dj = (v_d[col] - gk_cu_warp_sum_w<WS>(part)) * beta_v;
+
+        // the rank-one update that closes the gap, read out against q
+        float acc = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; ++r) {
+            s_reg[r] += k_reg[r] * dj;
+            acc += s_reg[r] * q_reg[r];
+        }
+        const float outv = gk_cu_warp_sum_w<WS>(acc);
+
+        if (lane == 0) {
+            attn[t * S_v * H + col] = outv * scale;
+        }
+
+        // snapshot slot s holds the state s tokens back; slot 0, written on
+        // the last token, is the final state every caller reads
+        const int64_t slot = n_tokens - 1 - t;
+        if (slot < K) {
+            float * snap = snap0 + slot * snap_elems;
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                snap[r * WS + lane] = s_reg[r];
+            }
+        }
+    }
+}
+
+// The generic fallback for head widths the register form does not cover. One
+// block per (head, sequence); a warp owns row j of the working state, which
+// the layout stores transposed - row j holds column j of the state.
 //
 // A warp rather than a thread for the same reason as RWKV-7 above: every one
 // of the four passes a token makes over a row walks it along i, so lanes
@@ -2939,6 +3067,29 @@ static __global__ void gk_cu_k_gated_delta_net(gk_tview q, gk_tview k_t, gk_tvie
         if (kda) {
             __syncthreads();
         }
+    }
+}
+
+// host-side dispatch for the register-resident form
+template <int S_v>
+static void gk_cu_gdn_col_launch(bool kda, int64_t H, int64_t n_seqs, cudaStream_t stream,
+                                 gk_tview q, gk_tview k, gk_tview v,
+                                 gk_tview g, gk_tview beta,
+                                 const float * s_in, int64_t s_in_stride3,
+                                 float * attn_base, float * state_base,
+                                 int64_t n_tokens, int64_t snap_elems, int64_t K,
+                                 int64_t rq3, int64_t rk3, float scale) {
+    constexpr int WS = S_v < GK_WARP_SIZE ? S_v : GK_WARP_SIZE;
+    dim3 grid((unsigned) H, (unsigned) n_seqs, (unsigned) (S_v / GK_CU_GDN_WARPS));
+    dim3 block(WS, GK_CU_GDN_WARPS, 1);
+    if (kda) {
+        gk_cu_k_gated_delta_net_col<S_v, true><<<grid, block, 0, stream>>>(
+            q, k, v, g, beta, s_in, s_in_stride3, attn_base, state_base,
+            H, n_tokens, snap_elems, K, rq3, rk3, scale);
+    } else {
+        gk_cu_k_gated_delta_net_col<S_v, false><<<grid, block, 0, stream>>>(
+            q, k, v, g, beta, s_in, s_in_stride3, attn_base, state_base,
+            H, n_tokens, snap_elems, K, rq3, rk3, scale);
     }
 }
 
@@ -3209,17 +3360,39 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         return op->type == GKT_F32 && s1 != NULL && s1->type == GKT_F32 &&
                (s0->type == GKT_F32 || s0->type == GKT_F16);
     }
-    if ((int) op->op == GK_OP_RWKV_WKV6 || (int) op->op == GK_OP_RWKV_WKV7 ||
-        (int) op->op == GK_OP_GATED_DELTA_NET) {
+    if ((int) op->op == GK_OP_GATED_DELTA_NET) {
+        // The kernels walk q, k, v, g and beta by their own nb[] per token -
+        // the graph hands v in as a strided slice of the fused qkv projection,
+        // and declining that sent the whole recurrence to the CPU with the
+        // state crossing the bus both ways every step. Only the row itself
+        // must be packed floats. The incoming state is read flat within a
+        // sequence, so its inner axes must be packed; the sequence axis alone
+        // may carry a stride.
+        const int64_t S = op->src[2]->ne[0];
+        if (S > GK_CUDA_RECURRENT_MAX_S) {
+            return false;
+        }
+        for (int i = 0; i < 5; ++i) {
+            const struct gk_tensor * t = op->src[i];
+            if (t == NULL || t->type != GKT_F32 || t->nb[0] != sizeof(float)) {
+                return false;
+            }
+        }
+        const struct gk_tensor * s = op->src[5];
+        if (s == NULL || s->type != GKT_F32 || s->nb[0] != sizeof(float) ||
+            s->nb[1] != (size_t) s->ne[0] * sizeof(float) ||
+            s->nb[2] != (size_t) (s->ne[0] * s->ne[1]) * sizeof(float)) {
+            return false;
+        }
+        return op->type == GKT_F32;
+    }
+    if ((int) op->op == GK_OP_RWKV_WKV6 || (int) op->op == GK_OP_RWKV_WKV7) {
         // RWKV-6 gives a head's state one slot per thread, so a head wider
-        // than a block would go partly uncomputed. The other two stride whole
-        // rows over warps and have no such limit, but the bound is applied to
-        // all three: it is above anything published - RWKV heads are 64 and
-        // the delta rule's 128 - and one rule is easier to keep true than
-        // three. A wider head falls back to the CPU.
-        const int64_t S = (int) op->op == GK_OP_GATED_DELTA_NET
-            ? op->src[2]->ne[0]
-            : op->ne[0] / op->src[1]->ne[1];
+        // than a block would go partly uncomputed. RWKV-7 strides whole rows
+        // over warps and has no such limit, but the bound is applied to both:
+        // it is above anything published - RWKV heads are 64 - and one rule
+        // is easier to keep true than two. A wider head falls back to the CPU.
+        const int64_t S = op->ne[0] / op->src[1]->ne[1];
 
         if (S > GK_CUDA_RECURRENT_MAX_S) {
             return false;
@@ -3228,8 +3401,7 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         // Every operand is read as a flat float array with only the outermost
         // axis strided, exactly as the CPU pass reads them, so a non-contiguous
         // one would be read wrongly rather than slowly.
-        const int n_src = (int) op->op == GK_OP_RWKV_WKV7 ? 7
-                        : (int) op->op == GK_OP_RWKV_WKV6 ? 6 : 6;
+        const int n_src = (int) op->op == GK_OP_RWKV_WKV7 ? 7 : 6;
         for (int i = 0; i < n_src; ++i) {
             const struct gk_tensor * t = op->src[i];
             if (t == NULL || t->type != GKT_F32 || !gk_is_contiguous(t)) {
@@ -4019,6 +4191,49 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
             const int64_t attn_elems = S * H * n_tokens * n_seqs;
             const int64_t snap_elems = S * S * H * n_seqs;
 
+            const int64_t rq3 = v->ne[3] / src0->ne[3];
+            const int64_t rk3 = v->ne[3] / src1->ne[3];
+            const float scale = 1.0f / sqrtf((float) S);
+
+            // published head widths take the register-resident form; anything
+            // else falls through to the generic kernel
+            switch (S) {
+                case 16:
+                    gk_cu_gdn_col_launch<16>(kda, H, n_seqs, stream,
+                        gk_cu_view(src0), gk_cu_view(src1), gk_cu_view(v),
+                        gk_cu_view(g), gk_cu_view(node->src[4]),
+                        (const float *) s_in->data, (int64_t) (s_in->nb[3] / sizeof(float)),
+                        (float *) node->data, (float *) node->data + attn_elems,
+                        n_tokens, snap_elems, K, rq3, rk3, scale);
+                    return true;
+                case 32:
+                    gk_cu_gdn_col_launch<32>(kda, H, n_seqs, stream,
+                        gk_cu_view(src0), gk_cu_view(src1), gk_cu_view(v),
+                        gk_cu_view(g), gk_cu_view(node->src[4]),
+                        (const float *) s_in->data, (int64_t) (s_in->nb[3] / sizeof(float)),
+                        (float *) node->data, (float *) node->data + attn_elems,
+                        n_tokens, snap_elems, K, rq3, rk3, scale);
+                    return true;
+                case 64:
+                    gk_cu_gdn_col_launch<64>(kda, H, n_seqs, stream,
+                        gk_cu_view(src0), gk_cu_view(src1), gk_cu_view(v),
+                        gk_cu_view(g), gk_cu_view(node->src[4]),
+                        (const float *) s_in->data, (int64_t) (s_in->nb[3] / sizeof(float)),
+                        (float *) node->data, (float *) node->data + attn_elems,
+                        n_tokens, snap_elems, K, rq3, rk3, scale);
+                    return true;
+                case 128:
+                    gk_cu_gdn_col_launch<128>(kda, H, n_seqs, stream,
+                        gk_cu_view(src0), gk_cu_view(src1), gk_cu_view(v),
+                        gk_cu_view(g), gk_cu_view(node->src[4]),
+                        (const float *) s_in->data, (int64_t) (s_in->nb[3] / sizeof(float)),
+                        (float *) node->data, (float *) node->data + attn_elems,
+                        n_tokens, snap_elems, K, rq3, rk3, scale);
+                    return true;
+                default:
+                    break;
+            }
+
             dim3 grid;
             grid.x = (unsigned) H;
             grid.y = (unsigned) n_seqs;
@@ -4031,8 +4246,7 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 (const float *) s_in->data, (int64_t) (s_in->nb[3] / sizeof(float)),
                 (float *) node->data, (float *) node->data + attn_elems,
                 S, H, n_tokens, snap_elems, K,
-                v->ne[3] / src0->ne[3], v->ne[3] / src1->ne[3], kda,
-                1.0f / sqrtf((float) S));
+                rq3, rk3, kda, scale);
             return true;
         }
 
