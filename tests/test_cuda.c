@@ -896,6 +896,19 @@ static struct gk_tensor * build_mmv_q4_K(struct gk_ctx * ctx, struct gk_tensor *
     return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 512, 700, 3);
 }
 
+// The narrow tensor-core tile: 2..23 columns, with enough rows and k for its
+// occupancy gate to say yes on any part. One split-scale format and one
+// whole-group format, because the tile drains the two differently; the q2_K
+// rows sit off the 256 boundary so the row guard runs, and the q4_K columns
+// are odd so the column padding does.
+static struct gk_tensor * build_mmn_q2_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q2_K, 2048, 4000, 4);
+}
+
+static struct gk_tensor * build_mmn_q4_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 2048, 4096, 5);
+}
+
 // The lattice formats, against a reference that is exact.
 //
 // Two things make this harness different from `run_op_tol`, and both are
@@ -1534,6 +1547,29 @@ static struct gk_tensor * build_get_rows(struct gk_ctx * ctx, struct gk_tensor *
     in[1] = gk_new_tensor_1d(ctx, GK_TYPE_I32, 13);
     *n_in = 2;
     return gk_get_rows(ctx, in[0], in[1]);
+}
+
+// The sampler ops: a top-k sampler gathers token ids out of an i32 table, a
+// dist sampler casts its computed index to i32 and sums a mask. The gather's
+// table is the harness's 0..n fill, which happens to be exactly what a
+// candidate list is.
+static struct gk_tensor * build_get_rows_i32(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_I32, 1, 40);
+    in[1] = gk_new_tensor_1d(ctx, GK_TYPE_I32, 13);
+    *n_in = 2;
+    return gk_get_rows(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_cast_i32(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_1d(ctx, GK_TYPE_F32, 1000);
+    *n_in = 1;
+    return gk_cast(ctx, gk_scale(ctx, in[0], 1000.0f), GK_TYPE_I32);
+}
+
+static struct gk_tensor * build_sum(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 513, 7);
+    *n_in = 1;
+    return gk_sum(ctx, in[0]);
 }
 
 static struct gk_tensor * build_scale(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
@@ -2333,6 +2369,12 @@ int main(void) {
     failures += run_op_tol(gpu, "mmv q4_K",      build_mmv_q4_K,     8e-2f);
     failures += run_op_tol(gpu, "mmv q4_0 nc",   build_mmv_q4_0_nc,  4e-2f);
 
+    // The narrow tensor-core tile. q2_K is held at the deep-k bound: the CPU
+    // reference carries one activation scale per 256 against the device's
+    // per-32, and a 2.5-bit format at k=2048 widens that spread.
+    failures += run_op_tol(gpu, "mmn q2_K",      build_mmn_q2_K,     2e-1f);
+    failures += run_op_tol(gpu, "mmn q4_K",      build_mmn_q4_K,     8e-2f);
+
     // The lattice formats that have an integer path. iq3_xxs and iq3_s encode
     // sanely without importances, so they can take the CPU comparison at the
     // same loose bound as q4_K - the reference dots them against Q8_K
@@ -2450,6 +2492,12 @@ int main(void) {
     failures += run_op_tol(gpu, "mma f16 permut", build_mma_f16_permuted, 5e-3f);
     failures += run_op(gpu, "rope",           build_rope);
     failures += run_op(gpu, "get_rows",       build_get_rows);
+    failures += run_op(gpu, "get_rows i32",   build_get_rows_i32);
+    failures += run_op(gpu, "cast f32->i32",  build_cast_i32);
+    // The sum reduces a few thousand signed values into one scalar in float
+    // against the CPU's double, so it is held to an absolute rather than an
+    // exact bound.
+    failures += run_op_tol(gpu, "sum",        build_sum, 1e-3f);
     failures += run_op(gpu, "scale",          build_scale);
     failures += run_op(gpu, "pad",            build_pad);
     failures += run_op(gpu, "upscale",        build_upscale);

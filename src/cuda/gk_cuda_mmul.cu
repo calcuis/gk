@@ -2822,6 +2822,225 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The narrow integer tile: 2..23 columns, the shape of a speculative verify.
+//
+// The NC dp4a mat-vec covers this range, and at four columns it is issue
+// bound: an instruction-budget estimate put its decode+4-dot loop at ~100%
+// issue rate, costing ~2x the single-column pass for what should be the same
+// memory traffic. One `mma.sync` retires the work of 128 dp4a instructions,
+// so the multiply drops out of the budget and the pass goes back to being
+// paid for in decodes - which a batch amortizes across every column at once,
+// where the NC path re-reads and re-decodes the weights once per group of
+// four columns.
+//
+// A block is eight warps stacked along m: a warp owns 32 rows, the block 256,
+// and the whole of n - at most three 8-wide mma tiles. Columns come from the
+// same quantized-activation scratch as the mat-vec path. k is cut across
+// blocks exactly as the f16 tile cuts it, with the same partial planes and
+// the same combine pass, because a projection matrix is short of rows in
+// exactly the way that tile's UNet shapes are.
+//
+// The split-scale formats are admitted here, unlike the 128x128 tile above:
+// a verify's dominant weights are whatever format the model shipped in, and
+// q2_K excluded is most of a q2_K model excluded. Their group is two
+// `m16n8k16` windows drained separately - the accumulator has to be emptied
+// where the scale changes - against the whole-group formats' one k32 window.
+// The activation block's `sl` is what makes the second drain's offset term
+// affordable: the low half's code sum is precomputed, so the high half's is
+// one subtract.
+// --------------------------------------------------------------------------
+
+#define GK_CU_MMAN_TILE_M  128   // rows a block owns; a warp owns 16
+#define GK_CU_MMAN_TILE_N  8     // columns: one mma tile
+#define GK_CU_MMAN_WARPS   8
+#define GK_CU_MMAN_THREADS (GK_CU_MMAN_WARPS * GK_WARP_SIZE)
+// k-groups staged per barrier. The first cut of this kernel staged one and
+// paid two barriers per ~66 scattered bytes per thread - it lost to the dp4a
+// mat-vec by 2-3x on pure latency. Four gives each thread two independent
+// decodes in flight and divides the barriers by four.
+#define GK_CU_MMAN_KSTEP   4
+#define GK_CU_MMAN_MIN_N   2     // below this the plain mat-vec keeps the win
+#define GK_CU_MMAN_SPLIT_MIN_GRP 8   // a k piece keeps at least this many groups
+
+template <int ATYPE>
+static __global__ __launch_bounds__(GK_CU_MMAN_THREADS, 2)
+void gk_cu_k_mul_mat_mma_q8n(gk_tview a, gk_tview_mut d,
+                             const gk_cu_q8blk * aq, int64_t n_grp,
+                             int64_t r2, int64_t r3,
+                             float * part, int64_t n_splits, int64_t n_23) {
+    __shared__ int   As[GK_CU_MMAN_KSTEP][GK_CU_MMAN_TILE_M][8];
+    __shared__ float Wsc[GK_CU_MMAN_KSTEP][GK_CU_MMAN_TILE_M][2];
+    __shared__ float Wof[GK_CU_MMAN_KSTEP][GK_CU_MMAN_TILE_M][2];
+    __shared__ int   Bs[GK_CU_MMAN_KSTEP][GK_CU_MMAN_TILE_N][8];
+    __shared__ float Ad [GK_CU_MMAN_KSTEP][GK_CU_MMAN_TILE_N];
+    __shared__ float Ads[GK_CU_MMAN_KSTEP][GK_CU_MMAN_TILE_N];  // d * (sum of the 32)
+    __shared__ float Adl[GK_CU_MMAN_KSTEP][GK_CU_MMAN_TILE_N];  // d * (sum of the first 16)
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int64_t m0    = (int64_t) blockIdx.x * GK_CU_MMAN_TILE_M;
+    const int64_t n0    = (int64_t) blockIdx.y * GK_CU_MMAN_TILE_N;
+    const int64_t i23   = blockIdx.z / n_splits;
+    const int64_t split = blockIdx.z % n_splits;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
+
+    const int64_t g_per = (n_grp + n_splits - 1) / n_splits;
+    const int64_t g0    = split * g_per;
+    const int64_t g1    = g0 + g_per < n_grp ? g0 + g_per : n_grp;
+
+    // The staging assignment: thread t owns row t % TILE_M at staged groups
+    // 2*(t / TILE_M) and 2*(t / TILE_M) + 1 - two decodes with nothing between
+    // them, which is the memory-level parallelism the whole redesign is for.
+    const int st_r  = (int) threadIdx.x % GK_CU_MMAN_TILE_M;
+    const int st_g  = 2 * ((int) threadIdx.x / GK_CU_MMAN_TILE_M);
+
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    const int r_lo = warp * 16 + group;
+
+    for (int64_t g = g0; g < g1; g += GK_CU_MMAN_KSTEP) {
+        // A row past the end - or a staged group past this split's slice -
+        // stages zero codes and zero scales, so the arithmetic below needs
+        // no bound.
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            const int     gg = st_g + s;
+            const int64_t gk = g + gg;
+            const int64_t m  = m0 + st_r;
+
+            int   codes[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+            float sc[2]  = { 0.0f, 0.0f };
+            float off[2] = { 0.0f, 0.0f };
+
+            if (m < n_rows && gk < g1) {
+                gk_cu_wblk32<ATYPE>((const uint8_t *) gk_cu_row(a, m, a2, a3),
+                                    gk, codes, sc, off);
+            }
+
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                As[gg][st_r][i] = codes[i];
+            }
+            Wsc[gg][st_r][0] = sc[0];
+            Wsc[gg][st_r][1] = sc[1];
+            Wof[gg][st_r][0] = off[0];
+            Wof[gg][st_r][1] = off[1];
+        }
+
+        if (threadIdx.x < GK_CU_MMAN_KSTEP * GK_CU_MMAN_TILE_N) {
+            const int     gg = (int) threadIdx.x / GK_CU_MMAN_TILE_N;
+            const int     c  = (int) threadIdx.x % GK_CU_MMAN_TILE_N;
+            const int64_t n  = n0 + c;
+            const int64_t gk = g + gg;
+
+            if (n < n_cols && gk < g1) {
+                const gk_cu_q8blk & ab = aq23[n * n_grp + gk];
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    Bs[gg][c][i] = ab.q[i];
+                }
+                Ad [gg][c] = ab.d;
+                Ads[gg][c] = ab.d * ab.s;
+                Adl[gg][c] = ab.d * ab.sl;
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    Bs[gg][c][i] = 0;
+                }
+                Ad [gg][c] = 0.0f;
+                Ads[gg][c] = 0.0f;
+                Adl[gg][c] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+#pragma unroll
+        for (int gg = 0; gg < GK_CU_MMAN_KSTEP; ++gg) {
+            // Column constants for this lane's two output columns.
+            float adv[2], asv[2], alv[2];
+            adv[0] = Ad [gg][tig * 2];  adv[1] = Ad [gg][tig * 2 + 1];
+            asv[0] = Ads[gg][tig * 2];  asv[1] = Ads[gg][tig * 2 + 1];
+            alv[0] = Adl[gg][tig * 2];  alv[1] = Adl[gg][tig * 2 + 1];
+
+            int bf[2];
+            bf[0] = Bs[gg][group][tig];
+            bf[1] = Bs[gg][group][4 + tig];
+
+            if (gk_cu_has_split_scale<ATYPE>()) {
+                // The scale changes at element sixteen, so the group is two
+                // k16 windows drained where it changes.
+                int af_lo[2] = { As[gg][r_lo][tig],     As[gg][r_lo + 8][tig]     };
+                int af_hi[2] = { As[gg][r_lo][4 + tig], As[gg][r_lo + 8][4 + tig] };
+
+                int df0[4] = { 0, 0, 0, 0 };
+                int df1[4] = { 0, 0, 0, 0 };
+                gk_cu_mma_s8(df0, af_lo, bf[0]);
+                gk_cu_mma_s8(df1, af_hi, bf[1]);
+
+                const float ws0[2] = { Wsc[gg][r_lo][0], Wsc[gg][r_lo + 8][0] };
+                const float ws1[2] = { Wsc[gg][r_lo][1], Wsc[gg][r_lo + 8][1] };
+                const float wo0[2] = { Wof[gg][r_lo][0], Wof[gg][r_lo + 8][0] };
+                const float wo1[2] = { Wof[gg][r_lo][1], Wof[gg][r_lo + 8][1] };
+
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int rh = i >> 1;      // 0: row group, 1: row group+8
+                    const int ch = i & 1;       // which of the lane's columns
+                    acc[i] += ws0[rh] * adv[ch] * (float) df0[i] + wo0[rh] * alv[ch]
+                            + ws1[rh] * adv[ch] * (float) df1[i] + wo1[rh] * (asv[ch] - alv[ch]);
+                }
+            } else {
+                int af[4] = { As[gg][r_lo][tig],     As[gg][r_lo + 8][tig],
+                              As[gg][r_lo][4 + tig], As[gg][r_lo + 8][4 + tig] };
+
+                int df[4] = { 0, 0, 0, 0 };
+                gk_cu_mma_s8_k32(df, af, bf);
+
+                const float ws[2] = { Wsc[gg][r_lo][0], Wsc[gg][r_lo + 8][0] };
+                const float wo[2] = { Wof[gg][r_lo][0], Wof[gg][r_lo + 8][0] };
+
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int rh = i >> 1;
+                    const int ch = i & 1;
+                    acc[i] += ws[rh] * adv[ch] * (float) df[i] + wo[rh] * asv[ch];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int64_t m = m0 + warp * 16 + group + ((i >> 1) != 0 ? 8 : 0);
+        const int64_t n = n0 + tig * 2 + (i & 1);
+
+        if (m < n_rows && n < n_cols) {
+            if (part != NULL) {
+                part[((split * n_23 + i23) * n_cols + n) * n_rows + m] = acc[i];
+            } else {
+                gk_cu_set(d, m, n, i2, i3, acc[i]);
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // The tiled path: same result as gk_cu_k_mul_mat, arranged for reuse.
 //
 // Each block owns a TILE_M x TILE_N patch of `d` and walks the whole of k,
@@ -3412,14 +3631,56 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         const int64_t n_23   = dst->ne[2] * dst->ne[3];
         const int64_t n_blk  = n_grp * n_cols * n_23;
 
-        // Read before scratch_get: it clears the claim on entry.
+        // Whether the narrow tensor-core tile takes this shape, decided up
+        // front because its k-split planes ride the same scratch allocation
+        // as the activation blocks. Zero means the mat-vec keeps it.
+        //
+        // Off by default: on an Ada part it measured 1.3-3x BEHIND the NC
+        // dp4a mat-vec on every verify shape (the mat-vec's lane-per-group
+        // walk is coalesced and barrier-free; this tile's staging is not).
+        // It exists because the same mat-vec measured issue-bound on
+        // Blackwell, where the mma should give back the dot's issue slots -
+        // measure there before flipping the default.
+        int64_t mman_splits = 0;
+        if (gk_cuda_mm_mma_q8_available(scratch) && n_cols >= GK_CU_MMAN_MIN_N &&
+            gk_cu_env_int("GK_MM_MMA_NARROW", 0) != 0) {
+            const int64_t grid_m = (dst->ne[0] + GK_CU_MMAN_TILE_M - 1) / GK_CU_MMAN_TILE_M;
+            const int64_t grid_n = (n_cols + GK_CU_MMAN_TILE_N - 1) / GK_CU_MMAN_TILE_N;
+            const int64_t have   = grid_m * grid_n * n_23 * GK_CU_MMAN_WARPS;
+            const int64_t want   = (int64_t) scratch->n_sm * 8;
+
+            int64_t ns = 1;
+            if (have < want) {
+                ns = (want + have - 1) / have;
+                const int64_t ns_max = n_grp / GK_CU_MMAN_SPLIT_MIN_GRP;
+                if (ns > ns_max) { ns = ns_max; }
+                if (ns < 1)      { ns = 1; }
+            }
+
+            // Still short of warps with k cut as far as it goes: the mat-vec,
+            // which splits k across its block, keeps the device busier.
+            if (have * ns >= want / 2) {
+                mman_splits = ns;
+            }
+        }
+
+        const size_t aq_bytes   = (size_t) n_blk * sizeof(gk_cu_q8blk);
+        const size_t part_bytes = mman_splits > 1
+            ? (size_t) mman_splits * n_23 * n_cols * dst->ne[0] * sizeof(float)
+            : 0;
+
+        // Read before scratch_get: it clears the claim on entry. The
+        // generation too - a grow moves the buffer, and blocks quantized
+        // into the old one are not in the new one whatever the other fields
+        // still say.
         const void *   aq_src_prev  = scratch->aq_src;
         const int64_t  aq_blk_prev  = scratch->aq_blk;
         const int64_t  aq_grp_prev  = scratch->aq_grp;
         const uint64_t aq_pass_prev = scratch->aq_pass;
+        const uint64_t aq_gen_prev  = scratch->gen;
 
         gk_cu_q8blk * aq = (gk_cu_q8blk *) gk_cu_scratch_get(
-            scratch, (size_t) n_blk * sizeof(gk_cu_q8blk), stream);
+            scratch, aq_bytes + part_bytes, stream);
 
         if (aq != NULL) {
             // The q, k and v projections dot different weights against the
@@ -3427,7 +3688,8 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             // blocks from this exact graph pass, the quantize is already done.
             const bool aq_reuse = aq_src_prev == src1->data &&
                                   aq_blk_prev == n_blk && aq_grp_prev == n_grp &&
-                                  aq_pass_prev == scratch->pass;
+                                  aq_pass_prev == scratch->pass &&
+                                  aq_gen_prev  == scratch->gen;
 
             if (!aq_reuse) {
                 gk_cu_k_quantize_act<<<gk_cu_blocks_1d(n_blk, GK_CUDA_BLOCK),
@@ -3438,6 +3700,35 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             scratch->aq_blk  = n_blk;
             scratch->aq_grp  = n_grp;
             scratch->aq_pass = scratch->pass;
+
+            if (mman_splits > 0) {
+                float * part = mman_splits > 1
+                    ? (float *) ((char *) aq + aq_bytes)
+                    : NULL;
+
+                dim3 ngrid;
+                ngrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMAN_TILE_M - 1) / GK_CU_MMAN_TILE_M);
+                ngrid.y = (unsigned) ((n_cols + GK_CU_MMAN_TILE_N - 1) / GK_CU_MMAN_TILE_N);
+                ngrid.z = (unsigned) (n_23 * mman_splits);
+
+#define GK_CU_LAUNCH_MMA_Q8N(T)                                                     \
+                gk_cu_k_mul_mat_mma_q8n<T><<<ngrid, GK_CU_MMAN_THREADS, 0, stream>>>( \
+                    gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3,       \
+                    part, mman_splits, n_23)
+
+                g_gk_mm_path = "mma-q8n";
+                GK_CU_MM_DISPATCH((int) src0->type, GK_CU_LAUNCH_MMA_Q8N);
+#undef GK_CU_LAUNCH_MMA_Q8N
+
+                if (mman_splits > 1) {
+                    const int64_t n_out = dst->ne[0] * n_cols * n_23;
+                    gk_cu_k_mma_f16_combine<<<gk_cu_blocks_1d(n_out, GK_CUDA_BLOCK),
+                                              GK_CUDA_BLOCK, 0, stream>>>(
+                        part, gk_cu_view_mut(dst), mman_splits, n_23,
+                        dst->ne[0], n_cols);
+                }
+                return;
+            }
 
             // A warp per row wants at least a few blocks per multiprocessor
             // out of rows alone; an output narrower than that - an attention
@@ -3450,7 +3741,14 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             const bool rowwise = dst->ne[0] < (int64_t) scratch->n_sm * 8 &&
                                  n_grp >= GK_CU_MM_BLOCK;
 
-            if (n_cols < GK_CU_MM_NC) {
+            // Only a single column takes the one-column kernel. Two or three
+            // columns used to as well - grid.y column blocks of NC=1 - which
+            // read and decoded the whole weight matrix once *per column*. A
+            // speculative verify at draft depth two is exactly three columns,
+            // so it paid 3x the traffic of the batched kernel for the same
+            // answer; the NC kernel's idle accumulators cost registers, not
+            // reads.
+            if (n_cols == 1) {
                 grid.y = (unsigned) n_cols;
 
 #define GK_CU_LAUNCH_Q8_1(T)                                               \
@@ -3495,9 +3793,11 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
     }
 
     // One column at a time when there is only one - the decode case, every
-    // token of generation - and blocks of NC once a batch makes the reuse
-    // real. Below NC columns the extra accumulators would sit idle.
-    if (dst->ne[1] < GK_CU_MM_NC) {
+    // token of generation - and blocks of NC for anything more: the NC
+    // kernel's column guard makes a partial block correct, and its idle
+    // accumulators are cheaper than reading the weights once per column,
+    // which is what NC=1 with a column grid did to a 2-3 column verify.
+    if (dst->ne[1] == 1) {
         grid.y = (unsigned) dst->ne[1];
 
 #define GK_CU_LAUNCH_MV1(T)                                                \

@@ -331,7 +331,11 @@ static struct gk_tensor * b_lm_q6_K(struct gk_ctx * c) { return mul_mat_case(c, 
 // attn_k/v are also the two shapes narrow enough to miss the integer path, so
 // they measure the float mat-vec where the rest measure the integer one.
 static struct gk_tensor * b_ver1_gate(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   6656, 19968,      1); }
+// Three columns is a draft depth of two - two drafted tokens and the one
+// that samples - so it is the width a `--spec-draft-n-max 2` run verifies at.
+static struct gk_tensor * b_ver3_gate(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   6656, 19968,      3); }
 static struct gk_tensor * b_ver4_gate(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_S,   6656, 19968,      4); }
+static struct gk_tensor * b_ver3_lm  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q6_K,    6656, 202048,     3); }
 static struct gk_tensor * b_ver1_down(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, 19968, 6656,      1); }
 static struct gk_tensor * b_ver4_down(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ3_XXS, 19968, 6656,      4); }
 static struct gk_tensor * b_ver1_q   (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_IQ2_XXS, 6656,  4096,      1); }
@@ -929,6 +933,7 @@ static const struct bench_case g_cases[] = {
 
     { "a 30B decode, verified 4 tokens at a time (speculative) against 1",
                        "ffn_gate iq2_s   x1", " 42 MB",       b_ver1_gate, ARENA_BIG },
+    { NULL,            "ffn_gate iq2_s   x3", " 42 MB",       b_ver3_gate, ARENA_BIG },
     { NULL,            "ffn_gate iq2_s   x4", " 42 MB",       b_ver4_gate, ARENA_BIG },
     { NULL,            "ffn_down iq3_xxs x1", " 50 MB",       b_ver1_down, ARENA_BIG },
     { NULL,            "ffn_down iq3_xxs x4", " 50 MB",       b_ver4_down, ARENA_BIG },
@@ -941,6 +946,7 @@ static const struct bench_case g_cases[] = {
     { NULL,            "attn_v   iq3_xxs x1", "0.6 MB",       b_ver1_v,    ARENA_BIG },
     { NULL,            "attn_v   iq3_xxs x4", "0.6 MB",       b_ver4_v,    ARENA_BIG },
     { NULL,            "lm_head  q6_K    x1", "1.1 GB",       b_lm_q6_K,   ARENA_BIG },
+    { NULL,            "lm_head  q6_K    x3", "1.1 GB",       b_ver3_lm,   ARENA_BIG },
     { NULL,            "lm_head  q6_K    x4", "1.1 GB",       b_ver4_lm,   ARENA_BIG },
 
     { "a DFlash draft's nvfp4 mat-vecs (4 columns)",

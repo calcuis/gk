@@ -1052,16 +1052,16 @@ static __global__ void gk_cu_k_group_norm(gk_tview a, gk_tview_mut d,
 static __global__ void gk_cu_k_copy(gk_tview a, gk_tview_mut d, bool same_shape, int64_t n) {
     GK_CU_FLAT_LOOP(n) {
         const gk_cu_idx x = gk_cu_decompose(k, d.ne);
+        const gk_cu_idx s = same_shape ? x : gk_cu_decompose(k, a.ne);
 
-        float v;
-        if (same_shape) {
-            v = gk_cu_get(a, x.i0, x.i1, x.i2, x.i3);
+        if (a.type == GKT_I32 && d.type == GKT_I32) {
+            // integers stay integers rather than crossing through the float
+            // accessors, whose round trip is only exact below 2^24
+            *(int32_t *) (gk_cu_row(d, x.i1, x.i2, x.i3) + x.i0 * d.nb[0]) =
+                *(const int32_t *) (gk_cu_row(a, s.i1, s.i2, s.i3) + s.i0 * a.nb[0]);
         } else {
-            const gk_cu_idx s = gk_cu_decompose(k, a.ne);
-            v = gk_cu_get(a, s.i0, s.i1, s.i2, s.i3);
+            gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, gk_cu_get(a, s.i0, s.i1, s.i2, s.i3));
         }
-
-        gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, v);
     }
 }
 
@@ -1074,7 +1074,15 @@ static __global__ void gk_cu_k_get_rows(gk_tview a, gk_tview idx, gk_tview_mut d
         const int64_t r = (int64_t) *(const int32_t *) (idx.data
                 + x.i1 * idx.nb[0] + x.i2 * idx.nb[1] + x.i3 * idx.nb[2]);
 
-        gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, gk_cu_get(a, x.i0, r, x.i2, x.i3));
+        if (a.type == GKT_I32 && d.type == GKT_I32) {
+            // a gather of token ids stays in integers rather than crossing
+            // through the float accessors, whose round trip is only exact
+            // below 2^24
+            *(int32_t *) (gk_cu_row(d, x.i1, x.i2, x.i3) + x.i0 * d.nb[0]) =
+                *(const int32_t *) (gk_cu_row(a, r, x.i2, x.i3) + x.i0 * a.nb[0]);
+        } else {
+            gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, gk_cu_get(a, x.i0, r, x.i2, x.i3));
+        }
     }
 }
 
@@ -1387,6 +1395,25 @@ static __global__ void gk_cu_k_sum_rows(gk_tview a, gk_tview_mut d, bool mean) {
 
     if (threadIdx.x == 0) {
         gk_cu_set(d, 0, i1, i2, i3, mean ? total / (float) a.ne[0] : total);
+    }
+}
+
+// Every element into one scalar. A single block is enough: the callers are
+// the samplers reducing a vocab-sized mask, a few hundred loop iterations
+// per thread, and one block spares the cross-block combine.
+static __global__ void gk_cu_k_sum(gk_tview a, gk_tview_mut d, int64_t n) {
+    __shared__ float scratch[GK_CU_NORM_BLOCK / GK_WARP_SIZE];
+
+    float local = 0.0f;
+    for (int64_t k = threadIdx.x; k < n; k += blockDim.x) {
+        const gk_cu_idx x = gk_cu_decompose(k, a.ne);
+        local += gk_cu_get(a, x.i0, x.i1, x.i2, x.i3);
+    }
+
+    const float total = gk_cu_block_sum(local, scratch);
+
+    if (threadIdx.x == 0) {
+        gk_cu_set(d, 0, 0, 0, 0, total);
     }
 }
 
@@ -3265,7 +3292,7 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         case GK_OP_DUP: case GK_OP_CPY: case GK_OP_CONT:
         case GK_OP_GET_ROWS: case GK_OP_REPEAT: case GK_OP_CONCAT:
         case GK_OP_SOFT_MAX: case GK_OP_DIAG_MASK_INF: case GK_OP_DIAG_MASK_ZERO:
-        case GK_OP_ROPE: case GK_OP_SUM_ROWS: case GK_OP_MEAN:
+        case GK_OP_ROPE: case GK_OP_SUM_ROWS: case GK_OP_MEAN: case GK_OP_SUM:
         case GK_OP_PAD: case GK_OP_TIMESTEP_EMBEDDING: case GK_OP_ARANGE:
         case GK_OP_FLASH_ATTN_EXT: case GK_OP_IM2COL: case GK_OP_UPSCALE:
         case GK_OP_SET_ROWS:
@@ -3420,7 +3447,18 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         }
     }
 
-    if (!gk_cu_is_float_type((int) op->type) && (int) op->op != GK_OP_ARANGE) {
+    // The samplers run on the backend too, and their graphs gather token ids
+    // (an i32 get_rows over an i32 table) and cast a computed index to i32
+    // (cpy). The same-type gather and copy move integers directly; the f32
+    // to i32 cast goes through gk_cu_set, whose C cast matches the CPU codec.
+    const bool i32_dst_ok = op->type == GKT_I32 && s0 != NULL &&
+        (((int) op->op == GK_OP_GET_ROWS && s0->type == GKT_I32) ||
+         (((int) op->op == GK_OP_CPY || (int) op->op == GK_OP_DUP ||
+           (int) op->op == GK_OP_CONT) &&
+          (s0->type == GKT_F32 || s0->type == GKT_I32)));
+
+    if (!gk_cu_is_float_type((int) op->type) && (int) op->op != GK_OP_ARANGE &&
+        !i32_dst_ok) {
         return false;
     }
 
@@ -3852,6 +3890,11 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_cu_view(src0), gk_cu_view_mut(node), op == GK_OP_MEAN);
             return true;
         }
+
+        case GK_OP_SUM:
+            gk_cu_k_sum<<<1, GK_CU_NORM_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), gk_cu_view_mut(node), gk_cu_nelements(src0));
+            return true;
 
         case GK_OP_ARGSORT: case GK_OP_TOP_K: {
             const int64_t rows  = node->ne[1] * node->ne[2] * node->ne[3];
