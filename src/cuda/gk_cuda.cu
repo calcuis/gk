@@ -1499,6 +1499,58 @@ static void gk_cu_launch_ev_reserve(int n) {
     }
 }
 
+// GK_NODE_HASH=1: a checksum of every node's output, in graph order, with the
+// per-node synchronization to make it meaningful. Two runs that should agree -
+// one with the allocator reusing memory and one without, or one on each
+// backend - diff down to the first node where they stop agreeing, which is
+// where the bug is rather than where the symptom is.
+static bool gk_cu_node_hash_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GK_NODE_HASH");
+        on = e != NULL && e[0] != '0';
+    }
+    return on != 0;
+}
+
+static void gk_cu_node_hash(gkStream_t stream, int index, const struct gk_tensor * node) {
+    if (node->data == NULL || !gk_is_contiguous(node)) {
+        gk_logf("nhash %4d %-14s %-22s -\n", index, gk_op_name(node->op), node->name);
+        return;
+    }
+
+    const size_t bytes = gk_nbytes(node);
+    if (bytes == 0 || bytes > (32u << 20)) {
+        gk_logf("nhash %4d %-14s %-22s -\n", index, gk_op_name(node->op), node->name);
+        return;
+    }
+
+    GK_CUDA_CHECK(gkStreamSynchronize(stream));
+
+    unsigned char * host = (unsigned char *) malloc(bytes);
+    if (host == NULL) {
+        return;
+    }
+    GK_CUDA_CHECK(gkMemcpy(host, node->data, bytes, gkMemcpyDeviceToHost));
+
+    unsigned long long h = 1469598103934665603ull;
+    for (size_t i = 0; i < bytes; ++i) {
+        h = (h ^ host[i]) * 1099511628211ull;
+    }
+    free(host);
+
+    gk_logf("nhash %4d %-14s %-22s %016llx ne=[%lld %lld %lld %lld] dst=%p s0=%p(%s) s1=%p(%s) %s\n",
+            index, gk_op_name(node->op), node->name, h,
+            (long long) node->ne[0], (long long) node->ne[1],
+            (long long) node->ne[2], (long long) node->ne[3],
+            node->data,
+            node->src[0] ? node->src[0]->data : NULL,
+            node->src[0] ? gk_type_name(node->src[0]->type) : "-",
+            node->src[1] ? node->src[1]->data : NULL,
+            node->src[1] ? gk_type_name(node->src[1]->type) : "-",
+            node->op == GK_OP_MUL_MAT ? gk_cuda_mm_last_path() : "");
+}
+
 static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cgraph * graph) {
     struct gk_cuda_backend_ctx * ctx = (struct gk_cuda_backend_ctx *) backend->context;
 
@@ -1527,7 +1579,9 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
     // graph cache. The profiled paths below cannot: both synchronize inside
     // the loop, which is meaningless under capture and worse under replay,
     // where there are no per-node launches to measure at all.
-    if (!prof && !lprof) {
+    const bool nhash = gk_cu_node_hash_on();
+
+    if (!prof && !lprof && !nhash) {
         return gk_cuda_compute_graphed(ctx, graph, n);
     }
 
@@ -1572,6 +1626,10 @@ static enum gk_status gk_cuda_backend_compute(gk_backend_t backend, struct gk_cg
                     (long long) node->ne[0], (long long) node->ne[1],
                     (long long) node->ne[2], (long long) node->ne[3]);
             return GK_STATUS_NO_STORAGE;
+        }
+
+        if (nhash) {
+            gk_cu_node_hash(ctx->stream, i, node);
         }
 
         if (lev && g_launch_events) {
@@ -1759,7 +1817,8 @@ static gk_backend_t gk_cuda_device_init_backend(gk_device_t dev) {
     ctx->scratch.ptr  = NULL;
     ctx->scratch.size = 0;
     ctx->scratch.gen  = 0;
-    ctx->scratch.aq_src  = NULL;
+    ctx->scratch.aq_src    = NULL;
+    ctx->scratch.aq_tensor = NULL;
     ctx->scratch.aq_blk  = 0;
     ctx->scratch.aq_grp  = 0;
     ctx->scratch.aq_pass = 0;

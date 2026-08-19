@@ -676,6 +676,32 @@ The generic float path - widen the weight row, multiply in float - is still
 there for every format and is what each integer dot was checked against as it
 landed. Nothing selects it any more.
 
+### Debugging a wrong answer
+
+A device answer that differs from the CPU one is either a kernel computing the
+wrong thing or a tensor that was written over before it was read, and the two
+are not fixed the same way. These switches tell them apart. All are read once
+from the environment and all are off by default:
+
+| Switch | What it does |
+| ------ | ------------ |
+| `GK_NODE_HASH=1` | A checksum of every node's output, in graph order, with a synchronize per node. Two runs that ought to agree - allocator reuse on and off, or one per backend - diff down to the first node where they stop, which is where the bug is rather than where the symptom is. |
+| `GK_ALLOC_NO_REUSE=1` | The graph allocator never hands a dead tensor's space to a later one. If the answer changes, the fault is a lifetime and not a kernel. Expensive: a graph that fits in tens of megabytes with reuse wants gigabytes without it. |
+| `GK_ALLOC_TRACE=1` | Every placement and every release, with buffer, offset and size, so whichever tensor took the space can be named. |
+| `GK_FA_MMA=0`, `GK_FA_TILED=0`, `GK_FA_VEC=0` | Route fused attention away from one of its kernels, so "which of the four" needs no rebuild. `GK_FA_DUMP=1` says which one each shape took. |
+
+That is what found the one bug of this kind so far. The integer mat-vec
+quantizes its activations into scratch and keeps a claim on them so that the q,
+k and v projections quantize one activation once - and the claim named the
+activation by its *address*. The graph allocator hands a dead tensor's storage
+to a later tensor, so within one execution an address is many tensors, and a
+projection whose activation happened to land on a claimed address was handed
+the earlier tensor's numbers. `GK_NODE_HASH` named the node; `GK_ALLOC_NO_REUSE`
+said it was a lifetime; the claim now names the tensor as well as the address.
+`tests/test_cuda.c` keeps the regression as `aq claim`, which runs one graph
+twice on the device - once with the intermediate pinned so nothing can be
+placed on it - and requires the two to agree bit for bit.
+
 ### A note on where the kernels spend their time
 
 Kernels reach rows through `gk_row_read` / `gk_row_write`, which convert or

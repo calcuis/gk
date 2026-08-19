@@ -3674,6 +3674,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
         // into the old one are not in the new one whatever the other fields
         // still say.
         const void *   aq_src_prev  = scratch->aq_src;
+        const void *   aq_tsr_prev  = scratch->aq_tensor;
         const int64_t  aq_blk_prev  = scratch->aq_blk;
         const int64_t  aq_grp_prev  = scratch->aq_grp;
         const uint64_t aq_pass_prev = scratch->aq_pass;
@@ -3686,7 +3687,15 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             // The q, k and v projections dot different weights against the
             // same activation; if the scratch still holds this exact tensor's
             // blocks from this exact graph pass, the quantize is already done.
-            const bool aq_reuse = aq_src_prev == src1->data &&
+            //
+            // "This exact tensor" is the tensor, not its address. The graph
+            // allocator reuses a dead tensor's storage, so an address that
+            // held the activation of an earlier matmul can hold an unrelated
+            // result of the same size later in the same pass - and then every
+            // other field matches too and the stale blocks are used. See the
+            // note on `aq_tensor` in gk_cuda_common.cuh.
+            const bool aq_reuse = aq_tsr_prev == (const void *) src1 &&
+                                  aq_src_prev == src1->data &&
                                   aq_blk_prev == n_blk && aq_grp_prev == n_grp &&
                                   aq_pass_prev == scratch->pass &&
                                   aq_gen_prev  == scratch->gen;
@@ -3696,10 +3705,11 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                                        GK_CUDA_BLOCK, 0, stream>>>(
                     gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
             }
-            scratch->aq_src  = src1->data;
-            scratch->aq_blk  = n_blk;
-            scratch->aq_grp  = n_grp;
-            scratch->aq_pass = scratch->pass;
+            scratch->aq_src    = src1->data;
+            scratch->aq_tensor = src1;
+            scratch->aq_blk    = n_blk;
+            scratch->aq_grp    = n_grp;
+            scratch->aq_pass   = scratch->pass;
 
             if (mman_splits > 0) {
                 float * part = mman_splits > 1
@@ -5245,7 +5255,15 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
     // path below is for.
     const int fam_d = gk_cuda_fam_bucket(DK, DV);
 
-    if (fam_d != 0 && q->ne[1] >= 16 &&
+    // The same escape hatch GK_FA_VEC gives the split path, for the two paths
+    // above it: with three kernels answering one op, "which kernel is wrong"
+    // is otherwise only answerable by rebuilding.
+    static const char * fa_mma_env   = getenv("GK_FA_MMA");
+    static const char * fa_tiled_env = getenv("GK_FA_TILED");
+    const bool fa_mma   = !(fa_mma_env   != NULL && fa_mma_env[0]   == '0');
+    const bool fa_tiled = !(fa_tiled_env != NULL && fa_tiled_env[0] == '0');
+
+    if (fa_mma && fam_d != 0 && q->ne[1] >= 16 &&
         (int) k->type == GK_TYPE_F16 && (int) v->type == GK_TYPE_F16 &&
         (mask == NULL || (int) mask->type == GK_TYPE_F16) &&
         ((int) q->type == GK_TYPE_F32 || (int) q->type == GK_TYPE_F16 ||
@@ -5344,7 +5362,7 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
     // 32-head, 256-position shape, tiled was 0.21 ms against split's tens of
     // microseconds. Above sixteen rows the mma path has already taken every
     // f16 cache, so this floor only routes the small-q tail.
-    if (q->ne[1] >= GK_CU_FAT_QROWS / 2 && DV <= GK_CU_FAT_MAX_D && scratch != NULL &&
+    if (fa_tiled && q->ne[1] >= GK_CU_FAT_QROWS / 2 && DV <= GK_CU_FAT_MAX_D && scratch != NULL &&
         fat_smem <= (size_t) scratch->smem_max) {
 
         if (fat_smem > 48u * 1024u) {
@@ -5461,4 +5479,5 @@ void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,
             sinks ? (const float *) sinks->data : NULL,
             gk_cu_view_mut(dst), DV, n_split, q->ne[1], q->ne[2]);
     }
+
 }

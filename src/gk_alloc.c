@@ -137,6 +137,19 @@ static size_t gk_dyn_alloc(struct gk_dyn_alloc * a, size_t size) {
 }
 
 static void gk_dyn_free(struct gk_dyn_alloc * a, size_t offset, size_t size) {
+    // GK_ALLOC_NO_REUSE=1: never hand a dead tensor's space to a later one.
+    // Diagnostic only, and expensive - a graph that fits in tens of megabytes
+    // with reuse needs gigabytes without it - but it is the one-run answer to
+    // "is this a wrong kernel or a tensor being written over".
+    static int no_reuse = -1;
+    if (no_reuse < 0) {
+        const char * e = getenv("GK_ALLOC_NO_REUSE");
+        no_reuse = e != NULL && e[0] != '0';
+    }
+    if (no_reuse) {
+        return;
+    }
+
     size = gk_pad_size(size, a->alignment);
 
     // Merge into an adjacent block where possible. Checking both sides means a
@@ -268,6 +281,16 @@ size_t gk_gallocr_get_buffer_size_n(struct gk_gallocr * g, int buffer_id) {
     return g->buffer_sizes[buffer_id];
 }
 
+// GK_ALLOC_TRACE=1: every placement and every release, in graph order.
+static bool gk_alloc_trace(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GK_ALLOC_TRACE");
+        on = e != NULL && e[0] != '0';
+    }
+    return on != 0;
+}
+
 // The tensor that actually owns storage: a view's parent, or the tensor
 // itself. Views collapse to one level at construction, so this is a single
 // step rather than a walk.
@@ -377,6 +400,9 @@ static bool gk_gallocr_run(struct gk_gallocr * g, struct gk_cgraph * graph, bool
     // Unchecked, the pass keeps counting past the end of the buffer and reports
     // success, and the first kernel to write one of those offsets writes
     // outside the allocation.
+    if (assign && gk_alloc_trace()) {
+        gk_logf("=== gallocr assign pass: %d nodes, %d leafs\n", graph->n_nodes, graph->n_leafs);
+    }
     for (int i = 0; i < g->n_bufs; ++i) {
         gk_dyn_reset(&g->dyn[i], assign ? g->buffer_sizes[i] : SIZE_MAX);
     }
@@ -471,6 +497,10 @@ static bool gk_gallocr_run(struct gk_gallocr * g, struct gk_cgraph * graph, bool
                 if (assign) {
                     node->data = (char *) bases[bid] + offset;
                     gk_backend_buffer_init_tensor(g->buffers[bid], node);
+                    if (gk_alloc_trace()) {
+                        gk_logf("alloc node %4d %-12s %-24s buf %d off %10zu size %10zu ptr %p\n",
+                                i, gk_op_name(node->op), node->name, bid, offset, a->size, node->data);
+                    }
                 }
             }
         }
@@ -494,6 +524,11 @@ static bool gk_gallocr_run(struct gk_gallocr * g, struct gk_cgraph * graph, bool
 
             a->n_uses--;
             if (a->n_uses == 0) {
+                if (assign && gk_alloc_trace()) {
+                    gk_logf("free  node %4d %-12s %-24s buf %d off %10zu size %10zu (last read by %s)\n",
+                            i, gk_op_name(owner->op), owner->name, a->buffer_id, a->offset, a->size,
+                            gk_op_name(node->op));
+                }
                 gk_dyn_free(&g->dyn[a->buffer_id], a->offset, a->size);
                 a->allocated = false;
             }

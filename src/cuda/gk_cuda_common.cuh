@@ -360,11 +360,22 @@ struct gk_cuda_scratch {
     // What the scratch currently holds, when that is a quantized activation.
     // The q/k/v projections - and gate/up - dot different weights against the
     // *same* activation, so the second and third quantize of it are the first
-    // one's answer recomputed. A match on all four fields skips the pass; any
-    // other scratch user clears `aq_src` on entry (see gk_cu_scratch_get) and
-    // the invariant holds by construction. `aq_pass` ties the claim to one
+    // one's answer recomputed. A match on every field skips the pass; any
+    // other scratch user clears the claim on entry (see gk_cu_scratch_get)
+    // and the invariant holds by construction. `aq_pass` ties the claim to one
     // graph execution, because the same address holds new numbers next token.
-    const void * aq_src;
+    //
+    // The claim names the *tensor* as well as its address, and it has to: the
+    // graph allocator hands a dead tensor's storage to a later one, so within
+    // a single execution one address is many tensors. Two of them the same
+    // size - an attention output and the normalized activation that fed the
+    // projection before it, both [n_embd, n_token] - matched on address,
+    // block count and pass alike, and the second matmul then dotted its
+    // weights against the first tensor's numbers. Nothing about that is
+    // visible in the kernel: the answer is wrong, deterministic, and moves
+    // when anything upstream changes the allocation.
+    const void * aq_src;     // src1->data
+    const void * aq_tensor;  // src1 itself, which the allocator does not recycle
     int64_t      aq_blk;
     int64_t      aq_grp;
     uint64_t     aq_pass;
@@ -396,7 +407,8 @@ static __host__ __forceinline__ void * gk_cu_scratch_get(struct gk_cuda_scratch 
     // Whoever asked may write the buffer, so any quantized activation in it
     // is spoken for. The one caller that wants to keep it reads the aq fields
     // *before* calling and re-asserts them after.
-    s->aq_src = NULL;
+    s->aq_src    = NULL;
+    s->aq_tensor = NULL;
 
     if (s->ptr != NULL && s->size >= bytes) {
         return s->ptr;

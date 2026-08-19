@@ -1667,6 +1667,58 @@ static struct gk_tensor * build_transformer_block(struct gk_ctx * ctx, struct gk
     return x;
 }
 
+// anima's two attentions, built the way the diffusion engine builds them with
+// flash attention on: the cache cast to f16, V permuted out of [d, head, key]
+// and made contiguous, and the result read back through a view. The kernels
+// answer these shapes correctly when they are handed plain contiguous
+// operands - so if the graph disagrees with the CPU, the disagreement is in
+// what feeds the kernel rather than in the kernel.
+static struct gk_tensor * anima_attention(struct gk_ctx * ctx,
+                                          struct gk_tensor * q,
+                                          struct gk_tensor * k_in,
+                                          struct gk_tensor * v_in,
+                                          int64_t D, int64_t NH, int64_t LQ, int64_t LK) {
+    struct gk_tensor * k = gk_cast(ctx, k_in, GK_TYPE_F16);
+
+    struct gk_tensor * v = gk_cont(ctx, gk_permute(ctx, v_in, 0, 2, 1, 3));
+    v = gk_reshape_3d(ctx, v, D, LK, NH);
+    v = gk_cast(ctx, v, GK_TYPE_F16);
+
+    struct gk_tensor * out = gk_flash_attn_ext(ctx, q, k, v, NULL,
+                                               1.0f / sqrtf((float) D), 0.0f, 0.0f);
+    gk_flash_attn_ext_set_prec(out, GK_PREC_F32);
+
+    out = gk_view_4d(ctx, out, D, NH, LQ, 1,
+                     out->nb[1], out->nb[2], out->nb[1] * NH, 0);
+    out = gk_cont(ctx, out);
+    return gk_reshape_3d(ctx, out, D * NH, LQ, 1);
+}
+
+// The llm adapter's cross-attention: four query rows against a cache of two,
+// which is a prompt of two tokens.
+static struct gk_tensor * build_anima_adapter_fa(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t D = 64, NH = 16, LQ = 4, LK = 2;
+
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, D, LQ, NH);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, D, LK, NH);
+    in[2] = gk_new_tensor_4d(ctx, GK_TYPE_F32, D, NH, LK, 1);
+    *n_in = 3;
+
+    return anima_attention(ctx, in[0], in[1], in[2], D, NH, LQ, LK);
+}
+
+// The transformer's cross-attention: the image against the padded context.
+static struct gk_tensor * build_anima_dit_fa(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t D = 128, NH = 4, LQ = 64, LK = 512;
+
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, D, LQ, NH);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, D, LK, NH);
+    in[2] = gk_new_tensor_4d(ctx, GK_TYPE_F32, D, NH, LK, 1);
+    *n_in = 3;
+
+    return anima_attention(ctx, in[0], in[1], in[2], D, NH, LQ, LK);
+}
+
 static int run_op_tol(gk_backend_t gpu, const char * name, op_builder build, float tol);
 static int run_op(gk_backend_t gpu, const char * name, op_builder build);
 
@@ -1872,6 +1924,15 @@ struct fa_shape {
     int64_t DV;
     enum fa_mask_mode mask;
     bool    sinks;
+    // Keys past this one are written as exact zeros in K and V, with no mask
+    // to go with them - which is not a contrived pattern but what a diffusion
+    // transformer's cross-attention is fed: a prompt of a few tokens in a
+    // context the model pads to a fixed 512. A zero key scores exactly zero
+    // against every query, so the padding carries real softmax weight, and an
+    // error in how the running maximum or the sum treats it costs the
+    // conditioning without costing anything else. Zero means the whole cache
+    // is live.
+    int64_t n_live;
 };
 
 // Builds the graph into `ctx`, and hands back the inputs so both sides can be
@@ -1937,6 +1998,30 @@ static void fa_fill(struct gk_tensor * gpu_t, struct gk_tensor * cpu_t, int * se
     free(f);
 }
 
+// Zero every cache row from `n_live` on, in both copies of the tensor.
+static void fa_zero_tail(struct gk_tensor * gpu_t, struct gk_tensor * cpu_t,
+                         int64_t n_live) {
+    const int64_t d    = cpu_t->ne[0];
+    const int64_t n_kv = cpu_t->ne[1];
+    const size_t  bytes = gk_nbytes(cpu_t);
+
+    char * buf = (char *) malloc(bytes);
+    memcpy(buf, cpu_t->data, bytes);
+
+    for (int64_t i3 = 0; i3 < cpu_t->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < cpu_t->ne[2]; ++i2) {
+            for (int64_t i1 = n_live; i1 < n_kv; ++i1) {
+                memset(buf + i3 * cpu_t->nb[3] + i2 * cpu_t->nb[2] + i1 * cpu_t->nb[1],
+                       0, (size_t) d * cpu_t->nb[0]);
+            }
+        }
+    }
+
+    memcpy(cpu_t->data, buf, bytes);
+    gk_backend_tensor_set(gpu_t, buf, 0, bytes);
+    free(buf);
+}
+
 static int run_flash_attn(gk_backend_t gpu, const char * name,
                           struct fa_shape s, float tol) {
     struct gk_tensor *gq, *gk_, *gv, *gm, *gs;
@@ -1975,6 +2060,11 @@ static int run_flash_attn(gk_backend_t gpu, const char * name,
     fa_fill(gk_, ck,  &seed);
     fa_fill(gv,  cv,  &seed);
     fa_fill(gs,  cs,  &seed);
+
+    if (s.n_live > 0 && s.n_live < s.n_kv) {
+        fa_zero_tail(gk_, ck, s.n_live);
+        fa_zero_tail(gv,  cv, s.n_live);
+    }
 
     if (cm != NULL) {
         const size_t bytes = gk_nbytes(cm);
@@ -2020,6 +2110,146 @@ static int run_flash_attn(gk_backend_t gpu, const char * name,
     gk_gallocr_free(alloc);
     gk_free(gpu_ctx);
     return bad == 0 ? 0 : 1;
+}
+
+// --------------------------------------------------------------------------
+// the quantized-activation claim
+//
+// The integer mat-vec quantizes its activations into scratch and leaves a
+// claim on them, so that the projections which share one activation - q, k
+// and v, or gate and up - quantize it once. What the claim may not be is the
+// activation's *address*: the graph allocator hands a dead tensor's storage
+// to a later tensor of the same size, so within one execution an address is
+// many tensors, and a later matmul whose activation happens to land there was
+// handed the earlier tensor's numbers.
+//
+// A tolerance against the CPU cannot see this. Chained quantized matmuls
+// disagree with the CPU by percent already - the two sides quantize the
+// activations differently and the products cancel - and the wrong answer here
+// is the same size as that noise. So the comparison is device against device:
+// the same graph twice, once with the intermediate pinned as an output so
+// that nothing can be placed on top of it, and once without. Same kernels,
+// same inputs, same arithmetic; the only difference is where the tensors sit,
+// so the two runs have to agree bit for bit.
+// --------------------------------------------------------------------------
+
+static struct gk_tensor * aq_claim_build(struct gk_ctx * ctx, struct gk_tensor ** in, bool pin) {
+    const int64_t K = 1024, N = 4;   // anima's llm adapter: 1024 wide, four tokens
+
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_Q4_K, K, K);
+    in[1] = gk_new_tensor_2d(ctx, GK_TYPE_Q4_K, K, K);
+    in[2] = gk_new_tensor_2d(ctx, GK_TYPE_Q4_K, K, K);
+    in[3] = gk_new_tensor_2d(ctx, GK_TYPE_F32,  K, N);
+
+    struct gk_tensor * x = gk_mul_mat(ctx, in[0], in[3]);
+    if (pin) {
+        // A reference the allocator's walk never gives back, so x keeps its
+        // storage to the end of the graph and the norm below is placed
+        // somewhere else.
+        gk_set_output(x);
+    }
+    struct gk_tensor * a = gk_mul_mat(ctx, in[1], x);   // quantizes x, claims it
+    struct gk_tensor * b = gk_rms_norm(ctx, a, 1e-6f);  // placed where x was
+    return gk_mul_mat(ctx, in[2], b);                   // must quantize b, not reuse x
+}
+
+static int run_aq_claim(gk_backend_t gpu) {
+    struct gk_tensor * in[2][4] = { { NULL } };
+    struct gk_tensor * out[2]   = { NULL, NULL };
+    struct gk_ctx *    ctx[2]   = { NULL, NULL };
+    struct gk_gallocr * alloc[2] = { NULL, NULL };
+    float * got[2] = { NULL, NULL };
+    int64_t n_out  = 0;
+    bool    landed = false;
+    int     rc     = 0;
+
+    for (int pass = 0; pass < 2; ++pass) {
+        ctx[pass] = gk_init((struct gk_init_params) {
+            .mem_size = 4u << 20, .mem_buffer = NULL, .no_alloc = true,
+        });
+        out[pass] = aq_claim_build(ctx[pass], in[pass], pass == 0);
+        gk_set_output(out[pass]);
+
+        struct gk_cgraph * graph = gk_new_graph(ctx[pass]);
+        gk_build_forward_expand(graph, out[pass]);
+
+        alloc[pass] = gk_gallocr_new(gk_backend_get_default_buffer_type(gpu));
+        if (alloc[pass] == NULL || !gk_gallocr_alloc_graph(alloc[pass], graph)) {
+            printf("  %-14s FAIL: could not allocate the device graph\n", "aq claim");
+            rc = 1;
+            goto done;
+        }
+
+        int seed = 0;
+        for (int i = 0; i < 4; ++i) {
+            const int64_t n     = gk_nelements(in[pass][i]);
+            const size_t  bytes = gk_nbytes(in[pass][i]);
+            float * f   = (float *) malloc((size_t) n * sizeof(float));
+            void  * raw = malloc(bytes);
+            for (int64_t j = 0; j < n; ++j) {
+                f[j] = input_value(seed++);
+            }
+            if (in[pass][i]->type == GK_TYPE_F32) {
+                memcpy(raw, f, bytes);
+            } else {
+                gk_get_type_traits(in[pass][i]->type)->from_float(f, raw, n);
+            }
+            gk_backend_tensor_set(in[pass][i], raw, 0, bytes);
+            free(raw);
+            free(f);
+        }
+
+        if (pass == 1) {
+            // Whether the case is exercised at all: the norm has to be placed
+            // exactly where the freed intermediate was, or there is no
+            // recycled address and the run proves nothing.
+            struct gk_tensor * b = out[pass]->src[1];
+            struct gk_tensor * x = b->src[0]->src[1];
+            landed = b->data == x->data;
+        }
+
+        if (gk_backend_graph_compute(gpu, graph) != GK_STATUS_SUCCESS) {
+            printf("  %-14s FAIL: the device graph failed\n", "aq claim");
+            rc = 1;
+            goto done;
+        }
+        gk_backend_synchronize(gpu);
+
+        n_out   = gk_nelements(out[pass]);
+        got[pass] = (float *) malloc((size_t) n_out * sizeof(float));
+        gk_backend_tensor_get(out[pass], got[pass], 0, (size_t) n_out * sizeof(float));
+    }
+
+    {
+        int   bad     = 0;
+        float max_abs = 0.0f;
+        for (int64_t i = 0; i < n_out; ++i) {
+            const float diff = fabsf(got[0][i] - got[1][i]);
+            if (diff > max_abs) {
+                max_abs = diff;
+            }
+            if (!(diff == 0.0f)) {
+                bad++;
+            }
+        }
+        printf("  %-14s %5lld outputs, max abs error %.8g, %d mismatches%s%s\n",
+               "aq claim", (long long) n_out, max_abs, bad,
+               landed ? "" : "  (no address was recycled: unexercised)",
+               bad == 0 ? "" : "  FAIL");
+        rc = bad == 0 ? 0 : 1;
+    }
+
+done:
+    for (int pass = 0; pass < 2; ++pass) {
+        free(got[pass]);
+        if (alloc[pass] != NULL) {
+            gk_gallocr_free(alloc[pass]);
+        }
+        if (ctx[pass] != NULL) {
+            gk_free(ctx[pass]);
+        }
+    }
+    return rc;
 }
 
 // --------------------------------------------------------------------------
@@ -2635,6 +2865,30 @@ int main(void) {
             (struct fa_shape) {  128, 2, 2,  192, 160, 160, FA_MASK_SUFFIX, true }, sd_tol);
         failures += run_flash_attn(gpu, "sd d80 causal",
             (struct fa_shape) {  192, 4, 4,  192, 80, 80, FA_MASK_CAUSAL, false }, sd_tol);
+
+        // Anima's four attention shapes, taken from GK_FA_DUMP on a 512x512
+        // txt2img step. The DiT self-attention (d128, square) is the one the
+        // mma path was tuned on; the other three are what the prompt travels
+        // through, and a wrong answer in any of them costs the conditioning
+        // without costing image quality.
+        failures += run_flash_attn(gpu, "anima dit self",
+            (struct fa_shape) { 1024, 16, 16, 1024, 128, 128, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "anima dit cross",
+            (struct fa_shape) { 1024, 16, 16,  512, 128, 128, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "anima adapter self",
+            (struct fa_shape) {    4, 16, 16,    4,  64,  64, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "anima adapter cross",
+            (struct fa_shape) {    4, 16, 16,    2,  64,  64, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "anima adapter cross 7",
+            (struct fa_shape) {    4, 16, 16,    7,  64,  64, FA_MASK_NONE, false }, sd_tol);
+
+        // The same two shapes with the cache padded the way anima pads it:
+        // ten real tokens and 502 zero keys in the DiT's cross-attention, two
+        // real and two zero in the adapter's.
+        failures += run_flash_attn(gpu, "anima dit cross pad",
+            (struct fa_shape) { 1024, 16, 16,  512, 128, 128, FA_MASK_NONE, false, 10 }, sd_tol);
+        failures += run_flash_attn(gpu, "anima adapter cross pad",
+            (struct fa_shape) {    4, 16, 16,    4,  64,  64, FA_MASK_NONE, false,  2 }, sd_tol);
     }
 
     // top_k on both sides of the width where one network stops fitting: 4096
@@ -2705,8 +2959,11 @@ int main(void) {
     }
 
     printf("composite graphs:\n");
+    failures += run_aq_claim(gpu);
     failures += run_op_tol(gpu, "vae stack",      build_vae_stack, 4e-2f);
     failures += run_op_tol(gpu, "transformer",    build_transformer_block, 4e-3f);
+    failures += run_op_tol(gpu, "anima adapter fa", build_anima_adapter_fa, 1e-3f);
+    failures += run_op_tol(gpu, "anima dit fa",     build_anima_dit_fa,     1e-3f);
 
     gk_backend_free(gpu);
 
