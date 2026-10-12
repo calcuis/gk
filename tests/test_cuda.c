@@ -2180,6 +2180,18 @@ static void fa_zero_tail(struct gk_tensor * gpu_t, struct gk_tensor * cpu_t,
 
 static int run_flash_attn(gk_backend_t gpu, const char * name,
                           struct fa_shape s, float tol) {
+    // GK_FA_ACC16=1 (the diffuser's setting) accumulates P*V in half: the
+    // outputs then carry f16 rounding of the order of 2e-3 against the f32
+    // reference, which is the arithmetic being asked for, not a defect. The
+    // bound below is the one the f32 tiles are held to; a tile bug shows as
+    // errors of order one.
+    {
+        const char * e = getenv("GK_FA_ACC16");
+        if (e != NULL && e[0] == '1' && tol < 4e-3f) {
+            tol = 4e-3f;
+        }
+    }
+
     struct gk_tensor *gq, *gk_, *gv, *gm, *gs;
     struct gk_tensor *cq, *ck, *cv, *cm, *cs;
 
