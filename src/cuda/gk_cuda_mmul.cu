@@ -2018,17 +2018,92 @@ static __device__ __forceinline__ int4 gk_cu_pack8_half(const char * p, int type
     return *(const int4 *) h;
 }
 
-// Whether an operand can be staged eight at a time: contiguous along k, every
-// row start 16-byte aligned, and a k that a run of eight either fits inside or
-// starts past the end of, so the guard stays a comparison rather than a
-// per-element mask.
-static __host__ __forceinline__ bool gk_cuda_mma_f16_vec(const struct gk_tensor * t, int64_t k_len) {
-    if ((size_t) t->nb[0] != gk_type_size(t->type) || k_len % 8 != 0) {
-        return false;
+// The same eight elements through the load width the operand's rows allow
+// (see gk_cuda_mma_f16_align); `al` is uniform across the launch, so the
+// switch costs a predicate, not divergence. The 16-byte class is the pack
+// above; the narrower ones read the run as two 8-byte or four 4-byte words
+// and widen it the same way.
+static __device__ __forceinline__ int4 gk_cu_load8_half(const char * p, int type, int al) {
+    if (al >= 16) {
+        return gk_cu_pack8_half(p, type);
+    }
+
+    __align__(16) __half h[8];
+
+    if (type == GKT_F32) {
+        if (al == 8) {
+            const float2 v0 = ((const float2 *) p)[0];
+            const float2 v1 = ((const float2 *) p)[1];
+            const float2 v2 = ((const float2 *) p)[2];
+            const float2 v3 = ((const float2 *) p)[3];
+            h[0] = __float2half(v0.x); h[1] = __float2half(v0.y);
+            h[2] = __float2half(v1.x); h[3] = __float2half(v1.y);
+            h[4] = __float2half(v2.x); h[5] = __float2half(v2.y);
+            h[6] = __float2half(v3.x); h[7] = __float2half(v3.y);
+        } else {
+            const float * f = (const float *) p;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                h[i] = __float2half(f[i]);
+            }
+        }
+        return *(const int4 *) h;
+    }
+
+    // 16-bit elements: f16 is its own bytes, bf16 is widened per element.
+    __align__(16) uint32_t w[4];
+    if (al == 8) {
+        const uint2 w0 = ((const uint2 *) p)[0];
+        const uint2 w1 = ((const uint2 *) p)[1];
+        w[0] = w0.x; w[1] = w0.y; w[2] = w1.x; w[3] = w1.y;
+    } else {
+        w[0] = ((const uint32_t *) p)[0];
+        w[1] = ((const uint32_t *) p)[1];
+        w[2] = ((const uint32_t *) p)[2];
+        w[3] = ((const uint32_t *) p)[3];
+    }
+    if (type == GKT_F16) {
+        return *(const int4 *) w;
+    }
+    const uint16_t * u = (const uint16_t *) w;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        h[i] = __float2half(gk_cu_bf2f(u[i]));
+    }
+    return *(const int4 *) h;
+}
+
+// The widest load a run of eight can be staged with: 16 bytes when the
+// operand is contiguous along k and every row start is 16-byte aligned, 8 or
+// 4 when the rows are only that aligned, 0 when it is not contiguous along k
+// at all and the scalar arm has to walk the strides.
+//
+// The middle classes exist because of k. A row of f16 is 16-byte aligned only
+// when k is a multiple of 8 and a row of f32 only when it is a multiple of 4,
+// and a model's hidden sizes are not chosen with that in mind: Iris-3B's
+// feed-forward is 6826 wide, so its down-projection - the largest f16 matmul
+// in the step - had every row on a different 4-byte phase. Measured, the
+// scalar arm it fell to ran at 6 TFLOP/s against the vector arm's 20 on the
+// same card; four 4-byte loads a run are within a few percent of one 16-byte
+// one, because what the scalar arm paid for was never the load width but the
+// sixteen address computations and the per-element masks around it.
+//
+// The ragged tail is not this function's concern: a run that does not fit
+// before k_end takes the masked scalar arm whatever the class says, so k
+// itself need not be a multiple of eight.
+static __host__ __forceinline__ int gk_cuda_mma_f16_align(const struct gk_tensor * t) {
+    if ((size_t) t->nb[0] != gk_type_size(t->type)) {
+        return 0;
     }
     const uintptr_t bits = (uintptr_t) t->data | (uintptr_t) t->nb[1]
                          | (uintptr_t) t->nb[2] | (uintptr_t) t->nb[3];
-    return bits % 16 == 0;
+    if (bits % 16 == 0) {
+        return 16;
+    }
+    if (bits % 8 == 0) {
+        return 8;
+    }
+    return bits % 4 == 0 ? 4 : 0;
 }
 
 // Whether this node may accumulate in half. `GK_MM_F16_ACC=1` to allow it;
@@ -2060,12 +2135,74 @@ static __host__ bool gk_cuda_mm_acc16(const struct gk_tensor * dst) {
     return allowed != 0 && (enum gk_prec) gk_get_op_params_i32(dst, 0) != GK_PREC_F32;
 }
 
+// How many row tiles a group of consecutively dispatched blocks spans, which
+// is what decides the tile's DRAM traffic. A block reads one TILE_M-row strip
+// of A and one TILE_N-column strip of B over the whole of k; the blocks
+// resident at once share whatever strips they have in common through L2 and
+// stream the rest from DRAM, and a strip evicted before the next wave wants
+// it is streamed again.
+//
+// The order that served the convolutions - every resident block on one row
+// tile, walking the column tiles - re-reads B once per row tile. That is
+// free when B is a 5 MB weight that lives in L2 for the whole launch, and it
+// is the whole cost when B is not: Iris-3B's feed-forward down-projection
+// puts a 35 MB f16 weight in A and a 120 MB f32 activation in B, and twenty
+// resident blocks each streaming a different 3.5 MB strip of B, twenty
+// row tiles over, came to 2.4 GB through a 192 GB/s bus - 12.5 ms of a 17.7
+// ms matmul whose arithmetic is 6.4 at the tensor rate.
+//
+// So: if B fits in L2 with room to spare, the old order (one row tile at a
+// time); if A does, the transpose of it (every row tile of one column tile
+// at a time, so A is read once and B's strips are shared); if neither, the
+// patch that minimises `TILE_M * G_n + TILE_N * G_m` bytes per wave, which is
+// `G_m = sqrt(W * B_bytes_per_k / A_bytes_per_k)` for a wave of W blocks.
+// Measured on the shape above: 17.7 -> 12.8 ms (the arithmetic floor at the
+// f32-accumulate tensor rate is 6.4, so the rest is the pipeline, not the
+// traffic). `GK_MM_F16_GROUP=N` pins the height - a bisect lever: 1 is the
+// old order.
+static __host__ int gk_cuda_mma_f16_group_m(const struct gk_cuda_scratch * s,
+                                            const struct gk_tensor * a,
+                                            const struct gk_tensor * b,
+                                            int grid_m, int grid_n,
+                                            int tile_m, int64_t k_len) {
+    static const int pinned = gk_cu_env_int("GK_MM_F16_GROUP", 0);
+    if (pinned > 0) {
+        return pinned < grid_m ? pinned : grid_m;
+    }
+
+    const size_t a_bytes = (size_t) gk_type_size(a->type) * (size_t) k_len * (size_t) a->ne[1];
+    const size_t b_bytes = (size_t) gk_type_size(b->type) * (size_t) k_len * (size_t) b->ne[1];
+    const size_t l2      = s != NULL ? s->l2_bytes : 0;
+
+    if (l2 > 0 && b_bytes <= l2 / 2) {
+        return 1;
+    }
+    if (l2 > 0 && a_bytes <= l2 / 2) {
+        return grid_m;
+    }
+
+    const double w  = s != NULL && s->n_sm > 0 ? (double) s->n_sm : 20.0;
+    const double ra = (double) tile_m * (double) gk_type_size(a->type);
+    const double rb = (double) GK_CU_MMA_F16_TILE_N * (double) gk_type_size(b->type);
+
+    int g = (int) (sqrt(w * rb / ra) + 0.5);
+    if (g < 1) {
+        g = 1;
+    }
+    if (g > grid_m) {
+        g = grid_m;
+    }
+    (void) grid_n;
+    return g;
+}
+
 template <int WARPS_M, bool ACC16>
 static __global__ __launch_bounds__(WARPS_M * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE, 1)
 void gk_cu_k_mul_mat_mma_f16(gk_tview a, gk_tview b, gk_tview_mut d,
                              int64_t k_len, int64_t r2, int64_t r3,
-                             bool a_vec, bool b_vec,
-                             float * part, int64_t k_split, int64_t n_23) {
+                             int a_al, int b_al,
+                             float * part, int64_t k_split, int64_t n_23,
+                             int grid_m, int group_m) {
     const int TILE_M = WARPS_M * GK_CU_MMA_F16_WM;
 
     // Sixteen-byte aligned, and the padded row stride is a multiple of sixteen
@@ -2091,18 +2228,25 @@ void gk_cu_k_mul_mat_mma_f16(gk_tview a, gk_tview b, gk_tview_mut d,
 
     const int n_threads = WARPS_M * GK_CU_MMA_F16_WARPS_N * GK_WARP_SIZE;
 
-    // x is the *column* tile and y the row tile, which is the opposite of the
-    // obvious assignment and is deliberate. Blocks are dispatched x fastest, so
-    // whichever axis x carries is the one whose blocks are co-resident - and
-    // the blocks that should be co-resident are the ones that share an operand.
-    // Here every block covering a row tile reads the same TILE_M rows of A,
-    // which for a UNet's convolutions is the big operand: 4096x8640 halves, 71
-    // MB, against a 5 MB weight. With x on the row axis those blocks are
-    // separated by the whole grid and A is re-read from DRAM once per column
-    // tile; with x on the column axis they run together and the re-reads come
-    // out of L2.
-    const int64_t m0  = (int64_t) blockIdx.y * TILE_M;
-    const int64_t n0  = (int64_t) blockIdx.x * GK_CU_MMA_F16_TILE_N;
+    // The output tiles are walked in groups of `group_m` row tiles: within a
+    // group consecutive blocks take consecutive *row* tiles of one column
+    // tile, then the next column tile, so the blocks resident together - the
+    // ones dispatched consecutively - cover a group_m-tall, (wave/group_m)-wide
+    // patch of the output and share both operands' tiles through L2. Which
+    // group height pays depends on the operands, so the host chooses it (see
+    // gk_cuda_mma_f16_group_m): one, the old "x is the column tile" order, when
+    // B is small enough to live in L2 and only A's re-reads cost anything; the
+    // whole of grid_m when it is A that fits; a square-ish patch when neither
+    // does. The last group may be shorter than group_m.
+    const int grid_n = (int) gridDim.x / grid_m;
+    const int bid    = (int) blockIdx.x;
+    const int g      = bid / (group_m * grid_n);
+    const int m_beg  = g * group_m;
+    const int gm     = min(group_m, grid_m - m_beg);
+    const int r      = bid - g * (group_m * grid_n);
+
+    const int64_t m0  = (int64_t) (m_beg + r % gm) * TILE_M;
+    const int64_t n0  = (int64_t) (r / gm) * GK_CU_MMA_F16_TILE_N;
 
     // z carries the slice and, when k is split, which piece of k this block
     // reduces. A split block owns the same output patch as its siblings and
@@ -2200,8 +2344,8 @@ void gk_cu_k_mul_mat_mma_f16(gk_tview a, gk_tview b, gk_tview_mut d,
                                                                                      \
             if (m < n_rows) {                                                        \
                 const char * row = gk_cu_row(a, m, a2, a3);                          \
-                if (a_vec && k + 8 <= k_end) {                                       \
-                    pa[i] = *(const int4 *) (row + k * a.nb[0]);                     \
+                if (a_al != 0 && k + 8 <= k_end) {                                   \
+                    pa[i] = gk_cu_load8_half(row + k * a.nb[0], a.type, a_al);       \
                 } else {                                                             \
                     __align__(16) __half h[8];                                       \
                     _Pragma("unroll")                                                \
@@ -2226,9 +2370,9 @@ void gk_cu_k_mul_mat_mma_f16(gk_tview a, gk_tview b, gk_tview_mut d,
             pb[i] = make_int4(0, 0, 0, 0);                                           \
                                                                                      \
             if (n < n_cols) {                                                        \
-                if (b_vec && k + 8 <= k_end) {                                       \
-                    pb[i] = gk_cu_pack8_half(gk_cu_row(b, n, i2, i3) + k * b.nb[0],  \
-                                             b.type);                                \
+                if (b_al != 0 && k + 8 <= k_end) {                                   \
+                    pb[i] = gk_cu_load8_half(gk_cu_row(b, n, i2, i3) + k * b.nb[0],  \
+                                             b.type, b_al);                          \
                 } else {                                                             \
                     __align__(16) __half h[8];                                       \
                     _Pragma("unroll")                                                \
@@ -2406,6 +2550,325 @@ static __global__ void gk_cu_k_mma_f16_combine(const float * part, gk_tview_mut 
         }
 
         gk_cu_set(d, m, n, i23 % d.ne[2], i23 / d.ne[2], sum);
+    }
+}
+
+
+// --------------------------------------------------------------------------
+// The f16 tile, pipelined.
+//
+// The register-staged tile above runs stage -> store -> barrier -> compute
+// inside one block of sixteen warps, one block per multiprocessor, and on
+// Iris-3B's 6826-wide down-projection it reached 12.8 ms against an
+// arithmetic floor of 6.4 at the f32-accumulate tensor rate (ggml: 5.8,
+// accumulating in half). What it lacks is what Investigation 11 gave the
+// q2_K tile: a copy that never lands in a register, issued a round ahead,
+// so the warps that are computing round g are not the ones waiting on the
+// loads of round g+1, and two independent blocks per multiprocessor so one
+// block's barrier is covered by the other's arithmetic.
+//
+// Same geometry as that tile: 128x128 over eight warps of 32x64 (the 64-row
+// tile over four for shapes short of rows), k in rounds of 32, both operands
+// `cp.async`'d straight into a [2]-buffered shared tile with the padded row
+// stride `ldmatrix` wants, `__launch_bounds__(256, 2)`.
+//
+// B has to be f16 in global for that, and rows of one stride. src1 is used
+// as it stands when it already is (a convolution's f16 weights); an f32
+// activation is converted once into scratch, k padded to the round and
+// zero-filled, by the stage kernel below - the pass ggml makes too, and at
+// a 120 MB activation it costs about a millisecond against the eleven the
+// register-staged tile spent streaming it as f32. A gets the same copy when
+// its rows are not 16-byte aligned (a k that is not a multiple of eight).
+// The ragged tail and the rows past the end are zero-filled by the copy
+// itself (`src-size`), so the compute phase carries no bounds arithmetic.
+// --------------------------------------------------------------------------
+
+#define GK_CU_F16P_TILE_N  128
+#define GK_CU_F16P_K       32   // k per round: two mma windows
+#define GK_CU_F16P_SK      40   // padded row stride in halves: 80 B, 16-byte aligned, conflict-free
+#define GK_CU_F16P_WARPS_N 2
+#define GK_CU_F16P_WM      32   // rows a warp owns
+#define GK_CU_F16P_WN      64   // columns a warp owns
+#define GK_CU_F16P_WNT     (GK_CU_F16P_WN / 8)
+
+// The commit/wait pair is defined with the q2_K pipeline tile further down.
+static __device__ __forceinline__ void gk_cu_cp_async_commit();
+template <int N>
+static __device__ __forceinline__ void gk_cu_cp_async_wait();
+
+// A 16-byte global->shared copy that zero-fills past `src_bytes` (0..16).
+// The zero-fill is how the tile's edges are handled: a row past the end or
+// a run past k is a copy of nothing.
+static __device__ __forceinline__ void gk_cu_cp_async16_zfill(void * dst, const void * src, int src_bytes) {
+#if defined(GK_CU_HAVE_MMA)
+    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(s), "l"(src), "r"(src_bytes));
+#else
+    const char * sp = (const char *) src;
+    char *       dp = (char *) dst;
+    for (int i = 0; i < 16; ++i) {
+        dp[i] = i < src_bytes ? sp[i] : 0;
+    }
+#endif
+}
+
+// B as the tile wants it: f16, every row `k_pad` halves, zero past k_len.
+// Rows are src1's [n, i2, i3] rows in order. The fast arm is the same eight
+// at a time the register-staged tile reads; the ragged tail and a permuted
+// operand go through the accessor.
+static __global__ void gk_cu_k_mma_f16p_stage_b(gk_tview b, __half * __restrict__ out,
+                                                int64_t k_len, int64_t k_pad,
+                                                int64_t n_rows, int b_al) {
+    const int64_t n_chunks = k_pad / 8;
+    const int64_t e        = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_rows * n_chunks) {
+        return;
+    }
+    const int64_t row = e / n_chunks;
+    const int64_t k   = (e % n_chunks) * 8;
+
+    int64_t i1, i2, i3;
+    gk_cu_unrow(row, b.ne, &i1, &i2, &i3);
+
+    int4 v;
+    if (b_al != 0 && k + 8 <= k_len) {
+        v = gk_cu_load8_half(gk_cu_row(b, i1, i2, i3) + k * b.nb[0], b.type, b_al);
+    } else {
+        __align__(16) __half h[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            h[j] = __float2half(k + j < k_len ? gk_cu_get(b, k + j, i1, i2, i3) : 0.0f);
+        }
+        v = *(const int4 *) h;
+    }
+    *(int4 *) (out + row * k_pad + k) = v;
+}
+
+// Both operands arrive as f16 rows of one stride each: `aq` is src0 itself
+// when its rows are contiguous and 16-byte aligned, otherwise the stage
+// kernel's copy; `bq` likewise for src1. The batch of A for slice (i2, i3)
+// is (i2 / r2, i3 / r3), its rows `a_ne2 * a_ne3` deep in `aq`.
+template <int WARPS_M, bool ACC16>
+static __global__ __launch_bounds__(WARPS_M * GK_CU_F16P_WARPS_N * GK_WARP_SIZE, 2)
+void gk_cu_k_mul_mat_mma_f16p(const __half * __restrict__ aq, int64_t a_stride, int64_t a_ne2,
+                              const __half * __restrict__ bq, int64_t b_stride,
+                              gk_tview_mut d, int64_t k_len, int64_t r2, int64_t r3,
+                              float * part, int64_t k_split, int64_t n_23,
+                              int grid_m, int group_m) {
+    constexpr int TILE_M  = WARPS_M * GK_CU_F16P_WM;
+    constexpr int THREADS = WARPS_M * GK_CU_F16P_WARPS_N * GK_WARP_SIZE;
+
+    static_assert(GK_CU_F16P_SK % 8 == 0, "ldmatrix needs 16-byte aligned rows");
+    static_assert((TILE_M * 4) % THREADS == 0 && (GK_CU_F16P_TILE_N * 4) % THREADS == 0,
+                  "the staging runs must divide the block");
+
+    __shared__ __align__(16) __half As[2][TILE_M][GK_CU_F16P_SK];
+    __shared__ __align__(16) __half Bs[2][GK_CU_F16P_TILE_N][GK_CU_F16P_SK];
+
+    const int tid    = (int) threadIdx.x;
+    const int lane   = tid % GK_WARP_SIZE;
+    const int warp   = tid / GK_WARP_SIZE;
+    const int warp_m = warp / GK_CU_F16P_WARPS_N;
+    const int warp_n = warp % GK_CU_F16P_WARPS_N;
+    const int group  = lane / 4;
+    const int tig    = lane % 4;
+
+    // Grouped tile order, exactly as the register-staged tile decodes it.
+    const int grid_n = (int) gridDim.x / grid_m;
+    const int bid    = (int) blockIdx.x;
+    const int g      = bid / (group_m * grid_n);
+    const int m_beg  = g * group_m;
+    const int gm     = min(group_m, grid_m - m_beg);
+    const int r      = bid - g * (group_m * grid_n);
+
+    const int64_t m0 = (int64_t) (m_beg + r % gm) * TILE_M;
+    const int64_t n0 = (int64_t) (r / gm) * GK_CU_F16P_TILE_N;
+
+    const int64_t i23   = blockIdx.z % n_23;
+    const int64_t split = blockIdx.z / n_23;
+
+    const int64_t k_beg = split * k_split;
+    const int64_t k_end = part != NULL && k_beg + k_split < k_len ? k_beg + k_split : k_len;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    // The rows of this slice's operands, in the stage kernel's order.
+    const __half * arow0 = aq + (a3 * a_ne2 + a2) * n_rows * a_stride;
+    const __half * brow0 = bq + (i3 * d.ne[2] + i2) * n_cols * b_stride;
+
+    float acc[2][GK_CU_F16P_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < 2; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_F16P_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    int acch[2][GK_CU_F16P_WNT][2];
+#define GK_CU_F16P_ACC_CLEAR()                                                 \
+    _Pragma("unroll")                                                          \
+    for (int wt = 0; wt < 2; ++wt) {                                           \
+        _Pragma("unroll")                                                      \
+        for (int ct = 0; ct < GK_CU_F16P_WNT; ++ct) {                          \
+            acch[wt][ct][0] = 0;                                               \
+            acch[wt][ct][1] = 0;                                               \
+        }                                                                      \
+    }
+#define GK_CU_F16P_ACC_DRAIN()                                                 \
+    _Pragma("unroll")                                                          \
+    for (int wt = 0; wt < 2; ++wt) {                                           \
+        _Pragma("unroll")                                                      \
+        for (int ct = 0; ct < GK_CU_F16P_WNT; ++ct) {                          \
+            const __half2 lo = *(const __half2 *) &acch[wt][ct][0];            \
+            const __half2 hi = *(const __half2 *) &acch[wt][ct][1];            \
+            acc[wt][ct][0] += __low2float(lo);                                 \
+            acc[wt][ct][1] += __high2float(lo);                                \
+            acc[wt][ct][2] += __low2float(hi);                                 \
+            acc[wt][ct][3] += __high2float(hi);                                \
+        }                                                                      \
+    }                                                                          \
+    GK_CU_F16P_ACC_CLEAR()
+
+    if (ACC16) {
+        GK_CU_F16P_ACC_CLEAR();
+    }
+
+    // One round's copies, sixteen bytes at a time. Every copy is issued; the
+    // ones past an edge copy zero bytes.
+    auto stage = [&](int buf, int64_t k0) {
+#pragma unroll
+        for (int i = 0; i < (TILE_M * 4) / THREADS; ++i) {
+            const int     e  = tid + i * THREADS;
+            const int     rr = e / 4;
+            const int     kc = e % 4;
+            const int64_t m  = m0 + rr;
+            const int64_t k  = k0 + kc * 8;
+            const bool    in = m < n_rows && k < k_end;
+            const __half * src = in ? arow0 + m * a_stride + k : aq;
+            int bytes = in ? (int) ((k_end - k) * 2) : 0;
+            bytes = bytes > 16 ? 16 : bytes;
+            gk_cu_cp_async16_zfill(&As[buf][rr][kc * 8], src, bytes);
+        }
+#pragma unroll
+        for (int i = 0; i < (GK_CU_F16P_TILE_N * 4) / THREADS; ++i) {
+            const int     e  = tid + i * THREADS;
+            const int     cc = e / 4;
+            const int     kc = e % 4;
+            const int64_t n  = n0 + cc;
+            const int64_t k  = k0 + kc * 8;
+            const bool    in = n < n_cols && k < k_end;
+            const __half * src = in ? brow0 + n * b_stride + k : bq;
+            int bytes = in ? (int) ((k_end - k) * 2) : 0;
+            bytes = bytes > 16 ? 16 : bytes;
+            gk_cu_cp_async16_zfill(&Bs[buf][cc][kc * 8], src, bytes);
+        }
+    };
+
+    const int64_t n_rounds = (k_end - k_beg + GK_CU_F16P_K - 1) / GK_CU_F16P_K;
+
+    if (n_rounds > 0) {
+        stage(0, k_beg);
+    }
+    gk_cu_cp_async_commit();
+
+    int chunk = 0;
+
+    for (int64_t rd = 0; rd < n_rounds; ++rd) {
+        const int buf = (int) (rd & 1);
+
+        if (rd + 1 < n_rounds) {
+            stage(buf ^ 1, k_beg + (rd + 1) * GK_CU_F16P_K);
+            gk_cu_cp_async_commit();
+            gk_cu_cp_async_wait<1>();
+        } else {
+            gk_cu_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int kk = h * 16;
+
+            int af[2][4];
+#pragma unroll
+            for (int wt = 0; wt < 2; ++wt) {
+                const int r0 = warp_m * GK_CU_F16P_WM + wt * 16;
+                gk_cu_ldmatrix_x4(
+                    af[wt], (const int *) &As[buf][r0 + (lane % 16)][kk + (lane / 16) * 8]);
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_F16P_WNT; ct += 2) {
+                const int c0 = warp_n * GK_CU_F16P_WN + ct * 8;
+
+                int bf[4];
+                gk_cu_ldmatrix_x4(
+                    bf, (const int *) &Bs[buf][c0 + (lane % 16)][kk + (lane / 16) * 8]);
+
+                const int bf0[2] = { bf[0], bf[2] };
+                const int bf1[2] = { bf[1], bf[3] };
+
+#pragma unroll
+                for (int wt = 0; wt < 2; ++wt) {
+                    if (ACC16) {
+                        gk_cu_mma_f16_h(acch[wt][ct],     af[wt], bf0);
+                        gk_cu_mma_f16_h(acch[wt][ct + 1], af[wt], bf1);
+                    } else {
+                        gk_cu_mma_f16(acc[wt][ct],     af[wt], bf0);
+                        gk_cu_mma_f16(acc[wt][ct + 1], af[wt], bf1);
+                    }
+                }
+            }
+        }
+
+        if (ACC16) {
+            if (++chunk == GK_CU_MMA_F16_ACC_CHUNK) {
+                GK_CU_F16P_ACC_DRAIN();
+                chunk = 0;
+            }
+        }
+
+        // The next round's stage overwrites the buffer just computed; every
+        // warp has to be past it first.
+        __syncthreads();
+    }
+
+    if (ACC16 && chunk != 0) {
+        GK_CU_F16P_ACC_DRAIN();
+    }
+#undef GK_CU_F16P_ACC_DRAIN
+#undef GK_CU_F16P_ACC_CLEAR
+
+#pragma unroll
+    for (int wt = 0; wt < 2; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_F16P_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_F16P_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_F16P_WN + ct * 8
+                                + tig * 2 + (i & 1);
+
+                if (m < n_rows && n < n_cols) {
+                    if (part != NULL) {
+                        part[((split * n_23 + i23) * n_cols + n) * n_rows + m] = acc[wt][ct][i];
+                    } else {
+                        gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3598,6 +4061,318 @@ void gk_cu_k_mul_mat_mma_q2k_pipe(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The nvfp4 integer tile, pipelined.
+//
+// The synchronous tile above stages a decoded round, barriers, computes, and
+// barriers again; its weight stream is prefetched a round ahead into
+// registers, its activation stream is not, and on this card it sits at
+// 1.35x of ggml's mmq at every Iris-3B shape (7.4 against 5.5 ms on the
+// 2560x6826 feed-forward). This is the same kernel in the shape the q2_K
+// pipeline tile (gk_cu_k_mul_mat_mma_q2k_pipe) found paid 17-25%: both
+// operands `cp.async`'d raw into a [2]-buffered shared tile a round ahead,
+// so nothing the stage does lands in a register and the warps computing
+// round g never wait on round g+1's loads; the e2m1 decode moves to the
+// fragment load, one nibble quad per mma operand register.
+//
+// A round is one nvfp4 block of k - 64 elements, two mma k32 windows, each
+// two k16 sub-windows with their own e4m3 scale - which is 9 raw words per
+// weight row (the scale word and eight code words) and, per column, two
+// q8 blocks' eight code words and their scale. Rows and columns past the
+// edge are zeroed once in both buffers and never staged again.
+//
+// Measured on the 4050 (2026-10-10) it is *slower* than the synchronous tile:
+// 8.6 against 7.4 ms on the 2560x6826 feed-forward, 3.4 against 3.0 on the
+// 2560x2560 projection, with test-cuda agreeing to the last mismatch. The
+// synchronous tile already prefetches its weight stream a round ahead, so
+// the pipeline buys only the activation side's latency, and it pays for that
+// with the decode: every warp now decodes its own 32 rows (16 nibble quads
+// and 8 e4m3 conversions a lane a round, against 8 and 2 when the stage
+// decoded once for both warp columns), and it still spills 16 bytes at the
+// 128-register budget. The remaining 1.35x to ggml's mmq is not where the
+// q2_K tile's was.
+//
+// Kept as an experiment, off: `GK_MM_NVFP4_PIPE=1` runs the wide shape on it.
+// The narrow (64-row) shape never takes it.
+// --------------------------------------------------------------------------
+
+#define GK_CU_NVP_TILE_N  128
+#define GK_CU_NVP_WARPS_N 2
+#define GK_CU_NVP_WM      32
+#define GK_CU_NVP_WN      64
+#define GK_CU_NVP_WMT     (GK_CU_NVP_WM / 16)
+#define GK_CU_NVP_WNT     (GK_CU_NVP_WN / 8)
+
+template <int WM_>
+static __global__ __launch_bounds__(WM_ * GK_CU_NVP_WARPS_N * GK_WARP_SIZE, 2)
+void gk_cu_k_mul_mat_mma_nvfp4_pipe(gk_tview a, gk_tview_mut d, const gk_cu_q8blk * aq,
+                                    int64_t n_grp, int64_t r2, int64_t r3) {
+    constexpr int TM      = WM_ * GK_CU_NVP_WM;              // rows a block owns
+    constexpr int THREADS = WM_ * GK_CU_NVP_WARPS_N * GK_WARP_SIZE;
+    constexpr int NCOL    = THREADS / 4;                     // rows/columns one stage pass covers
+    constexpr int NA      = TM / NCOL;                       // a thread's distinct rows
+    constexpr int NB      = GK_CU_NVP_TILE_N / NCOL;         // a thread's distinct columns
+
+    static_assert(WM_ == 4, "the shape this kernel is tuned at: 128x128 over eight warps");
+    static_assert(THREADS == TM * 2, "the scale stages assume two threads per row");
+
+    __shared__ int      Ar [2][TM][9];                       // the block's eight code words + pad
+    __shared__ uint32_t Asc[2][TM];                          // its four e4m3 scales
+    __shared__ int      Bs [2][2][GK_CU_NVP_TILE_N][9];      // [buf][group][col][word + pad]
+    __shared__ float    Ad [2][2][GK_CU_NVP_TILE_N];         // [buf][group][col] activation scale
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int warp_m = warp / GK_CU_NVP_WARPS_N;
+    const int warp_n = warp % GK_CU_NVP_WARPS_N;
+
+    const int64_t m0  = (int64_t) blockIdx.x * TM;
+    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_NVP_TILE_N;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
+
+    // Stage geometry: four lanes to a row or column, two adjacent words each,
+    // so a warp's copies walk eight consecutive 32-byte runs. Base pointers
+    // are hoisted: a thread only ever touches the same rows and columns.
+    const int stage_w = 2 * ((int) threadIdx.x % 4);
+    const int stage_c = (int) threadIdx.x / 4;
+
+    const uint8_t * frow[NA] = {};
+#pragma unroll
+    for (int j = 0; j < NA; ++j) {
+        const int64_t m = m0 + stage_c + j * NCOL;
+        if (m < n_rows) {
+            frow[j] = (const uint8_t *) gk_cu_row(a, m, a2, a3);
+        }
+    }
+
+    const gk_cu_q8blk * bblk[NB] = {};
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        const int64_t n = n0 + stage_c + j * NCOL;
+        if (n < n_cols) {
+            bblk[j] = aq23 + n * n_grp;
+        }
+    }
+
+    // The scalar stages: the low half of the block copies the scale word of
+    // row threadIdx.x, the high half the two activation scales of column
+    // threadIdx.x - TM.
+    const int       sc_i    = (int) threadIdx.x % TM;
+    const bool      sc_hi   = (int) threadIdx.x >= TM;
+    const uint8_t * sc_row  = !sc_hi && m0 + sc_i < n_rows
+        ? (const uint8_t *) gk_cu_row(a, m0 + sc_i, a2, a3) : NULL;
+    const gk_cu_q8blk * sc_col = sc_hi && sc_i < GK_CU_NVP_TILE_N && n0 + sc_i < n_cols
+        ? aq23 + (n0 + sc_i) * n_grp : NULL;
+
+    // Rows and columns past the edge, zeroed once in both buffers.
+    {
+        const int x = (int) threadIdx.x % TM;
+        const int h = (int) threadIdx.x / TM;
+
+        if (m0 + x >= n_rows) {
+            if (h == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { Ar[b][x][i] = 0; }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) { Asc[b][x] = 0; }
+            }
+        }
+
+        const int c = (int) threadIdx.x % GK_CU_NVP_TILE_N;
+        if (n0 + c >= n_cols) {
+            if (h == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int sg = 0; sg < 2; ++sg) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { Bs[b][sg][c][i] = 0; }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+                    Ad[b][0][c] = 0.0f;
+                    Ad[b][1][c] = 0.0f;
+                }
+            }
+        }
+    }
+
+    // One round's copies: the block `it` of every row this thread stages,
+    // the two q8 blocks of every column, and the scalars.
+    const auto stage = [&](int64_t it, int buf) {
+#pragma unroll
+        for (int j = 0; j < NA; ++j) {
+            const uint8_t * rp = frow[j];
+            if (rp != NULL) {
+                const uint8_t * qs = rp + it * 36 + 4;
+                const int       r  = stage_c + j * NCOL;
+                gk_cu_cp_async4(&Ar[buf][r][stage_w    ], qs + 4 * stage_w);
+                gk_cu_cp_async4(&Ar[buf][r][stage_w + 1], qs + 4 * stage_w + 4);
+            }
+        }
+
+        const int64_t g = it * 2;
+#pragma unroll
+        for (int it2 = 0; it2 < 2 * NB; ++it2) {
+            const int jj = it2 % NB;
+            const int sg = it2 / NB;
+            const int c  = stage_c + jj * NCOL;
+
+            const gk_cu_q8blk * bp = bblk[jj];
+            if (bp != NULL) {
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w    ], &bp[g + sg].q[stage_w    ]);
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w + 1], &bp[g + sg].q[stage_w + 1]);
+            }
+        }
+
+        if (sc_row != NULL) {
+            gk_cu_cp_async4(&Asc[buf][sc_i], sc_row + it * 36);
+        }
+        if (sc_col != NULL) {
+            gk_cu_cp_async4(&Ad[buf][0][sc_i], &sc_col[g    ].d);
+            gk_cu_cp_async4(&Ad[buf][1][sc_i], &sc_col[g + 1].d);
+        }
+    };
+
+    float acc[GK_CU_NVP_WMT][GK_CU_NVP_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_NVP_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_NVP_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    // Which raw word and which nibble of it a lane's fragment register is:
+    // sub-block `sb` of the round is words 2*sb and 2*sb+1, the low nibbles
+    // elements 0..7 and the high ones 8..15, and the k16 fragment wants
+    // elements 4*tig..4*tig+3 of it.
+    const int a_word  = tig & 1;
+    const int a_shift = (tig >> 1) * 4;
+
+    const int64_t n_iter = n_grp / 2;
+
+    if (n_iter > 0) {
+        stage(0, 0);
+    }
+    gk_cu_cp_async_commit();
+
+    for (int64_t it = 0; it < n_iter; ++it) {
+        const int buf = (int) (it & 1);
+
+        if (it + 1 < n_iter) {
+            stage(it + 1, buf ^ 1);
+            gk_cu_cp_async_commit();
+            gk_cu_cp_async_wait<1>();
+        } else {
+            gk_cu_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        // This round's raw words and scales for the lane's two row halves,
+        // read once and decoded per sub-block.
+        int      aw[GK_CU_NVP_WMT][2][4];
+        uint32_t sc[GK_CU_NVP_WMT][2];
+#pragma unroll
+        for (int wt = 0; wt < GK_CU_NVP_WMT; ++wt) {
+            const int r_lo = warp_m * GK_CU_NVP_WM + wt * 16 + group;
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                aw[wt][0][sb] = Ar[buf][r_lo    ][2 * sb + a_word];
+                aw[wt][1][sb] = Ar[buf][r_lo + 8][2 * sb + a_word];
+            }
+            sc[wt][0] = Asc[buf][r_lo    ];
+            sc[wt][1] = Asc[buf][r_lo + 8];
+        }
+
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            int   af[2][GK_CU_NVP_WMT][2];
+            float ws[2][GK_CU_NVP_WMT][2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int sb = kk * 2 + h;
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_NVP_WMT; ++wt) {
+                    af[h][wt][0] = gk_cu_e2m1_quad(aw[wt][0][sb], a_shift);
+                    af[h][wt][1] = gk_cu_e2m1_quad(aw[wt][1][sb], a_shift);
+                    ws[h][wt][0] = gk_cu_ue4m3((uint8_t) (sc[wt][0] >> (8 * sb)));
+                    ws[h][wt][1] = gk_cu_ue4m3((uint8_t) (sc[wt][1] >> (8 * sb)));
+                }
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_NVP_WNT; ++ct) {
+                const int c  = warp_n * GK_CU_NVP_WN + ct * 8 + group;
+                const int cd = warp_n * GK_CU_NVP_WN + ct * 8 + tig * 2;
+
+                const int bf0 = Bs[buf][kk][c][    tig];
+                const int bf1 = Bs[buf][kk][c][4 + tig];
+
+                const float adv0 = Ad[buf][kk][cd    ];
+                const float adv1 = Ad[buf][kk][cd + 1];
+
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_NVP_WMT; ++wt) {
+                    int df0[4] = { 0, 0, 0, 0 };
+                    int df1[4] = { 0, 0, 0, 0 };
+
+                    gk_cu_mma_s8(df0, af[0][wt], bf0);
+                    gk_cu_mma_s8(df1, af[1][wt], bf1);
+
+                    acc[wt][ct][0] += adv0 * (ws[0][wt][0] * (float) df0[0] + ws[1][wt][0] * (float) df1[0]);
+                    acc[wt][ct][1] += adv1 * (ws[0][wt][0] * (float) df0[1] + ws[1][wt][0] * (float) df1[1]);
+                    acc[wt][ct][2] += adv0 * (ws[0][wt][1] * (float) df0[2] + ws[1][wt][1] * (float) df1[2]);
+                    acc[wt][ct][3] += adv1 * (ws[0][wt][1] * (float) df0[3] + ws[1][wt][1] * (float) df1[3]);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_NVP_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_NVP_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_NVP_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_NVP_WN + ct * 8
+                                + tig * 2 + (i & 1);
+
+                if (m < n_rows && n < n_cols) {
+                    gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                }
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // The narrow integer tile: 2..23 columns, the shape of a speculative verify.
 //
 // The NC dp4a mat-vec covers this range, and at four columns it is issue
@@ -3952,6 +4727,16 @@ static int                g_gk_mm_act     = -1;
 static float4             g_gk_mm_actp    = { 0.0f, 0.0f, 0.0f, 0.0f };
 static struct gk_tensor * g_gk_mm_act_dst = NULL;
 
+// The activation a folded matmul (see gk_cuda_mul_mat) is really reading, for
+// the quantize claim: the fold hands the dispatch a stack copy of src1, and a
+// claim keyed on that copy's address would match the next fold's copy in the
+// same slot whatever tensor it held.
+static const struct gk_tensor * g_gk_mm_src1_id = NULL;
+
+static inline const struct gk_tensor * gk_cu_mm_src1_id(const struct gk_tensor * src1) {
+    return g_gk_mm_src1_id != NULL ? g_gk_mm_src1_id : src1;
+}
+
 bool gk_cuda_mm_act_fusable(const struct gk_cuda_scratch * scratch,
                             const struct gk_tensor * mm) {
     return scratch != NULL && mm->src[0] != NULL &&
@@ -4084,6 +4869,62 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         (int) gk_is_contiguous(ts[t]));
             }
         }
+    }
+
+    // A 2-D weight against a batched activation whose batches sit end to end
+    // is one GEMM with the batches as extra columns, and it is dispatched as
+    // one. Left as written it is dispatched by ne[1] alone: Iris-3B's text
+    // embedder runs its 7680x2560 projections over [2560, 12, 300] - twelve
+    // columns per batch, three hundred batches - and twelve columns is below
+    // every tile's gate, so the 3600-column matmul ran as three hundred
+    // mat-vecs at 1.9 TFLOP/s where the tile does 20. Folding is exact when
+    // src1 and dst are contiguous: column n of the folded view is byte for
+    // byte the same column the batched kernels would have indexed.
+    //
+    // The copies are stack-local and only the dispatch below sees them; the
+    // claim is told which tensor the copy stands for (g_gk_mm_src1_id), and
+    // the activation epilogue's destination, when there is one, is folded
+    // the same way so its bounds agree with the grid.
+    if (g_gk_mm_src1_id == NULL &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[2] * src1->ne[3] > 1 &&
+        gk_is_contiguous(src1) && gk_is_contiguous(dst) &&
+        (g_gk_mm_act_dst == NULL || gk_is_contiguous(g_gk_mm_act_dst))) {
+        struct gk_tensor f_src1 = *src1;
+        struct gk_tensor f_dst  = *dst;
+        struct gk_tensor f_act;
+
+        const int64_t n_fold = src1->ne[1] * src1->ne[2] * src1->ne[3];
+
+        f_src1.ne[1] = n_fold;
+        f_src1.ne[2] = 1;
+        f_src1.ne[3] = 1;
+        f_src1.nb[2] = f_src1.nb[1] * n_fold;
+        f_src1.nb[3] = f_src1.nb[2];
+
+        f_dst.ne[1] = n_fold;
+        f_dst.ne[2] = 1;
+        f_dst.ne[3] = 1;
+        f_dst.nb[2] = f_dst.nb[1] * n_fold;
+        f_dst.nb[3] = f_dst.nb[2];
+        f_dst.src[1] = &f_src1;
+
+        struct gk_tensor * act_prev = g_gk_mm_act_dst;
+        if (act_prev != NULL) {
+            f_act = *act_prev;
+            f_act.ne[1] = n_fold;
+            f_act.ne[2] = 1;
+            f_act.ne[3] = 1;
+            f_act.nb[2] = f_act.nb[1] * n_fold;
+            f_act.nb[3] = f_act.nb[2];
+            g_gk_mm_act_dst = &f_act;
+        }
+
+        g_gk_mm_src1_id = src1;
+        gk_cuda_mul_mat(stream, scratch, &f_dst);
+        g_gk_mm_src1_id = NULL;
+        g_gk_mm_act_dst = act_prev;
+        return;
     }
 
     // Enough columns for a tile to be mostly real work: reuse across the tile
@@ -4220,11 +5061,17 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 // worth knowing about a run of this kernel, and a profile that
                 // said only "mma-nvfp4" would hide the heuristic above going
                 // the wrong way on a shape.
-                g_gk_mm_path = wide ? "mma-nvfp4-128" : "mma-nvfp4-64";
+                const bool pipe = wide && gk_cu_env_int("GK_MM_NVFP4_PIPE", 0) != 0;
+
+                g_gk_mm_path = pipe ? "mma-nvfp4p" : wide ? "mma-nvfp4-128" : "mma-nvfp4-64";
                 const std::chrono::steady_clock::time_point m0 =
                     std::chrono::steady_clock::now();
 
-                if (wide) {
+                if (pipe) {
+                    gk_cu_k_mul_mat_mma_nvfp4_pipe<4>
+                        <<<mgrid, 4 * GK_CU_NVP_WARPS_N * GK_WARP_SIZE, 0, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
+                } else if (wide) {
                     gk_cu_k_mul_mat_mma_nvfp4<GK_CU_MMA_WARPS_M_WIDE, GK_CU_MMA_WN_WIDE>
                         <<<mgrid, GK_CU_MMA_THREADS(GK_CU_MMA_WARPS_M_WIDE), 0, stream>>>(
                             gk_cu_view(src0), gk_cu_view_mut(dst), aq, n_grp, r2, r3);
@@ -4303,12 +5150,70 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
 
             n_splits = (k_len + k_split - 1) / k_split;
 
+            const int a_al = gk_cuda_mma_f16_align(src0);
+            const int b_al = gk_cuda_mma_f16_align(src1);
+
+            // The pipelined tile wants A contiguous along k on at least a
+            // word boundary and B as f16 rows of one stride: src1 itself when
+            // it already is that, otherwise a converted copy in scratch with
+            // k padded to the round. `GK_MM_F16_PIPE=0` is the bisect lever
+            // back to the register-staged tile.
+            const bool pipe_ok  = gk_cu_env_int("GK_MM_F16_PIPE", 1) != 0;
+            const bool a_direct = pipe_ok && a_al == 16 && gk_is_contiguous(src0);
+            const bool b_direct = pipe_ok && (int) src1->type == GK_TYPE_F16 && b_al == 16 &&
+                                  gk_is_contiguous(src1);
+            const int64_t k_pad   = (k_len + GK_CU_F16P_K - 1) / GK_CU_F16P_K * GK_CU_F16P_K;
+            const int64_t a_rows  = n_rows * src0->ne[2] * src0->ne[3];
+            // A weight whose rows are not 16-byte aligned (a k that is not a
+            // multiple of eight: Iris-3B's 6826) is re-laid once per launch
+            // too - 35 MB, ~0.4 ms - because the 4-byte copies it would
+            // otherwise need cost 2.6 ms on the same matmul.
+            const size_t  a_bytes = pipe_ok && !a_direct
+                ? (size_t) a_rows * (size_t) k_pad * sizeof(__half) : 0;
+            const size_t  b_bytes = pipe_ok && !b_direct
+                ? (size_t) n_cols * (size_t) n_23 * (size_t) k_pad * sizeof(__half) : 0;
+
+            // One scratch allocation for the split planes and the converted
+            // B: the scratch keeps one buffer, so two requests would be two
+            // grow paths fighting over it.
+            size_t part_bytes = n_splits > 1
+                ? (size_t) n_splits * n_23 * n_cols * n_rows * sizeof(float) : 0;
+            part_bytes = (part_bytes + 15) / 16 * 16;
+
+            char * sbuf = NULL;
+            if (part_bytes + a_bytes + b_bytes > 0) {
+                sbuf = (char *) gk_cu_scratch_get(scratch, part_bytes + a_bytes + b_bytes, stream);
+            }
+
             float * part = NULL;
             if (n_splits > 1) {
-                part = (float *) gk_cu_scratch_get(
-                    scratch, (size_t) n_splits * n_23 * n_cols * n_rows * sizeof(float), stream);
-                if (part == NULL) {
-                    n_splits = 1;   // no room; one block per patch still works
+                if (sbuf == NULL) {
+                    n_splits   = 1;   // no room; one block per patch still works
+                    part_bytes = 0;
+                } else {
+                    part = (float *) sbuf;
+                }
+            }
+
+            const bool     pipe     = pipe_ok && (a_bytes + b_bytes == 0 || sbuf != NULL);
+            const __half * aq       = NULL;
+            const __half * bq       = NULL;
+            int64_t        a_stride = 0;
+            int64_t        b_stride = 0;
+            if (pipe) {
+                if (a_direct) {
+                    aq       = (const __half *) src0->data;
+                    a_stride = (int64_t) (src0->nb[1] / sizeof(__half));
+                } else {
+                    aq       = (const __half *) (sbuf + part_bytes);
+                    a_stride = k_pad;
+                }
+                if (b_direct) {
+                    bq       = (const __half *) src1->data;
+                    b_stride = (int64_t) (src1->nb[1] / sizeof(__half));
+                } else {
+                    bq       = (const __half *) (sbuf + part_bytes + a_bytes);
+                    b_stride = k_pad;
                 }
             }
 
@@ -4317,12 +5222,12 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             // paths below - narrower tiles, k split across a block rather than
             // across blocks - keep more of the device busy.
             if (have * n_splits >= want / 2) {
-                const bool a_vec = gk_cuda_mma_f16_vec(src0, k_len);
-                const bool b_vec = gk_cuda_mma_f16_vec(src1, k_len);
+                const int group_m = gk_cuda_mma_f16_group_m(
+                    scratch, src0, src1, (int) grid_m, (int) grid_n, tile_m, k_len);
 
                 dim3 fgrid;
-                fgrid.x = (unsigned) grid_n;   // column tiles: see the kernel
-                fgrid.y = (unsigned) grid_m;
+                fgrid.x = (unsigned) (grid_m * grid_n);   // tiles, grouped: see the kernel
+                fgrid.y = 1;
                 fgrid.z = (unsigned) (n_23 * n_splits);
 
                 // Which accumulator. The graph asks for one - a caller that
@@ -4331,23 +5236,59 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 // the choice away in either direction for an A/B.
                 const bool acc16 = gk_cuda_mm_acc16(dst);
 
-                g_gk_mm_path = acc16 ? "mma-f16-a16" : "mma-f16";
+                if (pipe) {
+                    if (!a_direct) {
+                        const int64_t n_items = a_rows * (k_pad / 8);
+                        gk_cu_k_mma_f16p_stage_b<<<gk_cu_blocks_1d(n_items, GK_CUDA_BLOCK),
+                                                   GK_CUDA_BLOCK, 0, stream>>>(
+                            gk_cu_view(src0), (__half *) aq, k_len, k_pad, a_rows, a_al);
+                    }
+                    if (!b_direct) {
+                        const int64_t nb_rows = n_cols * n_23;
+                        const int64_t n_items = nb_rows * (k_pad / 8);
+                        gk_cu_k_mma_f16p_stage_b<<<gk_cu_blocks_1d(n_items, GK_CUDA_BLOCK),
+                                                   GK_CUDA_BLOCK, 0, stream>>>(
+                            gk_cu_view(src1), (__half *) bq, k_len, k_pad, nb_rows, b_al);
+                    }
+
+                    g_gk_mm_path = acc16 ? "mma-f16p-a16" : "mma-f16p";
+
+#define GK_CU_LAUNCH_MMA_F16P(WM, A16)                                                      \
+                    gk_cu_k_mul_mat_mma_f16p<WM, A16>                                       \
+                        <<<fgrid, (WM) * GK_CU_F16P_WARPS_N * GK_WARP_SIZE, 0, stream>>>(   \
+                            aq, a_stride, src0->ne[2], bq, b_stride, gk_cu_view_mut(dst),   \
+                            k_len, r2, r3,                                                  \
+                            n_splits > 1 ? part : NULL, k_split, n_23,                      \
+                            (int) grid_m, group_m)
+
+                    if (warps_m == 4) {
+                        if (acc16) { GK_CU_LAUNCH_MMA_F16P(4, true); }
+                        else       { GK_CU_LAUNCH_MMA_F16P(4, false); }
+                    } else {
+                        if (acc16) { GK_CU_LAUNCH_MMA_F16P(2, true); }
+                        else       { GK_CU_LAUNCH_MMA_F16P(2, false); }
+                    }
+#undef GK_CU_LAUNCH_MMA_F16P
+                } else {
+                    g_gk_mm_path = acc16 ? "mma-f16-a16" : "mma-f16";
 
 #define GK_CU_LAUNCH_MMA_F16(WM, A16)                                                       \
                 gk_cu_k_mul_mat_mma_f16<WM, A16><<<fgrid, (WM) * GK_CU_MMA_F16_WARPS_N *    \
                                                    GK_WARP_SIZE, 0, stream>>>(              \
                     gk_cu_view(src0), gk_cu_view(src1), gk_cu_view_mut(dst),                \
-                    k_len, r2, r3, a_vec, b_vec,                                            \
-                    n_splits > 1 ? part : NULL, k_split, n_23)
+                    k_len, r2, r3, a_al, b_al,                                              \
+                    n_splits > 1 ? part : NULL, k_split, n_23,                              \
+                    (int) grid_m, group_m)
 
-                if (warps_m == 4) {
-                    if (acc16) { GK_CU_LAUNCH_MMA_F16(4, true); }
-                    else       { GK_CU_LAUNCH_MMA_F16(4, false); }
-                } else {
-                    if (acc16) { GK_CU_LAUNCH_MMA_F16(2, true); }
-                    else       { GK_CU_LAUNCH_MMA_F16(2, false); }
-                }
+                    if (warps_m == 4) {
+                        if (acc16) { GK_CU_LAUNCH_MMA_F16(4, true); }
+                        else       { GK_CU_LAUNCH_MMA_F16(4, false); }
+                    } else {
+                        if (acc16) { GK_CU_LAUNCH_MMA_F16(2, true); }
+                        else       { GK_CU_LAUNCH_MMA_F16(2, false); }
+                    }
 #undef GK_CU_LAUNCH_MMA_F16
+                }
 
                 if (n_splits > 1) {
                     const int64_t n_out = n_rows * n_cols * n_23;
@@ -4407,7 +5348,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             float * ap = use_mma && aq != NULL ? (float *) (aq + n_blk) : NULL;
 
             if (aq != NULL) {
-                const bool aq_reuse = aq_tsr_prev == (const void *) src1 &&
+                const bool aq_reuse = aq_tsr_prev == (const void *) gk_cu_mm_src1_id(src1) &&
                                       aq_src_prev == src1->data &&
                                       aq_blk_prev == n_blk && aq_grp_prev == n_grp &&
                                       aq_pass_prev == scratch->pass &&
@@ -4420,7 +5361,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         gk_cu_view(src1), aq, ap, n_grp, n_cols, n_blk);
                 }
                 scratch->aq_src    = src1->data;
-                scratch->aq_tensor = src1;
+                scratch->aq_tensor = gk_cu_mm_src1_id(src1);
                 scratch->aq_blk    = n_blk;
                 scratch->aq_grp    = n_grp;
                 scratch->aq_planes = aq_reuse ? aq_pln_prev : (use_mma ? 1 : 0);
@@ -4593,7 +5534,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             // result of the same size later in the same pass - and then every
             // other field matches too and the stale blocks are used. See the
             // note on `aq_tensor` in gk_cuda_common.cuh.
-            const bool aq_reuse = aq_tsr_prev == (const void *) src1 &&
+            const bool aq_reuse = aq_tsr_prev == (const void *) gk_cu_mm_src1_id(src1) &&
                                   aq_src_prev == src1->data &&
                                   aq_blk_prev == n_blk && aq_grp_prev == n_grp &&
                                   aq_pass_prev == scratch->pass &&
@@ -4605,7 +5546,7 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                     gk_cu_view(src1), aq, NULL, n_grp, n_cols, n_blk);
             }
             scratch->aq_src    = src1->data;
-            scratch->aq_tensor = src1;
+            scratch->aq_tensor = gk_cu_mm_src1_id(src1);
             scratch->aq_blk    = n_blk;
             scratch->aq_grp    = n_grp;
             // a reused claim keeps whatever planes it already carried; a

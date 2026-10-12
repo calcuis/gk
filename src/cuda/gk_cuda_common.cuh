@@ -350,6 +350,7 @@ struct gk_cuda_scratch {
     int    n_sm;   // multiprocessors on this device
     int    cc;     // compute capability, major*10 + minor
     int    smem_max; // dynamic shared memory a block may opt in to, bytes
+    size_t l2_bytes; // the device's L2, which decides what a GEMM's waves can share
 
     // Bumped every time `ptr` moves. A captured graph bakes the scratch
     // pointer into its kernel launches, so a replay after a grow would read

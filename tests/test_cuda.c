@@ -649,6 +649,49 @@ static struct gk_tensor * build_norm(struct gk_ctx * ctx, struct gk_tensor ** in
     return gk_norm(ctx, in[0], 1e-5f);
 }
 
+// The short-row norms: rows of at most 128 are owned by a run of lanes rather
+// than a block (Iris-3B's pixel stream is [16, 1048576]). 16 is the pixel
+// width and four lanes; 20 is not a multiple of four, so the last lane of each
+// run is partly masked; 100 takes the full warp with a masked tail; 4 is one
+// lane a row, no shuffle at all. Enough rows that the runs cross warps and
+// blocks and the last block is partial.
+static struct gk_tensor * build_rms_norm_short(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 16, 1031, 3);
+    *n_in = 1;
+    return gk_rms_norm(ctx, in[0], 1e-6f);
+}
+
+static struct gk_tensor * build_rms_norm_short20(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 20, 777);
+    *n_in = 1;
+    return gk_rms_norm(ctx, in[0], 1e-6f);
+}
+
+static struct gk_tensor * build_rms_norm_short100(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 100, 333);
+    *n_in = 1;
+    return gk_rms_norm(ctx, in[0], 1e-6f);
+}
+
+static struct gk_tensor * build_norm_short(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 16, 1031, 3);
+    *n_in = 1;
+    return gk_norm(ctx, in[0], 1e-5f);
+}
+
+static struct gk_tensor * build_l2_norm_short(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 4, 2049);
+    *n_in = 1;
+    return gk_l2_norm(ctx, in[0], 1e-6f);
+}
+
+// A short norm on a permuted view, so the strided accessor arm runs.
+static struct gk_tensor * build_rms_norm_short_perm(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 16, 64, 3);
+    *n_in = 1;
+    return gk_rms_norm(ctx, gk_permute(ctx, in[0], 1, 0, 2, 3), 1e-6f);
+}
+
 static struct gk_tensor * build_group_norm(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     // [W, H, C, N] with 32 groups over C, the shape every VAE block uses
     in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 9, 7, 64, 2);
@@ -811,6 +854,22 @@ static struct gk_tensor * build_mul_short_rows_strided(struct gk_ctx * ctx,
 // projection, and it is where a kernel that assumes contiguity shows up.
 static struct gk_tensor * build_cont_permuted(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 64, 5, 37, 2);
+    *n_in = 1;
+    return gk_cont(ctx, gk_permute(ctx, in[0], 0, 2, 1, 3));
+}
+
+// The head permute at a DiT's real width (128), which takes the row-copy
+// kernel's 16-byte arm, and a 33-wide row, which is contiguous along dim 0
+// but neither a multiple of four nor 16-byte aligned, so it takes the scalar
+// arm of the same kernel.
+static struct gk_tensor * build_cont_heads(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 128, 20, 100, 2);
+    *n_in = 1;
+    return gk_cont(ctx, gk_permute(ctx, in[0], 0, 2, 1, 3));
+}
+
+static struct gk_tensor * build_cont_odd_rows(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 33, 7, 41, 3);
     *n_in = 1;
     return gk_cont(ctx, gk_permute(ctx, in[0], 0, 2, 1, 3));
 }
@@ -1467,6 +1526,50 @@ static struct gk_tensor * build_mma_f16_ragged(struct gk_ctx * ctx, struct gk_te
     return mma_f16_case(ctx, in, n_in, 100, 2600, 140, GK_TYPE_F32);
 }
 
+// A k that is not a multiple of eight, so no row of either operand is 16-byte
+// aligned and the staging takes the narrower word loads: 1370 halves is a
+// 4-byte row phase for the f16 side and 8-byte for the f32 side. Iris-3B's
+// feed-forward is 6826 wide and every one of its down-projections is this.
+static struct gk_tensor * build_mma_f16_oddk(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 1370, 700, 140, GK_TYPE_F32);
+}
+
+// 1364 halves: 8-byte rows on the f16 side, with f16 on both sides.
+static struct gk_tensor * build_mma_f16_oddk8(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mma_f16_case(ctx, in, n_in, 1364, 700, 140, GK_TYPE_F16);
+}
+
+// A 2-D weight against a batched activation with few columns per batch: the
+// dispatch folds the batches into one GEMM of 12*30 columns (Iris-3B's text
+// embedder is [2560, 12, 300]). One per path the fold can land on.
+static struct gk_tensor * build_mm_fold_nvfp4(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_NVFP4, 256, 600);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 256, 12, 30);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_mm_fold_q4k(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_Q4_K, 256, 600);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 256, 12, 10, 3);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_mm_fold_f16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F16, 128, 700);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 128, 12, 30);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_mm_fold_f32(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 16, 64);
+    in[1] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 16, 12, 30);
+    *n_in = 2;
+    return gk_mul_mat(ctx, in[0], in[1]);
+}
+
 // f16 weights on the src1 side: a convolution's, and the one combination
 // where nothing is rounded on the way to the fragment.
 static struct gk_tensor * build_mma_f16_wf16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
@@ -1477,6 +1580,19 @@ static struct gk_tensor * build_mma_f16_wf16(struct gk_ctx * ctx, struct gk_tens
 // takes its own arm of the staging pack.
 static struct gk_tensor * build_mma_f16_wbf16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     return mma_f16_case(ctx, in, n_in, 256, 2600, 140, GK_TYPE_BF16);
+}
+
+// Enough output tiles for the wide (128x128) nvfp4 shape, which is where the
+// pipelined tile runs - every other nvfp4 case here is a handful of blocks
+// and takes the narrow synchronous tile. 1536x700 is 72 tiles on a twenty
+// multiprocessor part; k=320 is five rounds, an odd count, so the pipeline's
+// last round has no successor to stage.
+static struct gk_tensor * build_mma_nvfp4_wide(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 256, 1536, 700);
+}
+
+static struct gk_tensor * build_mma_nvfp4_wide5(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_NVFP4, 320, 1536, 700);
 }
 
 // Higher dimensions, and src0 with fewer of them than src1 so the broadcast
@@ -2588,6 +2704,12 @@ int main(void) {
 
     printf("diffusion op set:\n");
     failures += run_op(gpu, "norm",           build_norm);
+    failures += run_op(gpu, "norm short",     build_norm_short);
+    failures += run_op(gpu, "rms_norm short", build_rms_norm_short);
+    failures += run_op(gpu, "rms_norm sh 20", build_rms_norm_short20);
+    failures += run_op(gpu, "rms_norm sh100", build_rms_norm_short100);
+    failures += run_op(gpu, "rms_norm sh pm", build_rms_norm_short_perm);
+    failures += run_op(gpu, "l2_norm short",  build_l2_norm_short);
     failures += run_op(gpu, "group_norm",     build_group_norm);
     failures += run_op(gpu, "mean",           build_mean);
     failures += run_op(gpu, "repeat",         build_repeat);
@@ -2607,6 +2729,8 @@ int main(void) {
     failures += run_op(gpu, "add wrap odd",   build_add_wrap_odd);
     failures += run_op(gpu, "mul short rows", build_mul_short_rows_strided);
     failures += run_op(gpu, "cont permuted",  build_cont_permuted);
+    failures += run_op(gpu, "cont heads",     build_cont_heads);
+    failures += run_op(gpu, "cont odd rows",  build_cont_odd_rows);
     failures += run_op(gpu, "mul_mat permut", build_mul_mat_permuted);
     failures += run_op(gpu, "mul_mat wide",   build_mul_mat_wide);
     // nvfp4 and 145 columns, so on a Blackwell part this is the FP4 tile and
@@ -2746,6 +2870,8 @@ int main(void) {
     failures += run_op_tol(gpu, "mma nvfp4 deep", build_mma_nvfp4_deep,   6e-1f);
     failures += run_op_tol(gpu, "mma nvfp4 oddk", build_mma_nvfp4_odd_k,  6e-1f);
     failures += run_op_tol(gpu, "mma nvfp4 batch", build_mma_nvfp4_batched, 6e-1f);
+    failures += run_op_tol(gpu, "mma nvfp4 wide",  build_mma_nvfp4_wide,    6e-1f);
+    failures += run_op_tol(gpu, "mma nvfp4 wide5", build_mma_nvfp4_wide5,   6e-1f);
 
     // The f16 tensor-core tile. Held looser than the float paths for one
     // reason, and it is worth being explicit about it: the fragments are f16,
@@ -2765,6 +2891,14 @@ int main(void) {
     failures += run_op_tol(gpu, "mma f16 batch", build_mma_f16_batched,  5e-3f);
     failures += run_op_tol(gpu, "mma f16 split", build_mma_f16_split,    5e-3f);
     failures += run_op_tol(gpu, "mma f16 permut", build_mma_f16_permuted, 5e-3f);
+    failures += run_op_tol(gpu, "mma f16 oddk",   build_mma_f16_oddk,     5e-3f);
+    failures += run_op_tol(gpu, "mma f16 oddk8",  build_mma_f16_oddk8,    5e-3f);
+
+    // The batch fold, on every kind of kernel it can hand the folded GEMM to.
+    failures += run_op_tol(gpu, "mm fold nvfp4",  build_mm_fold_nvfp4,    6e-1f);
+    failures += run_op_tol(gpu, "mm fold q4_K",   build_mm_fold_q4k,      8e-2f);
+    failures += run_op_tol(gpu, "mm fold f16",    build_mm_fold_f16,      5e-3f);
+    failures += run_op(gpu,     "mm fold f32",    build_mm_fold_f32);
     failures += run_op(gpu, "rope",           build_rope);
     failures += run_op(gpu, "get_rows",       build_get_rows);
     failures += run_op(gpu, "get_rows i32",   build_get_rows_i32);

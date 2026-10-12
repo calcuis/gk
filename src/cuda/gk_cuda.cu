@@ -54,6 +54,7 @@ struct gk_cuda_device_ctx {
     size_t total_memory;
     bool   integrated;
     int    n_sm;         // multiprocessors; a launcher sizing a grid wants it
+    size_t l2_bytes;     // L2 cache, for the GEMM tile orderings
     int    cc;           // compute capability; the tensor-core path needs 8.0
     int    smem_max;     // shared memory a block may opt in to, past the 48 KB default
 
@@ -2358,6 +2359,7 @@ static gk_backend_t gk_cuda_device_init_backend(gk_device_t dev) {
     ctx->scratch.n_sm = d->n_sm;
     ctx->scratch.cc   = d->cc;
     ctx->scratch.smem_max = d->smem_max;
+    ctx->scratch.l2_bytes = d->l2_bytes;
 
     GK_CUDA_CHECK(gkSetDevice(d->index));
 
@@ -2607,6 +2609,7 @@ extern "C" void gk_cuda_register_devices(void) {
         d->integrated   = prop.integrated != 0;
         d->n_sm         = prop.multiProcessorCount;
         d->cc           = prop.major * 10 + prop.minor;
+        d->l2_bytes     = (size_t) (prop.l2CacheSize > 0 ? prop.l2CacheSize : 0);
         // Every part gives a block 48 KB without asking; Ampere and later will
         // give most of the multiprocessor's store to one block on request.
         d->smem_max     = (int) prop.sharedMemPerBlockOptin;

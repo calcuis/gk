@@ -465,6 +465,47 @@ DIT_MM(ffdn, 12288,  3072)   // feed-forward out - 12 per step
         return mul_mat_case(c, GK_TYPE_Q4_K,  (k), (rows), 1056);                        \
     }
 
+// Iris-3B at 1024x1024: 4396 tokens (4096 image + 300 text) through hidden
+// 2560 and a 6826-wide feed-forward - a width that is not a multiple of eight,
+// so the f16 down-projection's rows are on 4-byte phases and the f16 tile has
+// to stage them with word loads. The text embedder's projections see their
+// activation as [2560, 12, 300] and are folded to 3600 columns.
+static struct gk_tensor * mul_mat_case_3d(struct gk_ctx * ctx, enum gk_type type,
+                                          int64_t k, int64_t rows, int64_t cols, int64_t batch) {
+    struct gk_tensor * w = gk_new_tensor_2d(ctx, type, k, rows);
+    struct gk_tensor * x = gk_new_tensor_3d(ctx, GK_TYPE_F32, k, cols, batch);
+    gk_set_name(w, "weight");
+    gk_set_name(x, "x");
+    return gk_mul_mat(ctx, w, x);
+}
+
+static struct gk_tensor * b_ir_ffdn_f16 (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,   6826, 2560, 4396); }
+static struct gk_tensor * b_ir_ffdn_f16a(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_F16,   6832, 2560, 4396); }
+static struct gk_tensor * b_ir_ffup_nv  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, 2560, 6826, 4396); }
+static struct gk_tensor * b_ir_qproj_nv (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_NVFP4, 2560, 2560, 4396); }
+static struct gk_tensor * b_ir_txt_qkv  (struct gk_ctx * c) { return mul_mat_case_3d(c, GK_TYPE_NVFP4, 2560, 7680, 12, 300); }
+static struct gk_tensor * b_ir_txt_mlp  (struct gk_ctx * c) { return mul_mat_case_3d(c, GK_TYPE_NVFP4, 3328, 2560, 12, 300); }
+
+// The head permutes around Iris's trunk attention: q [128, 20, 4396] and the
+// rope pair's [64, 4396, 20, 2] output, each cont'd into a contiguous copy.
+static struct gk_tensor * b_ir_cont_q(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 128, 20, 4396, 1);
+    gk_set_name(a, "a");
+    return gk_cont(ctx, gk_permute(ctx, a, 0, 2, 1, 3));
+}
+
+static struct gk_tensor * b_ir_cont_rope(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_4d(ctx, GK_TYPE_F32, 64, 20, 4396, 2);
+    gk_set_name(a, "a");
+    return gk_cont(ctx, gk_permute(ctx, a, 0, 2, 1, 3));
+}
+
+static struct gk_tensor * b_ir_rms_pix(struct gk_ctx * ctx) {
+    struct gk_tensor * a = gk_new_tensor_2d(ctx, GK_TYPE_F32, 16, 1048576);
+    gk_set_name(a, "a");
+    return gk_rms_norm(ctx, a, 1e-6f);
+}
+
 ZIMG_MM(qkv,   3840, 11520)
 ZIMG_MM(proj,  3840,  3840)
 ZIMG_MM(ffup,  3840, 10240)
@@ -621,6 +662,18 @@ static struct gk_tensor * b_fa_h3(struct gk_ctx * c) { return fattn_square_d(c, 
 
 // Z-Image's self-attention: 1056 tokens, 30 heads of 128.
 static struct gk_tensor * b_fa_zimg(struct gk_ctx * c) { return fattn_square_d(c, 1056, 30, 128); }
+
+// Iris-3B's trunk attention: 4396 tokens, 20 query heads over 5 key/value
+// heads (grouped-query), head 128.
+static struct gk_tensor * b_fa_iris(struct gk_ctx * ctx) {
+    struct gk_tensor * q = gk_new_tensor_4d(ctx, GK_TYPE_F32, 128, 4396, 20, 1);
+    struct gk_tensor * k = gk_new_tensor_4d(ctx, GK_TYPE_F16, 128, 4396, 5, 1);
+    struct gk_tensor * v = gk_new_tensor_4d(ctx, GK_TYPE_F16, 128, 4396, 5, 1);
+    gk_set_name(q, "q");
+    gk_set_name(k, "k");
+    gk_set_name(v, "v");
+    return gk_flash_attn_ext(ctx, q, k, v, NULL, 1.0f / sqrtf(128.0f), 0.0f, 0.0f);
+}
 
 static struct gk_tensor * b_fa_dit_1k(struct gk_ctx * c) { return fattn_square(c, 1024, 16); }
 static struct gk_tensor * b_fa_dit_2k(struct gk_ctx * c) { return fattn_square(c, 2048, 16); }
@@ -1089,6 +1142,17 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ff down   f16",   "10240x3840 n=1056",  b_zi_ffdn_f16, ARENA_BIG },
     { NULL,            "ff down   q4_K",  "10240x3840 n=1056",  b_zi_ffdn_q4k, ARENA_BIG },
 
+    { "Iris-3B DiT matmuls at 1024x1024 (4396 tokens)",
+                       "ff down   f16",   "6826x2560 n=4396",   b_ir_ffdn_f16,  ARENA_BIG },
+    { NULL,            "ff down f16 al",  "6832x2560 n=4396",   b_ir_ffdn_f16a, ARENA_BIG },
+    { NULL,            "ff up     nvfp4", "2560x6826 n=4396",   b_ir_ffup_nv,   ARENA_BIG },
+    { NULL,            "q proj    nvfp4", "2560x2560 n=4396",   b_ir_qproj_nv,  ARENA_BIG },
+    { NULL,            "txt qkv   nvfp4", "2560x7680 12x300",   b_ir_txt_qkv,   ARENA_BIG },
+    { NULL,            "txt mlp   nvfp4", "3328x2560 12x300",   b_ir_txt_mlp,   ARENA_BIG },
+    { NULL,            "rms_norm pixels", "16x1048576",         b_ir_rms_pix,   ARENA_BIG },
+    { NULL,            "cont q heads",    "128x20x4396",        b_ir_cont_q,    ARENA_BIG },
+    { NULL,            "cont rope pair",  "64x20x4396x2",       b_ir_cont_rope, ARENA_BIG },
+
     { "MiniMax-H3 video VAE decoder matmuls (36 layers x 28 tiles a decode)",
                        "ff up     f16",   "2048x16384 n=1797",  b_vae_ffup,    ARENA_BIG  },
     { NULL,            "ff down   f16",   "8192x2048 n=1797",   b_vae_ffdn,    ARENA_BIG  },
@@ -1115,6 +1179,7 @@ static const struct bench_case g_cases[] = {
     { NULL,        "flash_attn DiT d128","4096 tok x16",   b_fa_dit_4k_d128, ARENA_BIG },
     { NULL,        "flash_attn H3 d128", "8742 tok x56",   b_fa_h3,          ARENA_HUGE },
     { NULL,        "flash_attn ZImg d128","1056 tok x30",  b_fa_zimg,        ARENA_BIG  },
+    { NULL,        "flash_attn Iris gqa", "4396 tok 20/5", b_fa_iris,        ARENA_BIG  },
     { NULL,        "soft_max decode",    "2048x1x8",       b_softmax_dec, ARENA_SMALL },
     { NULL,        "soft_max prefill",   "512x512x8",      b_softmax_pre, ARENA_MID   },
 

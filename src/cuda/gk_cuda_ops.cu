@@ -738,6 +738,196 @@ static __global__ void gk_cu_k_norm(gk_tview a, gk_tview_mut d, int kind, float 
     }
 }
 
+// --------------------------------------------------------------------------
+// Short rows.
+//
+// A block per row is the right shape for a hidden state and the wrong one for
+// a pixel stream: Iris-3B normalises [16, 1048576] nine times a pass, and a
+// 256-thread block on a 16-wide row is 240 idle threads, a block-wide
+// reduction over a sum one warp could do with its eyes shut, and a million
+// blocks of launch. Measured, 11.7 ms per norm for 128 MB of traffic - a
+// twentieth of the card's bandwidth.
+//
+// Here a row is owned by a run of `lanes` consecutive lanes of one warp, each
+// lane holding four consecutive elements, and the statistic is a shuffle tree
+// across the run. Runs never straddle a warp because `lanes` divides 32 and
+// the block is a multiple of it. Consecutive runs own consecutive rows, so a
+// warp's loads are one contiguous span whatever the row width.
+//
+// No lane returns early: a lane whose row is past the end still has to sit
+// in the shuffles, so it is masked at the loads and the stores instead.
+//
+// The fused forms below use the same lane geometry and the same reduction
+// tree, so the fused and the unfused spellings of a short norm stay bit for
+// bit the same, exactly as the block-per-row pairs do.
+// --------------------------------------------------------------------------
+
+#define GK_CU_NORM_SHORT_MAX 128
+
+// Lanes that share a row of n: the smallest power of two whose four elements
+// a lane cover it. 1 for n <= 4, 32 for n in (64, 128].
+static __host__ __device__ __forceinline__ int gk_cu_norm_short_lanes(int n) {
+    int l = 1;
+    while (l * 4 < n) {
+        l *= 2;
+    }
+    return l;
+}
+
+static __device__ __forceinline__ float gk_cu_lanes_sum(float x, int lanes) {
+#pragma unroll
+    for (int off = GK_WARP_SIZE / 2; off >= 1; off /= 2) {
+        const float o = __shfl_xor_sync(0xffffffff, x, off, GK_WARP_SIZE);
+        if (off < lanes) {
+            x += o;
+        }
+    }
+    return x;
+}
+
+// The generic form: any strides, any of the three statistics.
+static __global__ void gk_cu_k_norm_short(gk_tview a, gk_tview_mut d, int kind, float eps,
+                                          int lanes, int64_t rows) {
+    const int64_t gt   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t ir   = gt / lanes;
+    const int     sub  = (int) (gt % lanes);
+    const bool    live = ir < rows;
+    const int     n    = (int) d.ne[0];
+
+    int64_t i1 = 0, i2 = 0, i3 = 0;
+    if (live) {
+        gk_cu_unrow(ir, d.ne, &i1, &i2, &i3);
+    }
+
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int i = sub * 4 + j;
+        v[j] = live && i < n ? gk_cu_get(a, i, i1, i2, i3) : 0.0f;
+    }
+
+    if (kind == 1) { // NORM: mean first, then the variance about it
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sum += v[j];
+        }
+        const float mean = gk_cu_lanes_sum(sum, lanes) / (float) n;
+
+        float var = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = sub * 4 + j;
+            const float c = i < n ? v[j] - mean : 0.0f;
+            var += c * c;
+        }
+        const float scale = rsqrtf(gk_cu_lanes_sum(var, lanes) / (float) n + eps);
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = sub * 4 + j;
+            if (live && i < n) {
+                gk_cu_set(d, i, i1, i2, i3, (v[j] - mean) * scale);
+            }
+        }
+        return;
+    }
+
+    float sumsq = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        sumsq += v[j] * v[j];
+    }
+    const float total = gk_cu_lanes_sum(sumsq, lanes);
+    const float scale = kind == 0
+        ? rsqrtf(total / (float) n + eps)
+        : rsqrtf(fmaxf(total, eps));
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int i = sub * 4 + j;
+        if (live && i < n) {
+            gk_cu_set(d, i, i1, i2, i3, v[j] * scale);
+        }
+    }
+}
+
+// The fused forms over flat f32, the only layout the fusion plan approves:
+// rms_norm then the weight mul, with or without the residual add in front
+// (ADD writes the sum to `da` as the block-per-row kernel does), rounded
+// either as the _f pair (one expression) or the _x pair (every product
+// rounded where the unfused chain rounds it).
+template <bool ADD, bool EXACT>
+static __global__ void gk_cu_k_rms_norm_mul_short(const float * a, const float * b,
+                                                  const float * __restrict__ w,
+                                                  float * da, float * __restrict__ dm,
+                                                  int n, float eps, int lanes, int64_t rows) {
+    const int64_t gt   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t ir   = gt / lanes;
+    const int     sub  = (int) (gt % lanes);
+    const bool    live = ir < rows;
+    const int64_t base = live ? ir * n : 0;
+    const int     i0   = sub * 4;
+
+    float v[4];
+    if (n % 4 == 0 && live && i0 < n) {
+        float4 x = *(const float4 *) (a + base + i0);
+        if (ADD) {
+            const float4 y = *(const float4 *) (b + base + i0);
+            x = EXACT ? make_float4(__fadd_rn(x.x, y.x), __fadd_rn(x.y, y.y),
+                                    __fadd_rn(x.z, y.z), __fadd_rn(x.w, y.w))
+                      : make_float4(x.x + y.x, x.y + y.y, x.z + y.z, x.w + y.w);
+            *(float4 *) (da + base + i0) = x;
+        }
+        v[0] = x.x; v[1] = x.y; v[2] = x.z; v[3] = x.w;
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = i0 + j;
+            float x = live && i < n ? a[base + i] : 0.0f;
+            if (ADD && live && i < n) {
+                x = EXACT ? __fadd_rn(x, b[base + i]) : x + b[base + i];
+                da[base + i] = x;
+            }
+            v[j] = x;
+        }
+    }
+
+    float sumsq = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        sumsq += v[j] * v[j];
+    }
+    const float scale = rsqrtf(gk_cu_lanes_sum(sumsq, lanes) / (float) n + eps);
+
+    if (n % 4 == 0 && live && i0 < n) {
+        const float4 wv = *(const float4 *) (w + i0);
+        *(float4 *) (dm + base + i0) = EXACT
+            ? make_float4(__fmul_rn(__fmul_rn(v[0], scale), wv.x),
+                          __fmul_rn(__fmul_rn(v[1], scale), wv.y),
+                          __fmul_rn(__fmul_rn(v[2], scale), wv.z),
+                          __fmul_rn(__fmul_rn(v[3], scale), wv.w))
+            : make_float4(v[0] * scale * wv.x, v[1] * scale * wv.y,
+                          v[2] * scale * wv.z, v[3] * scale * wv.w);
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int i = i0 + j;
+            if (live && i < n) {
+                dm[base + i] = EXACT ? __fmul_rn(__fmul_rn(v[j], scale), w[i])
+                                     : v[j] * scale * w[i];
+            }
+        }
+    }
+}
+
+// Launch geometry for the short kernels: `lanes` threads a row, a block of
+// GK_CU_NORM_BLOCK, and the grid that covers every row.
+static inline int gk_cu_norm_short_blocks(int64_t rows, int lanes) {
+    const int64_t threads = rows * lanes;
+    return (int) ((threads + GK_CU_NORM_BLOCK - 1) / GK_CU_NORM_BLOCK);
+}
+
 // rms_norm and the weight multiply that always follows it, in one launch.
 // A transformer runs this pair four to six times per layer, and at decode
 // batch sizes both kernels are launch latency, not work: the pair costs two
@@ -824,6 +1014,15 @@ void gk_cuda_fused_add_rms_mul(gkStream_t stream, const struct gk_tensor * add,
         return; // zero-extent graphs are legal; zero-block launches are not
     }
 
+    if (mul->ne[0] <= GK_CU_NORM_SHORT_MAX) {
+        const int lanes = gk_cu_norm_short_lanes((int) mul->ne[0]);
+        gk_cu_k_rms_norm_mul_short<true, false><<<gk_cu_norm_short_blocks(rows, lanes), GK_CU_NORM_BLOCK, 0, stream>>>(
+            (const float *) add->src[0]->data, (const float *) add->src[1]->data,
+            (const float *) w->data, (float *) add->data, (float *) mul->data,
+            (int) mul->ne[0], gk_get_op_params_f32(norm, 0), lanes, rows);
+        return;
+    }
+
     gk_cu_k_add_rms_norm_mul_f<<<(int) rows, GK_CU_NORM_BLOCK, 0, stream>>>(
         (const float *) add->src[0]->data, (const float *) add->src[1]->data,
         (const float *) w->data,
@@ -847,6 +1046,14 @@ void gk_cuda_fused_rms_mul(gkStream_t stream, const struct gk_tensor * norm,
     // output rows, during warmup) and on a GPU an illegal launch, not a
     // no-op; the per-op path has the same guard in its dispatcher.
     if (rows <= 0 || mul->ne[0] <= 0) {
+        return;
+    }
+
+    if (mul->ne[0] <= GK_CU_NORM_SHORT_MAX) {
+        const int lanes = gk_cu_norm_short_lanes((int) mul->ne[0]);
+        gk_cu_k_rms_norm_mul_short<false, false><<<gk_cu_norm_short_blocks(rows, lanes), GK_CU_NORM_BLOCK, 0, stream>>>(
+            (const float *) a->data, NULL, (const float *) w->data, NULL, (float *) mul->data,
+            (int) mul->ne[0], gk_get_op_params_f32(norm, 0), lanes, rows);
         return;
     }
 
@@ -993,6 +1200,14 @@ void gk_cuda_fused_rms_mul_x(gkStream_t stream, const struct gk_tensor * norm,
         return;
     }
 
+    if (mul->ne[0] <= GK_CU_NORM_SHORT_MAX) {
+        const int lanes = gk_cu_norm_short_lanes((int) mul->ne[0]);
+        gk_cu_k_rms_norm_mul_short<false, true><<<gk_cu_norm_short_blocks(rows, lanes), GK_CU_NORM_BLOCK, 0, stream>>>(
+            (const float *) a->data, NULL, (const float *) w->data, NULL, (float *) mul->data,
+            (int) mul->ne[0], gk_get_op_params_f32(norm, 0), lanes, rows);
+        return;
+    }
+
     gk_cu_k_rms_norm_mul_x<<<(int) rows, GK_CU_NORM_BLOCK, 0, stream>>>(
         (const float *) a->data, (const float *) w->data, (float *) mul->data,
         mul->ne[0], gk_get_op_params_f32(norm, 0));
@@ -1004,6 +1219,15 @@ void gk_cuda_fused_add_rms_mul_x(gkStream_t stream, const struct gk_tensor * add
 
     const int64_t rows = mul->ne[1] * mul->ne[2] * mul->ne[3];
     if (rows <= 0 || mul->ne[0] <= 0) {
+        return;
+    }
+
+    if (mul->ne[0] <= GK_CU_NORM_SHORT_MAX) {
+        const int lanes = gk_cu_norm_short_lanes((int) mul->ne[0]);
+        gk_cu_k_rms_norm_mul_short<true, true><<<gk_cu_norm_short_blocks(rows, lanes), GK_CU_NORM_BLOCK, 0, stream>>>(
+            (const float *) add->src[0]->data, (const float *) add->src[1]->data,
+            (const float *) w->data, (float *) add->data, (float *) mul->data,
+            (int) mul->ne[0], gk_get_op_params_f32(norm, 0), lanes, rows);
         return;
     }
 
@@ -1201,6 +1425,33 @@ static __global__ void gk_cu_k_copy(gk_tview a, gk_tview_mut d, bool same_shape,
                 *(const int32_t *) (gk_cu_row(a, s.i1, s.i2, s.i3) + s.i0 * a.nb[0]);
         } else {
             gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, gk_cu_get(a, s.i0, s.i1, s.i2, s.i3));
+        }
+    }
+}
+
+// The copy a DiT's attention makes four times a block: a head permute of a
+// 45 MB f32 tensor into a contiguous one, same shape, both operands
+// contiguous along dim 0. Per element the generic kernel above pays two
+// four-axis decompositions (64-bit divisions) and two type switches, and ran
+// these at ~120 GB/s on a 192 GB/s part. A block per destination row with
+// 16-byte copies pays the row arithmetic once and streams the rest.
+static __global__ void gk_cu_k_copy_rows_f32(gk_tview a, gk_tview_mut d, bool vec4) {
+    const int64_t i1  = blockIdx.x;
+    const int64_t i23 = blockIdx.y;
+    const int64_t i2  = i23 % d.ne[2];
+    const int64_t i3  = i23 / d.ne[2];
+
+    const float * src = (const float *) gk_cu_row(a, i1, i2, i3);
+    float *       dst = (float *) gk_cu_row(d, i1, i2, i3);
+    const int     n   = (int) d.ne[0];
+
+    if (vec4) {
+        for (int i = threadIdx.x; i < n / 4; i += blockDim.x) {
+            ((float4 *) dst)[i] = ((const float4 *) src)[i];
+        }
+    } else {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            dst[i] = src[i];
         }
     }
 }
@@ -3896,6 +4147,13 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
         case GK_OP_NORM: case GK_OP_RMS_NORM: case GK_OP_L2_NORM: {
             const int kind = op == GK_OP_RMS_NORM ? 0 : op == GK_OP_NORM ? 1 : 2;
             const int64_t rows = node->ne[1] * node->ne[2] * node->ne[3];
+            if (node->ne[0] <= GK_CU_NORM_SHORT_MAX) {
+                const int lanes = gk_cu_norm_short_lanes((int) node->ne[0]);
+                gk_cu_k_norm_short<<<gk_cu_norm_short_blocks(rows, lanes), GK_CU_NORM_BLOCK, 0, stream>>>(
+                    gk_cu_view(src0), gk_cu_view_mut(node), kind, gk_get_op_params_f32(node, 0),
+                    lanes, rows);
+                return true;
+            }
             gk_cu_k_norm<<<(int) rows, GK_CU_NORM_BLOCK, 0, stream>>>(
                 gk_cu_view(src0), gk_cu_view_mut(node), kind, gk_get_op_params_f32(node, 0));
             return true;
@@ -3928,11 +4186,27 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
             return true;
         }
 
-        case GK_OP_DUP: case GK_OP_CPY: case GK_OP_CONT:
+        case GK_OP_DUP: case GK_OP_CPY: case GK_OP_CONT: {
+            const int64_t n23 = node->ne[2] * node->ne[3];
+            if (src0->type == GKT_F32 && node->type == GKT_F32 &&
+                gk_are_same_shape(src0, node) &&
+                src0->nb[0] == sizeof(float) && node->nb[0] == sizeof(float) &&
+                node->ne[0] >= 32 && node->ne[1] <= INT32_MAX && n23 <= 65535) {
+                const uintptr_t bits = (uintptr_t) src0->data | src0->nb[1] | src0->nb[2] | src0->nb[3]
+                                     | (uintptr_t) node->data | node->nb[1] | node->nb[2] | node->nb[3];
+                const bool vec4   = node->ne[0] % 4 == 0 && bits % 16 == 0;
+                const int  per    = vec4 ? (int) (node->ne[0] / 4) : (int) node->ne[0];
+                const int  thr    = per >= 128 ? 128 : (per + 31) / 32 * 32;
+                dim3 cgrid((unsigned) node->ne[1], (unsigned) n23);
+                gk_cu_k_copy_rows_f32<<<cgrid, thr, 0, stream>>>(
+                    gk_cu_view(src0), gk_cu_view_mut(node), vec4);
+                return true;
+            }
             gk_cu_k_copy<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
                 gk_cu_view(src0), gk_cu_view_mut(node),
                 gk_are_same_shape(src0, node), ne);
             return true;
+        }
 
         case GK_OP_GET_ROWS:
             gk_cu_k_get_rows<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
