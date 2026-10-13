@@ -932,6 +932,20 @@ static struct gk_tensor * build_mmq_q4_K_1sb(struct gk_ctx * ctx, struct gk_tens
     return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 256, 700, 70);
 }
 
+// The q4_K/q5_K pipeline tile: ragged rows and columns, and a shape with
+// several tiles along both axes (1200 rows, 300 columns, four superblocks).
+static struct gk_tensor * build_mmq_q5_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q5_K, 512, 700, 70);
+}
+
+static struct gk_tensor * build_mmq_q5_K_tiles(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q5_K, 1024, 1200, 300);
+}
+
+static struct gk_tensor * build_mmq_q4_K_tiles(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 1024, 1200, 300);
+}
+
 // The integer *mat-vec*, which is a different kernel from the tile above and
 // needs the opposite shape to reach: enough rows to be worth quantizing the
 // activations for, few enough columns to stay off the tiled path.
@@ -2089,7 +2103,12 @@ struct fa_shape {
     // conditioning without costing anything else. Zero means the whole cache
     // is live.
     int64_t n_live;
+    // Scale on V (0 = 1): the diffuser's values run to tens, and with the
+    // f16 accumulator a long cache then sums past 65504.
+    float v_scale;
 };
+
+static float g_fa_fill_scale = 1.0f;
 
 // Builds the graph into `ctx`, and hands back the inputs so both sides can be
 // given identical bytes.
@@ -2139,7 +2158,7 @@ static void fa_fill(struct gk_tensor * gpu_t, struct gk_tensor * cpu_t, int * se
     float * f = (float *) malloc((size_t) n * sizeof(float));
     void  * raw = malloc(bytes);
     for (int64_t i = 0; i < n; ++i) {
-        f[i] = input_value((*seed)++);
+        f[i] = input_value((*seed)++) * g_fa_fill_scale;
     }
     if (cpu_t->type == GK_TYPE_F32) {
         memcpy(raw, f, bytes);
@@ -2226,7 +2245,9 @@ static int run_flash_attn(gk_backend_t gpu, const char * name,
     int seed = 0;
     fa_fill(gq,  cq,  &seed);
     fa_fill(gk_, ck,  &seed);
+    g_fa_fill_scale = s.v_scale > 0.0f ? s.v_scale : 1.0f;
     fa_fill(gv,  cv,  &seed);
+    g_fa_fill_scale = 1.0f;
     fa_fill(gs,  cs,  &seed);
 
     if (s.n_live > 0 && s.n_live < s.n_kv) {
@@ -2766,6 +2787,9 @@ int main(void) {
     // bound is set above where that lands rather than where a bug would.
     failures += run_op_tol(gpu, "mmq q4_K 1sb",  build_mmq_q4_K_1sb, 8e-2f);
     failures += run_op_tol(gpu, "mmq q4_K",      build_mmq_q4_K,     8e-2f);
+    failures += run_op_tol(gpu, "mmq q5_K",      build_mmq_q5_K,     8e-2f);
+    failures += run_op_tol(gpu, "mmq q5_K tiles", build_mmq_q5_K_tiles, 8e-2f);
+    failures += run_op_tol(gpu, "mmq q4_K tiles", build_mmq_q4_K_tiles, 8e-2f);
     failures += run_op_tol(gpu, "mmq batched",   build_mmq_batched,  4e-2f);
     failures += run_op_tol(gpu, "mmq ragged k",  build_mmq_ragged_k, 4e-2f);
 
@@ -3082,6 +3106,39 @@ int main(void) {
             (struct fa_shape) { 1024, 16, 16,  512, 128, 128, FA_MASK_NONE, false, 10 }, sd_tol);
         failures += run_flash_attn(gpu, "anima adapter cross pad",
             (struct fa_shape) {    4, 16, 16,    4,  64,  64, FA_MASK_NONE, false,  2 }, sd_tol);
+
+        // The f16 accumulator (GK_FA_ACC16=1, the diffuser's setting) rounds
+        // the running output at every one of the 265 tiles of an 8464-key
+        // cache, which measures at ~1% of the output; the bound below is a
+        // guard against the overflow that used to saturate these shapes,
+        // which shows as errors of order one, not against that rounding.
+        const float ltx_tol = getenv("GK_FA_ACC16") != NULL && getenv("GK_FA_ACC16")[0] == '1' ? 1e-2f : sd_tol;
+        // LTX-2.5 at 736^2 x 121 frames: 8464 video tokens (66 tiles of 128
+        // and a ragged 16), 127 audio tokens, 1024 text tokens, d_head 128.
+        // The audio stream attends to the video (few rows, long ragged cache)
+        // and the video to the audio (many rows, a cache shorter than a tile).
+        failures += run_flash_attn(gpu, "ltx v2a 127x8464",
+            (struct fa_shape) {  127, 4, 4, 8464, 128, 128, FA_MASK_NONE, false }, ltx_tol);
+        failures += run_flash_attn(gpu, "ltx a2v 8464x127",
+            (struct fa_shape) { 8464, 4, 4,  127, 128, 128, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "ltx text 8464x1024",
+            (struct fa_shape) { 8464, 4, 4, 1024, 128, 128, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "ltx self 8464",
+            (struct fa_shape) { 8464, 2, 2, 8464, 128, 128, FA_MASK_NONE, false }, ltx_tol);
+        failures += run_flash_attn(gpu, "ltx v2a 127x1040",
+            (struct fa_shape) {  127, 4, 4, 1040, 128, 128, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "ltx v2a 127x1024",
+            (struct fa_shape) {  127, 4, 4, 1024, 128, 128, FA_MASK_NONE, false }, sd_tol);
+        failures += run_flash_attn(gpu, "ltx audio self 127",
+            (struct fa_shape) {  127, 4, 4,  127, 128, 128, FA_MASK_NONE, false }, sd_tol);
+        // the values the model actually carries: V in the tens, which is
+        // where the half accumulator overflowed before it was kept bounded
+        failures += run_flash_attn(gpu, "ltx v2a 127x8464 v16",
+            (struct fa_shape) {  127, 4, 4, 8464, 128, 128, FA_MASK_NONE, false, 0, 16.0f }, 16.0f * ltx_tol);
+        failures += run_flash_attn(gpu, "ltx self 8464 v16",
+            (struct fa_shape) { 8464, 2, 2, 8464, 128, 128, FA_MASK_NONE, false, 0, 16.0f }, 16.0f * ltx_tol);
+        failures += run_flash_attn(gpu, "ltx text 8464x1024 v16",
+            (struct fa_shape) { 8464, 4, 4, 1024, 128, 128, FA_MASK_NONE, false, 0, 16.0f }, 16.0f * ltx_tol);
     }
 
     // top_k on both sides of the width where one network stops fitting: 4096

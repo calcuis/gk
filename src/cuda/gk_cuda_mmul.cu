@@ -4648,6 +4648,425 @@ void gk_cu_k_mul_mat_mma_q2k_pipe(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The q4_K / q5_K pipeline tile.
+//
+// The q2_K pipeline above, for the two k-quant formats whose scale and
+// minimum span a whole 32-element group: one k32 mma per group, one offset
+// term in the drain, and no sub-scale fold to do - a 5-bit code is already an
+// int8. What the format changes is the stage. A superblock is eight groups:
+// 128 bytes of nibbles in four 32-byte runs (a run holds two groups, low and
+// high nibble), twelve packed scale/minimum bytes, d and dmin, and for q5_K a
+// 32-byte plane whose bit `sub` is group sub's fifth bit for all eight
+// groups. So a round (two groups) stages one 32-byte code run per row, and
+// the header - three scale words, the d/dmin word, the eight plane words -
+// stages once per superblock, a round ahead of first use, which is each raw
+// weight byte fetched exactly once per pass. The round's two groups differ
+// only in the nibble (shift 0 / 4) and the plane bit (sub / sub+1).
+//
+// The generic tile decoded q5_K per thread at 69 TFLOP/s against its own
+// 137 for q4_0 on the same mma - the per-lane 176-byte-stride decode was the
+// bill, as it was for q2_K before Investigation 10. Shared stays under the
+// 48 KB static limit at 46 KB for q5_K (38 KB for q4_K), two blocks per SM.
+// `GK_MM_MMA_PIPE=0` returns both formats to the synchronous tile.
+// --------------------------------------------------------------------------
+
+// scale and minimum of group `sub` out of the superblock's three packed
+// scale words - gk_cu_scale_min_6 on words instead of bytes
+static __device__ __forceinline__ void gk_cu_scale_min_6w(uint32_t w0, uint32_t w1, uint32_t w2,
+                                                          int sub, int * sc, int * mn) {
+    if (sub < 4) {
+        const int sh = 8 * sub;
+        *sc = (int) ((w0 >> sh) & 63u);
+        *mn = (int) ((w1 >> sh) & 63u);
+    } else {
+        const int sh = 8 * (sub - 4);
+        *sc = (int) (((w2 >> sh) & 0xfu) | (((w0 >> (sh + 6)) & 3u) << 4));
+        *mn = (int) (((w2 >> (sh + 4)) & 0xfu) | (((w1 >> (sh + 6)) & 3u) << 4));
+    }
+}
+
+template <int TYPE>
+static __global__ __launch_bounds__(GK_CU_MMAQ_THREADS, 2)
+void gk_cu_k_mul_mat_mma_k45_pipe(gk_tview a, gk_tview_mut d,
+                                  const gk_cu_q8blk * aq, const float * ap,
+                                  int64_t n_grp, int64_t r2, int64_t r3,
+                                  int act, float4 actp) {
+    static_assert(TYPE == GKT_Q4_K || TYPE == GKT_Q5_K, "the two whole-group k-quants");
+    constexpr bool HAS_QH  = TYPE == GKT_Q5_K;
+    constexpr int  TM      = GK_CU_MMAQ_TILE_M;
+    constexpr int  THREADS = GK_CU_MMAQ_THREADS;
+    constexpr int  NCOL    = THREADS / 4;               // rows/columns one stage pass covers
+    constexpr int  NB      = GK_CU_MMAQ_TILE_N / NCOL;  // a thread's distinct columns
+    constexpr int  BLK     = HAS_QH ? 4 + 12 + GK_QK / 8 + GK_QK / 2 : 4 + 12 + GK_QK / 2;
+    constexpr int  QS_OFF  = HAS_QH ? 4 + 12 + GK_QK / 8 : 4 + 12;
+    constexpr int  QH_OFF  = 4 + 12;
+
+    static_assert(GK_CU_MMAQ_KSTEP == 2 && GK_CU_MMAQ_TILE_N == 128 && TM == 128,
+                  "the pipeline stage assumes this geometry");
+
+    __shared__ int      Aq [2][TM][9];                         // the round's code run (8 words + pad)
+    __shared__ int      Ah [HAS_QH ? 2 : 1][HAS_QH ? TM : 1][9]; // the superblock's fifth-bit plane
+    __shared__ uint32_t Asc[2][TM][3];                         // the superblock's scale/min bytes
+    __shared__ uint32_t Add[2][TM];                            // d, dmin as raw halves
+    __shared__ int      Bs [2][2][GK_CU_MMAQ_TILE_N][9];       // [buf][sg][col][word + pad]
+    __shared__ __align__(16) float Apl[2][2][3][GK_CU_MMAQ_TILE_N]; // d, d*s, d*sl planes
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int warp_m = warp / GK_CU_MMAQ_WARPS_N;
+    const int warp_n = warp % GK_CU_MMAQ_WARPS_N;
+
+    const int64_t m0  = (int64_t) blockIdx.x * TM;
+    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMAQ_TILE_N;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
+    const float *       ap23 = ap + i23 * n_cols * n_grp * 3;
+
+    const int stage_w = 2 * ((int) threadIdx.x % 4);
+    const int stage_c = (int) threadIdx.x / 4;
+
+    const uint8_t * frow[2] = { NULL, NULL };
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int64_t m = m0 + stage_c + j * NCOL;
+        if (m < n_rows) {
+            frow[j] = (const uint8_t *) gk_cu_row(a, m, a2, a3);
+        }
+    }
+
+    // The header stage: the low half of the block fetches plane words 0-3
+    // and scale words 0-1, the high half plane words 4-7, scale word 2 and
+    // d/dmin, each for row threadIdx.x % TM.
+    const int       hdr_r   = (int) threadIdx.x % TM;
+    const bool      hdr_hi  = (int) threadIdx.x >= TM;
+    const uint8_t * hdr_row = m0 + hdr_r < n_rows
+        ? (const uint8_t *) gk_cu_row(a, m0 + hdr_r, a2, a3) : NULL;
+
+    const gk_cu_q8blk * bblk[NB] = {};
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        const int64_t n = n0 + stage_c + j * NCOL;
+        if (n < n_cols) {
+            bblk[j] = aq23 + n * n_grp;
+        }
+    }
+
+    const int  pl_c  = (int) threadIdx.x % GK_CU_MMAQ_TILE_N;
+    const int  pl_s  = (int) threadIdx.x / GK_CU_MMAQ_TILE_N;
+    const bool pl_ok = pl_s < 2 && n0 + pl_c < n_cols;
+
+    // Rows and columns past the edge, zeroed once in both buffers and never
+    // staged again.
+    {
+        const int x = (int) threadIdx.x % TM;
+        const int h = (int) threadIdx.x / TM;
+
+        if (m0 + x >= n_rows) {
+            if (h == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { Aq[b][x][i] = 0; }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+                    if constexpr (HAS_QH) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { Ah[b][x][i] = 0; }
+                    }
+                    Asc[b][x][0] = 0;
+                    Asc[b][x][1] = 0;
+                    Asc[b][x][2] = 0;
+                    Add[b][x] = 0;
+                }
+            }
+        }
+
+        const int c  = (int) threadIdx.x % GK_CU_MMAQ_TILE_N;
+        const int h2 = (int) threadIdx.x / GK_CU_MMAQ_TILE_N;
+        if (n0 + c >= n_cols && h2 < 2) {
+            if (h2 == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int sg = 0; sg < 2; ++sg) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { Bs[b][sg][c][i] = 0; }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int sg = 0; sg < 2; ++sg) {
+#pragma unroll
+                        for (int q = 0; q < 3; ++q) { Apl[b][sg][q][c] = 0.0f; }
+                    }
+                }
+            }
+        }
+    }
+
+    // The code stage, once per round: the run holding the round's two groups.
+    const auto stage_q = [&](int64_t it, int buf) {
+        const int64_t sb = it >> 2;
+        const int     j  = (int) (it & 3);
+#pragma unroll
+        for (int jr = 0; jr < 2; ++jr) {
+            const uint8_t * rp = frow[jr];
+            if (rp != NULL) {
+                const uint8_t * qs = rp + sb * BLK + QS_OFF + j * 32;
+                const int r = stage_c + jr * NCOL;
+                gk_cu_cp_async4(&Aq[buf][r][stage_w    ], qs + 4 * stage_w);
+                gk_cu_cp_async4(&Aq[buf][r][stage_w + 1], qs + 4 * stage_w + 4);
+            }
+        }
+    };
+
+    // The header stage, once per superblock.
+    const auto stage_h = [&](int64_t sb, int hb) {
+        if (hdr_row == NULL) {
+            return;
+        }
+        const uint8_t * blk = hdr_row + sb * BLK;
+        if (!hdr_hi) {
+            if constexpr (HAS_QH) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    gk_cu_cp_async4(&Ah[hb][hdr_r][i], blk + QH_OFF + 4 * i);
+                }
+            }
+            gk_cu_cp_async4(&Asc[hb][hdr_r][0], blk + 4);
+            gk_cu_cp_async4(&Asc[hb][hdr_r][1], blk + 8);
+        } else {
+            if constexpr (HAS_QH) {
+#pragma unroll
+                for (int i = 4; i < 8; ++i) {
+                    gk_cu_cp_async4(&Ah[hb][hdr_r][i], blk + QH_OFF + 4 * i);
+                }
+            }
+            gk_cu_cp_async4(&Asc[hb][hdr_r][2], blk + 12);
+            gk_cu_cp_async4(&Add[hb][hdr_r], blk);
+        }
+    };
+
+    // The activation stage, once per round (two groups).
+    const auto stage_b = [&](int64_t it, int buf) {
+        const int64_t g = it * 2;
+
+#pragma unroll
+        for (int it2 = 0; it2 < 2 * NB; ++it2) {
+            const int jj = it2 % NB;
+            const int sg = it2 / NB;
+            const int c  = stage_c + jj * NCOL;
+            const int64_t gk = g + sg;
+
+            const gk_cu_q8blk * bp = bblk[jj];
+            if (bp != NULL && gk < n_grp) {
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w    ], &bp[gk].q[stage_w    ]);
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w + 1], &bp[gk].q[stage_w + 1]);
+            }
+        }
+
+        {
+            const int64_t gk = g + pl_s;
+            if (pl_ok && gk < n_grp) {
+                const float * p = ap23 + gk * 3 * n_cols + (n0 + pl_c);
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    gk_cu_cp_async4(&Apl[buf][pl_s][q][pl_c], p + q * n_cols);
+                }
+            }
+        }
+    };
+
+    float acc[GK_CU_MMAQ_WMT][GK_CU_MMAQ_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    const int64_t n_iter = (n_grp + 1) / 2;   // rounds
+    const int64_t n_sb   = (n_iter + 3) / 4;  // superblocks
+
+    stage_h(0, 0);
+    stage_q(0, 0);
+    stage_b(0, 0);
+    gk_cu_cp_async_commit();
+
+    for (int64_t it = 0; it < n_iter; ++it) {
+        const int buf = (int) (it & 1);
+        const int hb  = (int) ((it >> 2) & 1);
+        const int j   = (int) (it & 3);        // which code run of the superblock
+
+        // Round it+1's codes and activations go into the other buffer before
+        // this round computes, and on a superblock's last round the next
+        // superblock's header goes with them - a round ahead of first use,
+        // four rounds behind the last read of that buffer. One commit per
+        // round keeps the wait arithmetic uniform.
+        if (it + 1 < n_iter) {
+            stage_q(it + 1, buf ^ 1);
+            stage_b(it + 1, buf ^ 1);
+            if (j == 3 && (it >> 2) + 1 < n_sb) {
+                stage_h((it >> 2) + 1, hb ^ 1);
+            }
+            gk_cu_cp_async_commit();
+            gk_cu_cp_async_wait<1>();
+        } else {
+            gk_cu_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        const int64_t g = it * 2;
+
+        // The raw words and the header serve both of the round's groups, so
+        // they are read once per round and decoded per group.
+        int      aw[GK_CU_MMAQ_WMT][4];
+        int      hw[GK_CU_MMAQ_WMT][4];
+        uint32_t sw[GK_CU_MMAQ_WMT][2][3];
+        float2   dd[GK_CU_MMAQ_WMT][2];
+
+#pragma unroll
+        for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+            const int r_lo = warp_m * GK_CU_MMAQ_WM + wt * 16 + group;
+
+            aw[wt][0] = Aq[buf][r_lo    ][tig];
+            aw[wt][1] = Aq[buf][r_lo + 8][tig];
+            aw[wt][2] = Aq[buf][r_lo    ][4 + tig];
+            aw[wt][3] = Aq[buf][r_lo + 8][4 + tig];
+
+            if constexpr (HAS_QH) {
+                hw[wt][0] = Ah[hb][r_lo    ][tig];
+                hw[wt][1] = Ah[hb][r_lo + 8][tig];
+                hw[wt][2] = Ah[hb][r_lo    ][4 + tig];
+                hw[wt][3] = Ah[hb][r_lo + 8][4 + tig];
+            } else {
+                hw[wt][0] = hw[wt][1] = hw[wt][2] = hw[wt][3] = 0;
+            }
+
+#pragma unroll
+            for (int rh = 0; rh < 2; ++rh) {
+                sw[wt][rh][0] = Asc[hb][r_lo + 8 * rh][0];
+                sw[wt][rh][1] = Asc[hb][r_lo + 8 * rh][1];
+                sw[wt][rh][2] = Asc[hb][r_lo + 8 * rh][2];
+                dd[wt][rh]    = gk_cu_h2f2_w(Add[hb][r_lo + 8 * rh]);
+            }
+        }
+
+#pragma unroll
+        for (int gg = 0; gg < 2; ++gg) {
+            if (g + gg >= n_grp) {
+                break;
+            }
+
+            const int sub = 2 * j + gg;   // the group within its superblock
+            const int sh  = 4 * gg;       // its nibble
+
+            int   af[GK_CU_MMAQ_WMT][4];
+            float ws[GK_CU_MMAQ_WMT][2];
+            float wo[GK_CU_MMAQ_WMT][2];
+
+#pragma unroll
+            for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+                for (int rh = 0; rh < 2; ++rh) {
+                    int lo0 = (aw[wt][rh    ] >> sh) & 0x0F0F0F0F;
+                    int lo2 = (aw[wt][rh + 2] >> sh) & 0x0F0F0F0F;
+                    if constexpr (HAS_QH) {
+                        lo0 |= ((hw[wt][rh    ] >> sub) & 0x01010101) << 4;
+                        lo2 |= ((hw[wt][rh + 2] >> sub) & 0x01010101) << 4;
+                    }
+                    af[wt][rh    ] = lo0;
+                    af[wt][rh + 2] = lo2;
+
+                    int sc, mn;
+                    gk_cu_scale_min_6w(sw[wt][rh][0], sw[wt][rh][1], sw[wt][rh][2], sub, &sc, &mn);
+                    ws[wt][rh] =  dd[wt][rh].x * (float) sc;
+                    wo[wt][rh] = -dd[wt][rh].y * (float) mn;
+                }
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+                const int c = warp_n * GK_CU_MMAQ_WN + ct * 8 + group;
+
+                int bf[2];
+                bf[0] = Bs[buf][gg][c][tig];
+                bf[1] = Bs[buf][gg][c][4 + tig];
+
+                const int cd = warp_n * GK_CU_MMAQ_WN + ct * 8 + tig * 2;
+
+                // cd is even, so each pair is one aligned 64-bit load
+                const float2 advv = *(const float2 *) &Apl[buf][gg][0][cd];
+                const float2 adsv = *(const float2 *) &Apl[buf][gg][1][cd];
+
+                const float adv[2] = { advv.x, advv.y };
+                const float ads[2] = { adsv.x, adsv.y };
+
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+                    int df[4] = { 0, 0, 0, 0 };
+
+                    gk_cu_mma_s8_k32(df, af[wt], bf);
+
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int rh = i >> 1;
+                        const int ch = i & 1;
+                        acc[wt][ct][i] += ws[wt][rh] * adv[ch] * (float) df[i]
+                                        + wo[wt][rh] * ads[ch];
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_MMAQ_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_MMAQ_WN + ct * 8
+                                + tig * 2 + (i & 1);
+
+                if (m < n_rows && n < n_cols) {
+                    float v = acc[wt][ct][i];
+                    if (act >= 0) {
+                        v = gk_cu_unary(act, v, actp.x, actp.y, actp.z, actp.w);
+                    }
+                    gk_cu_set(d, m, n, i2, i3, v);
+                }
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // The nvfp4 integer tile, pipelined.
 //
 // The synchronous tile above stages a decoded round, barriers, computes, and
@@ -6052,6 +6471,26 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                         return;
                     }
 
+                    // q4_K and q5_K take their own pipeline tile (same
+                    // lever, same geometry); the short shape only - its
+                    // shared tile sits at the static limit already.
+                    if (((int) src0->type == GKT_Q5_K || (int) src0->type == GKT_Q4_K) &&
+                        gk_cu_env_int("GK_MM_MMA_PIPE", 1) != 0) {
+                        struct gk_tensor * fdst =
+                            g_gk_mm_act_dst != NULL ? g_gk_mm_act_dst : dst;
+                        g_gk_mm_path = "mma-q8p";
+                        if ((int) src0->type == GKT_Q5_K) {
+                            gk_cu_k_mul_mat_mma_k45_pipe<GKT_Q5_K><<<mgrid, GK_CU_MMAQ_THREADS, 0, stream>>>(
+                                gk_cu_view(src0), gk_cu_view_mut(fdst), aq, ap, n_grp, r2, r3,
+                                g_gk_mm_act, g_gk_mm_actp);
+                        } else {
+                            gk_cu_k_mul_mat_mma_k45_pipe<GKT_Q4_K><<<mgrid, GK_CU_MMAQ_THREADS, 0, stream>>>(
+                                gk_cu_view(src0), gk_cu_view_mut(fdst), aq, ap, n_grp, r2, r3,
+                                g_gk_mm_act, g_gk_mm_actp);
+                        }
+                        return;
+                    }
+
 #define GK_CU_LAUNCH_MMA_Q8(T)                                                            \
                     gk_cu_k_mul_mat_mma_q8<T><<<mgrid, GK_CU_MMAQ_THREADS, 0, stream>>>(   \
                         gk_cu_view(src0), gk_cu_view_mut(dst), aq, ap, n_grp, r2, r3)
@@ -7189,7 +7628,26 @@ void gk_cu_k_flash_attn_mma(gk_tview q, gk_tview k, gk_tview v,
         float sum[2] = { 0.0f, 0.0f };
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            const float m_new = fmaxf(M[r], m[r]);
+            float m_new = fmaxf(M[r], m[r]);
+            if constexpr (ACC16) {
+                // The half accumulator holds sum(p*v) with p taken relative
+                // to the running maximum, and over a long cache that sum
+                // walks past 65504: LTX-2.5's 8464-key video at 736^2 drove
+                // the audio stream's attention to inf and the clip to full-
+                // scale noise, while 1024 keys at 256^2 were fine. Raising
+                // the reference maximum scales every probability, and with
+                // it O and S, by one factor, so the normalised row is
+                // untouched. A sum of 256 leaves |v| up to 250 clear of
+                // 65504; the bound was measured against 64 and 1024 on the
+                // 8464-key shapes and the error (f16 rounding of the
+                // accumulator at every tile, ~1% there) did not move.
+                if (m_new != -INFINITY) {
+                    const float s_scaled = S[r] * __expf(M[r] - m_new);
+                    if (s_scaled > 256.0f) {
+                        m_new += __logf(s_scaled * (1.0f / 128.0f));
+                    }
+                }
+            }
             // A tile that was entirely masked leaves the running maximum
             // where it was; expf(-inf - -inf) is not a number, so it is not
             // asked.

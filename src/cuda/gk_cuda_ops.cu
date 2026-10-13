@@ -24,6 +24,7 @@
 #include <float.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 // The op, unary and glu enums are used directly: this file includes gk.h
 // through gk_impl.h, and an enumerator is a compile-time constant that device
@@ -3656,9 +3657,41 @@ static bool gk_cu_readable(const struct gk_tensor * t) {
     return gk_cu_type_supported(type) && t->nb[0] == (size_t) gk_cu_type_size(type);
 }
 
+// GK_CUDA_DENY_OPS=conv_transpose_1d,im2col,... refuses the named ops so the
+// per-graph CPU fallback runs them: a bisect tool for "CUDA output differs
+// from CPU", off unless the variable is set.
+static bool gk_cuda_op_denied(enum gk_op op) {
+    static int   checked = 0;
+    static char  deny[512];
+    if (!checked) {
+        checked = 1;
+        const char * e = getenv("GK_CUDA_DENY_OPS");
+        deny[0] = 0;
+        if (e != NULL && e[0] != 0) {
+            snprintf(deny, sizeof(deny), ",%s,", e);
+            for (char * c = deny; *c; ++c) {
+                *c = (char) tolower((unsigned char) *c);
+            }
+        }
+    }
+    if (deny[0] == 0) {
+        return false;
+    }
+    char key[80];
+    snprintf(key, sizeof(key), ",%s,", gk_op_name(op));
+    for (char * c = key; *c; ++c) {
+        *c = (char) tolower((unsigned char) *c);
+    }
+    return strstr(deny, key) != NULL;
+}
+
 bool gk_cuda_supports_op(const struct gk_tensor * op) {
     const struct gk_tensor * s0 = op->src[0];
     const struct gk_tensor * s1 = op->src[1];
+
+    if (gk_cuda_op_denied((enum gk_op) op->op)) {
+        return false;
+    }
 
     switch ((int) op->op) {
         case GK_OP_NONE: case GK_OP_RESHAPE: case GK_OP_VIEW:

@@ -997,6 +997,15 @@ struct bench_case {
 #define ARENA_MID   ((size_t) 1024u << 20)
 #define ARENA_SMALL ((size_t)  256u << 20)
 
+
+// LTX-2.5 22B at 736^2 x 121 frames: 8464 video tokens through the Q4_0
+// GGUF's q5_K majority (the "Q4_0" file is 71% q5_K by element).
+static struct gk_tensor * b_ltx_q5k_attn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q5_K,  4096,  4096, 8464); }
+static struct gk_tensor * b_ltx_q5k_up  (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q5_K,  4096, 16384, 8464); }
+static struct gk_tensor * b_ltx_q5k_down(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q5_K, 16384,  4096, 8464); }
+static struct gk_tensor * b_ltx_q40_attn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0,  4096,  4096, 8464); }
+static struct gk_tensor * b_ltx_q4k_attn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_K,  4096,  4096, 8464); }
+
 static const struct bench_case g_cases[] = {
     { "matmul (decode, 1 column)", "attn_q      q4_0", "1536x2048",       b_mm_q_dec,     ARENA_SMALL },
     { NULL,                        "attn_k/v    q4_0", "1536x256",        b_mm_kv_dec,    ARENA_SMALL },
@@ -1113,6 +1122,13 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ff out    nvfp4", "7168x5376 n=8742",   b_h3_ffo_nv,   ARENA_HUGE },
     { NULL,            "ff out    f16",   "7168x5376 n=8742",   b_h3_ffo_f16,  ARENA_HUGE },
     { NULL,            "ff out    q4_K",  "7168x5376 n=8742",   b_h3_ffo_q4k,  ARENA_HUGE },
+
+    { "LTX-2.5 22B DiT at 736^2 x 121 frames (8464 columns)",
+                       "attn      q5_K",  "4096x4096 n=8464",   b_ltx_q5k_attn, ARENA_HUGE },
+    { NULL,            "ffn up    q5_K",  "4096x16384 n=8464",  b_ltx_q5k_up,   ARENA_HUGE },
+    { NULL,            "ffn down  q5_K",  "16384x4096 n=8464",  b_ltx_q5k_down, ARENA_HUGE },
+    { NULL,            "attn      q4_K",  "4096x4096 n=8464",   b_ltx_q4k_attn, ARENA_HUGE },
+    { NULL,            "attn      q4_0",  "4096x4096 n=8464",   b_ltx_q40_attn, ARENA_HUGE },
 
     { "krea2 DiT matmuls (q2_K, against f16 and q4_K at the same shape)",
                        "ff up     q2_K",  "6144x16384 n=1038",  b_k2_ffup_q2k, ARENA_BIG },
